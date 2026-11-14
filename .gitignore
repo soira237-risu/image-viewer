@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Benchmark / profiling output
+/bench-results/
+*.profraw
+flamegraph.svg
+
+# Local test images (large corpora stay out of git)
+/testdata/local/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
