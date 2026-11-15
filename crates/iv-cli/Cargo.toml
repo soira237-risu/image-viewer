@@ -1,0 +1,15 @@
+[package]
+name = "iv-cli"
+description = "Command-line tools: probe, bench."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "iv"
+path = "src/main.rs"
+
+[dependencies]
+iv-core.workspace = true
+iv-codec.workspace = true

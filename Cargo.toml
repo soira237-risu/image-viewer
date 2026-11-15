@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/iv-core", "crates/iv-codec", "crates/iv-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+iv-core = { path = "crates/iv-core" }
+iv-codec = { path = "crates/iv-codec" }
+
+thiserror = "2"
+image = { version = "0.25.10", default-features = false, features = [
+    "bmp", "dds", "exr", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp", "rayon",
+] }
+zune-jpeg = "0.5.15"
+zune-core = "0.5"
+kamadak-exif = "0.6.2"
+bytemuck = "1"
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+debug = "line-tables-only"
+
+# Decoders are the hot path; keep them optimized even in dev builds so timings stay meaningful.
+[profile.dev.package."*"]
+opt-level = 3

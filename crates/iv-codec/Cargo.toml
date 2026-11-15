@@ -1,0 +1,18 @@
+[package]
+name = "iv-codec"
+description = "Codec traits, format sniffing, codec registry and built-in decoders."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+iv-core.workspace = true
+image.workspace = true
+zune-jpeg.workspace = true
+zune-core.workspace = true
+kamadak-exif.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

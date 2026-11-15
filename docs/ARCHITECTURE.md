@@ -264,6 +264,18 @@ export(source, edits, target_codec, options, dest):
 | **M5 확장** | 일괄 변환, 확장자 바로잡기, 압축파일 감상, 두 쪽 보기(만화), 거대 이미지 타일, 설정 화면 | 기능별 통합 테스트 |
 | 이후 | JPEG 무손실 변환(turbojpeg), HDR 톤매핑, 런타임 플러그인 ABI, 탐색기 정렬 순서 연동 | |
 
+### M0 결과 (2026-11-15)
+
+- 툴체인: rustc 1.100.0 (stable-x86_64-pc-windows-msvc), VS 2022 Build Tools (VC 도구 + Windows SDK)
+- 구현: `iv-core`(오류·취소·형식·`ImageBuf`·`Source`), `iv-codec`(형식 판별, `Decoder` 트레이트, `Registry` 우선순위·폴백, zune-jpeg·image-rs 디코더, EXIF 방향·내장 썸네일 미리보기), `iv-cli`(`probe`, `bench`, `formats`)
+- 테스트 28개: 무손실 형식 왕복 픽셀 일치, JPEG 오차, 16비트 보존, 확장자 불일치 판별, 손상 파일, 취소, 폴백 체인, EXIF 방향·썸네일
+- 측정 (release, 3840×2400 = 9.2MP, 중앙값 7회): JPEG 34.8ms (314 MP/s), TIFF 36.5ms, QOI 59.6ms, BMP 101ms, WebP(무손실) 103ms, PNG 131ms. probe는 모든 형식 0.2ms 이하
+- 측정에서 얻은 결정
+  - `ImageBuf`를 `Arc<Vec<u8>>`로 변경: `Vec → Arc<[u8]>` 변환이 전체 버퍼를 복사하던 낭비 제거 (JPEG 42.6 → 34.8ms)
+  - Windows 배경화면 JPEG에는 EXIF 썸네일이 없음 → 미리보기 경로가 비어 있음. 화면 크기 축소 디코드(libjpeg-turbo IDCT 축소 또는 GPU 축소 표시)는 M2에서 측정 후 결정
+  - BMP가 원시 형식임에도 느림(image-rs의 행 단위 처리) → 빈도 낮아 보류, 필요 시 전용 디코더
+- 벤치 코퍼스: `cargo run -p iv-codec --release --example make_corpus -- C:/Windows/Web/Wallpaper/ThemeC testdata/local/corpus 4`
+
 ## 7. 테스트 전략
 
 - **코덱**: 형식별 샘플 코퍼스(`testdata/`), probe 결과·크기·프레임 수 검증, 손상 파일에서 패닉 없이 오류 반환
