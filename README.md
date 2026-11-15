@@ -9,8 +9,13 @@ Rust로 만드는 빠른 Windows 이미지 뷰어.
 
 ## 상태
 
-M4(편집·변환) 완료: 회전·뒤집기·자르기·실행 취소, 저장/다른 이름으로 저장(JPEG 회전은 무손실), 9개 형식 인코더, 일괄 변환 CLI, 확장자 바로잡기.
-M5(확장)에서: 보정·크기 변경 UI, 압축파일 감상, 두 쪽 보기 등.
+M0~M5 완료:
+
+- 빠른 보기: GPU 렌더링, 미리보기 먼저, 방향 고려 미리 읽기, 키를 누르고 있을 때의 빠른 넘김
+- 형식: JPEG, PNG/APNG, GIF, WebP, AVIF, HEIC, JPEG XL, TIFF, BMP, ICO, QOI, TGA, PNM, DDS, EXR, HDR, SVG, 카메라 RAW(Windows 코덱), ICC 색 관리
+- 압축파일: ZIP/CBZ, 7z/CB7 (만화 두 쪽 보기)
+- 편집: 회전·뒤집기·자르기·보정·크기 변경, 실행 취소, 저장/다른 이름으로 저장 (JPEG 회전은 무손실)
+- 변환: 9개 형식 인코더, 일괄 변환 CLI, 확장자 바로잡기
 
 설계와 개발 단계는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 참고.
 
@@ -52,10 +57,15 @@ cargo build --release
 | 드래그 | 이동 |
 | 더블클릭 | 맞춤 ↔ 100% |
 | F11, Alt+Enter | 전체 화면 |
+| D / Shift+D | 두 쪽 보기 / 읽는 방향 전환 |
+| E | 편집 패널 (보정 슬라이더, 크기 변경, 저장 품질) |
+| F2 | 설정 |
 | Esc | 선택 해제 → 전체 화면 해제 → 종료 |
 | Ctrl+W, Ctrl+Q | 종료 |
 
-`%APPDATA%\image-viewer\keymap.toml`로 바꿀 수 있음:
+설정은 F2 또는 `%APPDATA%\image-viewer\settings.toml` (`--settings <파일>`로 다른 파일 지정).
+
+단축키는 `%APPDATA%\image-viewer\keymap.toml`로 바꿀 수 있음 (`--keymap <파일>`로 다른 파일 지정):
 
 ```toml
 [bindings]
