@@ -11,6 +11,7 @@ mod builtin {
     #[cfg(windows)]
     pub mod wic;
 }
+pub mod color;
 mod decoder;
 mod registry;
 pub mod sniff;

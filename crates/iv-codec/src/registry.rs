@@ -86,10 +86,15 @@ impl Registry {
         self.try_each(src, id.format, |d| d.probe(src, id.format))
     }
 
-    /// Decodes with the first decoder that succeeds.
+    /// Decodes with the first decoder that succeeds. Pixels with an embedded RGB ICC profile come
+    /// back converted to sRGB (`Decoded::color_managed`); `info.icc_profile` still describes the
+    /// file.
     pub fn decode(&self, src: &Source, cancel: &CancelToken) -> Result<Decoded> {
         let id = self.identify(src)?;
-        self.try_each(src, id.format, |d| d.decode(src, id.format, cancel))
+        let mut decoded = self.try_each(src, id.format, |d| d.decode(src, id.format, cancel))?;
+        cancel.check()?;
+        decoded.color_managed = crate::color::to_srgb(&mut decoded).is_ok();
+        Ok(decoded)
     }
 
     /// The first preview any decoder for the format can produce cheaply.

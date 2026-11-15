@@ -834,7 +834,7 @@ mod playback_tests {
         };
         let frames =
             delays_ms.iter().map(|ms| AnimationFrame { image: frame(), delay: Duration::from_millis(*ms) }).collect();
-        Arc::new(Decoded { info, image: frame(), animation: Some(Animation { frames }) })
+        Arc::new(Decoded { info, image: frame(), animation: Some(Animation { frames }), color_managed: false })
     }
 
     #[test]

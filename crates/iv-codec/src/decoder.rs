@@ -23,11 +23,13 @@ pub struct Decoded {
     pub image: ImageBuf,
     /// Every frame of an animated image (the first is `image` again, sharing its pixels).
     pub animation: Option<Animation>,
+    /// Pixels were converted from the embedded ICC profile to sRGB.
+    pub color_managed: bool,
 }
 
 impl Decoded {
     pub fn still(info: ImageInfo, image: ImageBuf) -> Self {
-        Self { info, image, animation: None }
+        Self { info, image, animation: None, color_managed: false }
     }
 
     /// Pixel memory held, counting every animation frame once.

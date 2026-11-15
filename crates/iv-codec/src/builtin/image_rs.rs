@@ -220,7 +220,7 @@ impl Decoder for ImageRsDecoder {
                 return Ok(Decoded::still(info, frames.remove(0).image));
             }
             let image = frames[0].image.clone();
-            return Ok(Decoded { info, image, animation: Some(Animation { frames }) });
+            return Ok(Decoded { info, image, animation: Some(Animation { frames }), color_managed: false });
         }
 
         // refuse before allocating, with the size the RGBA output will need

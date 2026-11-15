@@ -307,6 +307,31 @@ export(source, edits, target_codec, options, dest):
   - 캐시 사용량은 측정 내내 예산(1024MiB) 이하 (최대 914MiB)
 - 남은 개선 후보: 16비트 → 8비트 변환이 UI 스레드에서 약 18ms (디코드 작업자로 옮기기), 이웃 이미지 GPU 텍스처 선업로드
 
+### M3 결과 (2026-11-15)
+
+- 디코더 구성 (우선순위 높은 순)
+
+  | 형식 | 디코더 |
+  |---|---|
+  | JPEG | zune-jpeg → image-rs → WIC |
+  | PNG/APNG, GIF, WebP, ICO, QOI, TGA, PNM, EXR, HDR | image-rs (애니메이션 포함) |
+  | TIFF, BMP, DDS | image-rs → WIC |
+  | AVIF | 알파 있음: rav1d / 알파 없음: WIC (Windows) |
+  | HEIF/HEIC, Camera RAW | WIC (내장 썸네일을 미리보기로) |
+  | JPEG XL | jxl-oxide → WIC |
+  | SVG/SVGZ | resvg (긴 변 1024~8192로 래스터화) |
+
+- 확인된 사실과 그에 따른 결정
+  - Windows AV1 코덱은 AVIF 알파를 버림 (ffmpeg 디코드로 파일의 알파 1~254 확인 후 비교) → 알파 AVIF만 rav1d가 맡도록 `Decoder::claims` 확장 지점 추가. 불투명 AVIF는 회전·ICC를 지키는 WIC 유지 (속도: WIC 72ms, rav1d 80ms, 9.2MP)
+  - avif-decode의 10비트 출력은 이미 16비트 범위 (실측 56503 ≈ 220×257) → 처음 넣었던 추가 확장은 테스트에서 흰색으로 드러나 제거
+  - WIC는 잘린 PNG를 성공으로 반환 → PNG/GIF/ICO/WebP는 WIC 보루에서 제외(손상 파일은 오류로 보고)
+  - WIC의 AVIF 미리보기는 사실상 전체 디코드(9.2MP에서 46ms/76ms)이고 알파도 없음 → AVIF 미리보기 생략
+- 애니메이션: GIF/WebP/APNG 프레임 전체 합성, 0~10ms 지연은 100ms(브라우저 규칙), 512MiB 초과 애니메이션은 첫 프레임만, 캐시는 모든 프레임 메모리를 계산. 실제 창에서 20프레임×100ms가 2001ms에 한 바퀴
+- 색 관리: 내장 RGB ICC → sRGB (moxcms, 8/16비트, 모든 프레임). 기준값 검증: P3 (234,51,35) → sRGB (255,0,0) ±4. sRGB 태그 이미지는 대표색 125개 왕복으로 항등을 확인해 변환 생략(9.2MP 변환 13ms 절약)
+- RAW: 형식 식별(RAF/ORF/RW2/CR3 서명, TIFF 기반은 확장자)과 WIC 경로는 구현. **실제 RAW 파일로는 아직 검증하지 못함** (이 컴퓨터에 샘플 없음)
+- 빌드 요구 사항에 NASM 추가 (rav1d 어셈블리)
+- 자동 창 검사는 `--no-activate`로 실행 (테스트 창이 포커스를 가져가 다른 앱의 키 입력을 받는 일이 실제로 있었음)
+
 ## 7. 테스트 전략
 
 - **코덱**: 형식별 샘플 코퍼스(`testdata/`), probe 결과·크기·프레임 수 검증, 손상 파일에서 패닉 없이 오류 반환

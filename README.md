@@ -9,8 +9,8 @@ Rust로 만드는 빠른 Windows 이미지 뷰어.
 
 ## 상태
 
-M2(넘김) 완료: 폴더 안 자연 정렬 넘김, 방향을 고려한 미리 읽기, 메모리 예산 캐시, 키를 누르고 있을 때의 빠른 넘김.
-추가 형식(HEIC·AVIF·RAW·JXL·SVG)과 애니메이션은 M3에서.
+M3(형식) 완료: HEIC·AVIF(알파 포함)·JPEG XL·SVG·RAW(Windows 코덱), GIF·WebP·APNG 애니메이션, ICC 색 관리.
+편집·형식 변환은 M4에서.
 
 설계와 개발 단계는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 참고.
 
