@@ -22,6 +22,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 use crate::commands::Command;
 use crate::edit::{drag_rect, in_place_format, save_request, selection_to_crop};
 use crate::keymap::{Chord, Keymap, canonical_key};
+use crate::panel::{self, PanelAction, PanelContext, PanelState};
 use crate::trace::Trace;
 
 const ZOOM_STEP: f64 = 1.25;
@@ -128,6 +129,14 @@ struct Surface {
     renderer: ImageRenderer,
     /// format the renderer targets (the sRGB view of the swapchain)
     view_format: wgpu::TextureFormat,
+    egui: EguiParts,
+}
+
+/// The edit panel's UI toolkit, drawn over the image.
+struct EguiParts {
+    ctx: egui::Context,
+    state: egui_winit::State,
+    renderer: egui_wgpu::Renderer,
 }
 
 pub struct App {
@@ -163,6 +172,7 @@ pub struct App {
     encoders: Encoders,
     /// Two-page view: `Some(right_to_left)` when on.
     spread: Option<bool>,
+    panel: PanelState,
 }
 
 /// GPU device creation started at launch, before the window exists.
@@ -242,6 +252,7 @@ impl App {
             saving: false,
             encoders: Encoders::default(),
             spread: None,
+            panel: PanelState::default(),
         }
     }
 
@@ -437,7 +448,18 @@ impl App {
 
         let renderer = ImageRenderer::new(&gpu.device, view_format);
         self.trace.mark("pipelines created");
-        self.surface = Some(Surface { window, surface, config, gpu, renderer, view_format });
+        let ctx = egui::Context::default();
+        let state = egui_winit::State::new(
+            ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(window.scale_factor() as f32),
+            None,
+            Some(gpu.max_texture_side() as usize),
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(&gpu.device, view_format, egui_wgpu::RendererOptions::default());
+        let egui = EguiParts { ctx, state, renderer: egui_renderer };
+        self.surface = Some(Surface { window, surface, config, gpu, renderer, view_format, egui });
         Ok(())
     }
 
@@ -708,6 +730,12 @@ impl App {
             Command::ViewActualSize => self.with_view(|v| v.actual_size_at(center)),
             Command::ViewZoomIn => self.with_view(|v| v.zoom_by(ZOOM_STEP)),
             Command::ViewZoomOut => self.with_view(|v| v.zoom_by(1.0 / ZOOM_STEP)),
+            Command::ViewToggleEditPanel => {
+                self.panel.open = !self.panel.open;
+                if let Some(s) = &self.surface {
+                    s.window.request_redraw();
+                }
+            }
             Command::ViewToggleSpread => {
                 self.spread = if self.spread.is_some() { None } else { Some(true) };
                 self.trace.mark(&format!("two-page view: {:?}", self.spread));
@@ -781,9 +809,19 @@ impl App {
         let mut encoder = s.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         let view = self.display.as_ref().map(|d| &d.view);
         s.renderer.render(&s.gpu.queue, &mut encoder, &target, (s.config.width, s.config.height), view);
+        let mut panel_actions = Vec::new();
+        if self.panel.open {
+            let cx = self.panel_context();
+            let s = self.surface.as_mut().expect("checked above");
+            panel_actions = draw_panel(s, &mut self.panel, &cx, &mut encoder, &target);
+        }
+        let s = self.surface.as_mut().expect("checked above");
         s.gpu.queue.submit([encoder.finish()]);
         s.window.pre_present_notify();
         s.gpu.queue.present(frame);
+        if !panel_actions.is_empty() {
+            self.apply_panel_actions(panel_actions);
+        }
 
         if !self.first_frame_logged {
             self.first_frame_logged = true;
@@ -886,11 +924,62 @@ impl App {
             return;
         }
         s.renderer.set_uv_transform(uv);
+        s.renderer.set_adjustments(&crate::edit::preview_adjustments(&g));
+        if d.view.image_size() != (g.size.0 as f64, g.size.1 as f64) {
+            self.panel.resize = (0, 0);
+        }
         d.view.set_image_size(g.size);
         s.window.request_redraw();
     }
 
+    fn panel_context(&self) -> PanelContext {
+        let shown = self.current.as_ref().is_some_and(|c| self.display.as_ref().is_some_and(|d| d.path == c.path));
+        PanelContext {
+            size: if shown { self.geometry().map(|g| g.size) } else { None },
+            can_undo: self.edits.can_undo(),
+            can_redo: self.edits.can_redo(),
+            edited: !self.edits.is_empty(),
+        }
+    }
+
+    fn apply_panel_actions(&mut self, actions: Vec<PanelAction>) {
+        for action in actions {
+            match action {
+                PanelAction::Adjust(a) => {
+                    if self.spread.is_some() {
+                        self.error = Some("editing works in single-page view (press D)".into());
+                    } else if self.current.as_ref().is_some_and(|c| c.info.is_some()) {
+                        self.edits.push_or_replace(Op::Adjust(a), |o| matches!(o, Op::Adjust(_)));
+                        self.after_edit_change();
+                    }
+                }
+                PanelAction::Edit(op) => self.edit(op),
+                PanelAction::Undo => {
+                    if self.edits.undo() {
+                        self.after_edit_change();
+                    }
+                }
+                PanelAction::Redo => {
+                    if self.edits.redo() {
+                        self.after_edit_change();
+                    }
+                }
+                PanelAction::Save => self.save_in_place(),
+                PanelAction::SaveAs => self.save_as(),
+            }
+        }
+        self.update_title();
+    }
+
     fn after_edit_change(&mut self) {
+        // the sliders show the newest adjustment in effect
+        self.panel.adjust = self
+            .edits
+            .active()
+            .iter()
+            .rev()
+            .find_map(|o| if let Op::Adjust(a) = o { Some(*a) } else { None })
+            .unwrap_or_default();
         self.selection = None;
         self.sync_selection();
         self.apply_edits_to_display();
@@ -965,7 +1054,7 @@ impl App {
         if self.saving {
             return;
         }
-        let req = match save_request(&self.encoders, &cur.path, self.edits.active(), dest) {
+        let req = match save_request(&self.encoders, &cur.path, self.edits.active(), dest, self.panel.quality) {
             Ok(r) => r,
             Err(e) => {
                 self.error = Some(e);
@@ -1035,9 +1124,10 @@ impl App {
                     return false;
                 }
                 let saved =
-                    save_request(&self.encoders, &cur.path, self.edits.active(), cur.path.clone()).and_then(|req| {
-                        export(&iv_codec::default_registry(), &self.encoders, &req).map_err(|e| e.to_string())
-                    });
+                    save_request(&self.encoders, &cur.path, self.edits.active(), cur.path.clone(), self.panel.quality)
+                        .and_then(|req| {
+                            export(&iv_codec::default_registry(), &self.encoders, &req).map_err(|e| e.to_string())
+                        });
                 match saved {
                     Ok(_) => {
                         let path = cur.path.clone();
@@ -1137,6 +1227,22 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // the edit panel gets first look at input; what it uses (clicks on it, typing in its
+        // fields) does not also reach the viewer
+        if self.panel.open {
+            if let Some(s) = &mut self.surface {
+                let response = s.egui.state.on_window_event(&s.window, &event);
+                if response.repaint {
+                    s.window.request_redraw();
+                }
+                // a focused panel widget (slider, field, button) owns the keyboard: arrow keys must move
+                // the slider, not also step to the next image
+                let panel_has_focus = s.egui.ctx.memory(|m| m.focused().is_some());
+                if response.consumed || (panel_has_focus && matches!(event, WindowEvent::KeyboardInput { .. })) {
+                    return;
+                }
+            }
+        }
         match event {
             WindowEvent::CloseRequested => self.quit(event_loop),
             WindowEvent::Resized(size) => {
@@ -1288,4 +1394,54 @@ mod spread_tests {
         let (_, f) = spread_layout((1600, 1200), (800, 1200));
         assert!((f - 2.0 / 3.0).abs() < 1e-6);
     }
+}
+
+/// Runs one egui frame for the edit panel and draws it over the image in `target`.
+fn draw_panel(
+    s: &mut Surface,
+    st: &mut PanelState,
+    cx: &PanelContext,
+    encoder: &mut wgpu::CommandEncoder,
+    target: &wgpu::TextureView,
+) -> Vec<PanelAction> {
+    let e = &mut s.egui;
+    let raw = e.state.take_egui_input(&s.window);
+    let mut actions = Vec::new();
+    let full = e.ctx.run_ui(raw, |ui| actions = panel::show(ui, st, cx));
+    e.state.handle_platform_output(&s.window, full.platform_output);
+    let ppp = full.pixels_per_point;
+    let jobs = e.ctx.tessellate(full.shapes, ppp);
+    let screen =
+        egui_wgpu::ScreenDescriptor { size_in_pixels: [s.config.width, s.config.height], pixels_per_point: ppp };
+    for (id, deltas) in &full.textures_delta.set {
+        for delta in deltas {
+            e.renderer.update_texture(&s.gpu.device, &s.gpu.queue, *id, delta);
+        }
+    }
+    let callbacks = e.renderer.update_buffers(&s.gpu.device, &s.gpu.queue, encoder, &jobs, &screen);
+    s.gpu.queue.submit(callbacks);
+    {
+        let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("edit panel"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        e.renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
+    }
+    for id in &full.textures_delta.free {
+        e.renderer.free_texture(id);
+    }
+    // egui animates hover and focus; keep drawing while it asks for it
+    if full.viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|v| v.repaint_delay.is_zero()) {
+        s.window.request_redraw();
+    }
+    actions
 }

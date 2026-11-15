@@ -106,6 +106,16 @@ impl EditStack {
         self.cursor += 1;
     }
 
+    /// Replaces the newest edit when `same_kind` says it is the same kind (a slider still being
+    /// dragged), so one undo reverts the whole drag; otherwise pushes.
+    pub fn push_or_replace(&mut self, op: Op, same_kind: impl Fn(&Op) -> bool) {
+        if self.cursor > 0 && self.cursor == self.ops.len() && same_kind(&self.ops[self.cursor - 1]) {
+            self.ops[self.cursor - 1] = op;
+        } else {
+            self.push(op);
+        }
+    }
+
     pub fn undo(&mut self) -> bool {
         if self.cursor == 0 {
             return false;
@@ -166,6 +176,24 @@ mod tests {
         // a new edit after undo drops the redo branch
         s.push(Op::flip_v());
         assert_eq!(s.active(), &[Op::rotate_cw(), Op::flip_v()]);
+        assert!(!s.can_redo());
+    }
+
+    #[test]
+    fn slider_drags_collapse_into_one_edit() {
+        let is_adjust = |o: &Op| matches!(o, Op::Adjust(_));
+        let mut s = EditStack::new();
+        s.push(Op::rotate_cw());
+        for b in [0.1, 0.2, 0.3] {
+            s.push_or_replace(Op::Adjust(Adjust { brightness: b, ..Default::default() }), is_adjust);
+        }
+        assert_eq!(s.active().len(), 2);
+        assert_eq!(s.active()[1], Op::Adjust(Adjust { brightness: 0.3, ..Default::default() }));
+        s.undo();
+        assert_eq!(s.active(), &[Op::rotate_cw()], "one undo reverts the whole drag");
+        // after an undo the redo branch is not overwritten in place
+        s.push_or_replace(Op::Adjust(Adjust::default()), is_adjust);
+        assert_eq!(s.active().len(), 2);
         assert!(!s.can_redo());
     }
 

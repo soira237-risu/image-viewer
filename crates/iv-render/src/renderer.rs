@@ -10,6 +10,9 @@ use crate::view::ViewState;
 /// sRGB texture: the sampler linearises, so mipmaps and filtering average light, not codes.
 const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
+/// Tone adjustments the shader previews per image.
+pub const MAX_ADJUSTMENTS: usize = 4;
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
@@ -21,6 +24,10 @@ struct Params {
     checker_b: [f32; 4],
     /// Selection in screen pixels (x, y, w, h); width 0 = none. Outside it is dimmed.
     selection: [f32; 4],
+    /// Tone adjustments (brightness, contrast, gamma, saturation), applied in order.
+    adjust: [[f32; 4]; 4],
+    /// x: number of adjustments in use.
+    misc: [f32; 4],
 }
 
 /// Appearance settings.
@@ -61,6 +68,8 @@ pub struct UploadInfo {
 struct GpuImage {
     bind_group: wgpu::BindGroup,
     uniform: wgpu::Buffer,
+    /// Tone adjustments previewed on this image (at most [`MAX_ADJUSTMENTS`]).
+    adjust: Vec<[f32; 4]>,
     /// Shown UV → texture UV: the EXIF orientation, or an edit geometry set later.
     uv: UvTransform,
     has_alpha: bool,
@@ -261,6 +270,15 @@ impl ImageRenderer {
         }
     }
 
+    /// Previews tone adjustments on the main image: each is (brightness, contrast, gamma,
+    /// saturation) as in `iv_ops::Adjust`, applied in order. Only the first
+    /// [`MAX_ADJUSTMENTS`] are shown. Reset by the next `set_image`.
+    pub fn set_adjustments(&mut self, adjust: &[[f32; 4]]) {
+        if let Some(img) = &mut self.image {
+            img.adjust = adjust.iter().take(MAX_ADJUSTMENTS).copied().collect();
+        }
+    }
+
     /// Dims everything outside `rect` (screen pixels), or nothing with `None`.
     pub fn set_selection(&mut self, rect: Option<ScreenRect>) {
         self.selection = rect.filter(|r| r.width >= 1.0 && r.height >= 1.0);
@@ -345,7 +363,14 @@ impl ImageRenderer {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler_nearest) },
             ],
         });
-        let gpu = GpuImage { bind_group, uniform, uv: uv_transform(orientation), has_alpha, _texture: texture };
+        let gpu = GpuImage {
+            bind_group,
+            uniform,
+            adjust: Vec::new(),
+            uv: uv_transform(orientation),
+            has_alpha,
+            _texture: texture,
+        };
         let info = UploadInfo {
             texture_width: w,
             texture_height: h,
@@ -478,6 +503,8 @@ impl ImageRenderer {
             checker_a: [s.checker_a[0], s.checker_a[1], s.checker_a[2], 1.0],
             checker_b: [s.checker_b[0], s.checker_b[1], s.checker_b[2], 1.0],
             selection: self.selection.map_or([0.0; 4], |r| [r.x as f32, r.y as f32, r.width as f32, r.height as f32]),
+            adjust: std::array::from_fn(|i| image.adjust.get(i).copied().unwrap_or([0.0, 0.0, 1.0, 0.0])),
+            misc: [image.adjust.len() as f32, 0.0, 0.0, 0.0],
         };
         queue.write_buffer(&image.uniform, 0, bytemuck::bytes_of(&params));
         pass.set_bind_group(0, &image.bind_group, &[]);

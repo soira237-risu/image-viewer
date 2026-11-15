@@ -32,24 +32,41 @@ pub fn selection_to_crop(view: &ViewState, sel: ScreenRect) -> Option<Rect> {
     })
 }
 
+/// The adjustments of `g` in the renderer's preview form: (brightness, contrast, gamma,
+/// saturation), in the order they are applied when saving.
+pub fn preview_adjustments(g: &iv_ops::Geometry) -> Vec<[f32; 4]> {
+    g.adjusts.iter().map(|a| [a.brightness, a.contrast, a.gamma, a.saturation]).collect()
+}
+
 /// Format to use when saving over `format` in place, if it can be written.
 pub fn in_place_format(encoders: &Encoders, format: FormatId) -> Option<FormatId> {
     encoders.for_format(format).map(|_| format)
 }
 
 /// Builds the request for saving `source` with `ops` to `dest`; the format follows `dest`'s
-/// extension, with default encoder options.
-pub fn save_request(encoders: &Encoders, source: &Path, ops: &[Op], dest: PathBuf) -> Result<ExportRequest, String> {
+/// extension. `quality` applies to formats that have a quality option (JPEG, WebP, AVIF).
+pub fn save_request(
+    encoders: &Encoders,
+    source: &Path,
+    ops: &[Op],
+    dest: PathBuf,
+    quality: u8,
+) -> Result<ExportRequest, String> {
     let ext = dest.extension().and_then(|e| e.to_str()).unwrap_or_default().to_string();
     let format = FormatId::from_extension(&ext).ok_or_else(|| format!("unknown file type '.{ext}'"))?;
-    if encoders.for_format(format).is_none() {
+    let Some(encoder) = encoders.for_format(format) else {
         return Err(format!("{format} files cannot be written"));
-    }
+    };
+    let options = if encoder.options().iter().any(|o| o.key == "quality") {
+        EncodeOptions::parse(encoder.options(), &[format!("quality={}", quality.clamp(1, 100))])?
+    } else {
+        EncodeOptions::default()
+    };
     Ok(ExportRequest {
         source: source.to_path_buf(),
         ops: ops.to_vec(),
         format,
-        options: EncodeOptions::default(),
+        options,
         dest,
         background: [255, 255, 255],
         keep_metadata: true,
@@ -59,6 +76,23 @@ pub fn save_request(encoders: &Encoders, source: &Path, ops: &[Op], dest: PathBu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adjustments_reach_the_preview_in_order_and_identities_are_dropped() {
+        use iv_core::Orientation;
+        use iv_ops::{Adjust, EditStack, Geometry};
+        let is_adjust = |o: &Op| matches!(o, Op::Adjust(_));
+        let mut edits = EditStack::new();
+        // a slider drag collapses to its last value
+        for b in [0.1, 0.2, 0.4] {
+            edits.push_or_replace(Op::Adjust(Adjust { brightness: b, ..Default::default() }), is_adjust);
+        }
+        edits.push(Op::rotate_cw());
+        edits.push_or_replace(Op::Adjust(Adjust { saturation: -1.0, ..Default::default() }), is_adjust);
+        edits.push(Op::Adjust(Adjust::default()));
+        let g = Geometry::new((10, 10), Orientation::Normal, edits.active());
+        assert_eq!(preview_adjustments(&g), vec![[0.4, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, -1.0]]);
+    }
 
     #[test]
     fn drag_corners_in_any_order() {
@@ -82,12 +116,20 @@ mod tests {
     #[test]
     fn save_requests_follow_the_extension() {
         let enc = Encoders::default();
-        let r = save_request(&enc, Path::new("a.jpg"), &[Op::rotate_cw()], PathBuf::from("out.WEBP")).unwrap();
+        let r = save_request(&enc, Path::new("a.jpg"), &[Op::rotate_cw()], PathBuf::from("out.WEBP"), 70).unwrap();
         assert_eq!(r.format, FormatId::Webp);
         assert_eq!(r.ops, vec![Op::rotate_cw()]);
-        assert!(save_request(&enc, Path::new("a.jpg"), &[], PathBuf::from("out.xyz")).is_err());
+        let webp = enc.for_format(FormatId::Webp).unwrap();
+        assert_eq!(
+            r.options,
+            EncodeOptions::parse(webp.options(), &["quality=70".into()]).unwrap(),
+            "panel quality is used"
+        );
+        let png = save_request(&enc, Path::new("a.jpg"), &[], PathBuf::from("out.png"), 70).unwrap();
+        assert_eq!(png.options, EncodeOptions::default(), "formats without quality ignore it");
+        assert!(save_request(&enc, Path::new("a.jpg"), &[], PathBuf::from("out.xyz"), 90).is_err());
         assert!(
-            save_request(&enc, Path::new("a.jpg"), &[], PathBuf::from("out.heic"))
+            save_request(&enc, Path::new("a.jpg"), &[], PathBuf::from("out.heic"), 90)
                 .unwrap_err()
                 .contains("cannot be written")
         );

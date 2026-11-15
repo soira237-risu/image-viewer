@@ -14,7 +14,32 @@ struct Params {
     checker_b: vec4<f32>,
     // selection in screen pixels: x, y, width, height (width 0 = none); outside is dimmed
     selection: vec4<f32>,
+    // tone adjustments applied in order: brightness, contrast, gamma, saturation
+    adjust: array<vec4<f32>, 4>,
+    // x: number of adjustments in use
+    misc: vec4<f32>,
 };
+
+fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
+    let lo = c * 12.92;
+    let hi = 1.055 * pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(hi, lo, c <= vec3<f32>(0.0031308));
+}
+
+fn srgb_decode(c: vec3<f32>) -> vec3<f32> {
+    let lo = c / 12.92;
+    let hi = pow((max(c, vec3<f32>(0.0)) + 0.055) / 1.055, vec3<f32>(2.4));
+    return select(hi, lo, c <= vec3<f32>(0.04045));
+}
+
+// the same formula as `iv_ops::Adjust::apply`, on sRGB-encoded values
+fn adjust_tone(rgb_in: vec3<f32>, a: vec4<f32>) -> vec3<f32> {
+    var c = rgb_in + vec3<f32>(a.x);
+    c = (c - vec3<f32>(0.5)) * (1.0 + a.y) + vec3<f32>(0.5);
+    c = pow(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / clamp(a.z, 0.1, 10.0)));
+    let luma = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return clamp(vec3<f32>(luma) + (c - vec3<f32>(luma)) * (1.0 + a.w), vec3<f32>(0.0), vec3<f32>(1.0));
+}
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var photo: texture_2d<f32>;
@@ -52,11 +77,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     var rgb = c.rgb;
+    let n = u32(p.misc.x);
+    if (n > 0u) {
+        var e = srgb_encode(rgb);
+        for (var i = 0u; i < min(n, 4u); i = i + 1u) {
+            e = adjust_tone(e, p.adjust[i]);
+        }
+        rgb = srgb_decode(e);
+    }
     if ((flags & 1u) != 0u) {
         let cell = floor(in.pos.xy / p.viewport.z);
         let odd = (u32(cell.x) + u32(cell.y)) & 1u;
         let bg = select(p.checker_a.rgb, p.checker_b.rgb, odd == 1u);
-        rgb = mix(bg, c.rgb, c.a);
+        rgb = mix(bg, rgb, c.a);
     }
     if (p.selection.z > 0.0) {
         let lo = p.selection.xy;

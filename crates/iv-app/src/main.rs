@@ -7,6 +7,7 @@ mod app;
 mod commands;
 mod edit;
 mod keymap;
+mod panel;
 mod trace;
 
 use std::path::PathBuf;

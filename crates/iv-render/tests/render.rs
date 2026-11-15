@@ -205,3 +205,25 @@ fn two_pages_side_by_side_in_either_reading_direction() {
     let single = draw(&gpu, &r, &view);
     assert_eq!(px(&single, 44, 24), RED, "one page fills the spread again");
 }
+
+#[test]
+fn adjustment_preview_matches_the_saved_result() {
+    use iv_ops::{Adjust, apply};
+    let gpu = gpu();
+    let src = image(1, 1, &[[200, 100, 50, 255]]);
+    let adjusts = [
+        Adjust { brightness: 0.1, contrast: 0.3, gamma: 1.4, saturation: -0.5 },
+        Adjust { brightness: -0.05, contrast: 0.0, gamma: 1.0, saturation: 0.4 },
+    ];
+    let expected = apply::adjust(&src, &adjusts).unwrap();
+    let want: [u8; 4] = expected.data()[..4].try_into().unwrap();
+
+    let mut r = ImageRenderer::new(&gpu.device, TARGET);
+    r.set_image(&gpu.device, &gpu.queue, &src, Orientation::Normal, false);
+    r.set_adjustments(&adjusts.map(|a| [a.brightness, a.contrast, a.gamma, a.saturation]));
+    let mut view = ViewState::new((1, 1), (W, H));
+    view.set_zoom_at(48.0, (32.0, 24.0));
+    let got = px(&draw(&gpu, &r, &view), 32, 24);
+    assert!(near(got, want, 2), "GPU preview {got:?} vs saved {want:?}");
+    assert_ne!(got, [200, 100, 50, 255], "the adjustment did something");
+}

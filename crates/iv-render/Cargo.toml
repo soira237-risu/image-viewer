@@ -14,5 +14,6 @@ fast_image_resize.workspace = true
 
 [dev-dependencies]
 pollster.workspace = true
+iv-ops.workspace = true
 bytemuck.workspace = true
 

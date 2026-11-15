@@ -24,6 +24,8 @@ pub enum Command {
     ViewZoomIn,
     ViewZoomOut,
     ViewToggleFullscreen,
+    /// The edit panel: sliders, resize, buttons.
+    ViewToggleEditPanel,
     /// Two pages side by side (comics).
     ViewToggleSpread,
     /// Two-page reading direction: right-to-left (manga) or left-to-right.
@@ -34,7 +36,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 23] = [
+    pub const ALL: [Command; 24] = [
         Command::FileOpen,
         Command::FileSave,
         Command::FileSaveAs,
@@ -54,6 +56,7 @@ impl Command {
         Command::ViewZoomIn,
         Command::ViewZoomOut,
         Command::ViewToggleFullscreen,
+        Command::ViewToggleEditPanel,
         Command::ViewToggleSpread,
         Command::ViewToggleDirection,
         Command::Escape,
@@ -81,6 +84,7 @@ impl Command {
             Command::ViewZoomIn => "view.zoom_in",
             Command::ViewZoomOut => "view.zoom_out",
             Command::ViewToggleFullscreen => "view.toggle_fullscreen",
+            Command::ViewToggleEditPanel => "view.toggle_edit_panel",
             Command::ViewToggleSpread => "view.toggle_spread",
             Command::ViewToggleDirection => "view.toggle_direction",
             Command::Escape => "app.escape",
