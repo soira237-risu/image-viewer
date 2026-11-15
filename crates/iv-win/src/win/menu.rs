@@ -9,34 +9,35 @@ use windows::core::PCWSTR;
 
 use super::wide;
 use crate::commands::Command;
+use crate::i18n::Strings;
 use crate::keymap::Keymap;
 
 /// Menu layout: commands in groups; `None` is a separator.
-const ITEMS: &[Option<(Command, &str)>] = &[
-    Some((Command::FileOpen, "Open…")),
-    Some((Command::FileSave, "Save")),
-    Some((Command::FileSaveAs, "Save as…")),
+const ITEMS: &[Option<Command>] = &[
+    Some(Command::FileOpen),
+    Some(Command::FileSave),
+    Some(Command::FileSaveAs),
     None,
-    Some((Command::EditRotateCw, "Rotate right")),
-    Some((Command::EditRotateCcw, "Rotate left")),
-    Some((Command::EditFlipH, "Flip horizontally")),
-    Some((Command::EditFlipV, "Flip vertically")),
-    Some((Command::EditCrop, "Crop to selection")),
-    Some((Command::EditUndo, "Undo")),
-    Some((Command::EditRedo, "Redo")),
+    Some(Command::EditRotateCw),
+    Some(Command::EditRotateCcw),
+    Some(Command::EditFlipH),
+    Some(Command::EditFlipV),
+    Some(Command::EditCrop),
+    Some(Command::EditUndo),
+    Some(Command::EditRedo),
     None,
-    Some((Command::ViewFit, "Fit to window")),
-    Some((Command::ViewActualSize, "Actual size")),
-    Some((Command::ViewZoomIn, "Zoom in")),
-    Some((Command::ViewZoomOut, "Zoom out")),
-    Some((Command::ViewToggleFullscreen, "Full screen")),
-    Some((Command::ViewToggleSpread, "Two pages")),
-    Some((Command::ViewToggleDirection, "Right to left")),
+    Some(Command::ViewFit),
+    Some(Command::ViewActualSize),
+    Some(Command::ViewZoomIn),
+    Some(Command::ViewZoomOut),
+    Some(Command::ViewToggleFullscreen),
+    Some(Command::ViewToggleSpread),
+    Some(Command::ViewToggleDirection),
     None,
-    Some((Command::ViewToggleEditPanel, "Edit panel")),
-    Some((Command::AppSettings, "Settings")),
+    Some(Command::ViewToggleEditPanel),
+    Some(Command::AppSettings),
     None,
-    Some((Command::AppQuit, "Quit")),
+    Some(Command::AppQuit),
 ];
 
 /// What the menu shows as checked or unavailable.
@@ -94,15 +95,16 @@ fn flags_for(cmd: Command, s: &MenuState) -> MENU_ITEM_FLAGS {
 }
 
 /// Shows the menu at screen point `at` and returns the chosen command.
-pub fn show(owner: HWND, at: (i32, i32), keymap: &Keymap, state: &MenuState) -> Option<Command> {
+pub fn show(owner: HWND, at: (i32, i32), keymap: &Keymap, strings: &Strings, state: &MenuState) -> Option<Command> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
         for item in ITEMS {
             match item {
-                Some((cmd, label)) => {
+                Some(cmd) => {
+                    let label = strings.command(*cmd);
                     let text = match keymap.chord_for(*cmd) {
                         Some(chord) => format!("{label}\t{chord}"),
-                        None => (*label).to_string(),
+                        None => label.to_string(),
                     };
                     let w = wide(&text);
                     let _ = AppendMenuW(menu, flags_for(*cmd, state), id_of(*cmd), PCWSTR(w.as_ptr()));
@@ -129,7 +131,7 @@ mod tests {
         for cmd in Command::ALL {
             assert_eq!(Command::ALL[id_of(cmd) - 1], cmd);
         }
-        let listed: Vec<Command> = ITEMS.iter().flatten().map(|(c, _)| *c).collect();
+        let listed: Vec<Command> = ITEMS.iter().flatten().copied().collect();
         for cmd in Command::ALL {
             let expected = !matches!(
                 cmd,

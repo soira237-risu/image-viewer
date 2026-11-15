@@ -26,6 +26,7 @@ use super::dialogs::{self, Answer, Filter};
 use super::{UiEvent, keys, menu, panel, settings_window, wake, wide};
 use crate::commands::Command;
 use crate::edit::{drag_rect, in_place_format, save_request, selection_to_crop};
+use crate::i18n::{Strings, fill};
 use crate::keymap::{Chord, Keymap};
 use crate::panel::{PanelAction, PanelContext, PanelState, follow_aspect};
 use crate::raster::{self, Frame, Page, Picture, Style};
@@ -318,7 +319,7 @@ impl App {
                     self.index = Some(0);
                     self.request(first);
                 }
-                Ok(_) => self.set_error(format!("{}: no images inside", file_name(&path))),
+                Ok(_) => self.set_error(fill(self.t().no_images_inside, &[("name", &file_name(&path))])),
                 Err(e) => self.set_error(format!("{}: {e}", file_name(&path))),
             }
             return;
@@ -333,6 +334,11 @@ impl App {
                 send(&tx, AppEvent::Folder { for_path: path, result });
             })
             .expect("spawn folder scan");
+    }
+
+    /// The UI's words in the chosen language.
+    fn t(&self) -> &'static Strings {
+        self.settings.language.strings()
     }
 
     fn set_error(&mut self, e: String) {
@@ -554,6 +560,7 @@ impl App {
 
     fn update_title(&self) {
         let Some(hwnd) = self.hwnd else { return };
+        let t = self.t();
         let position = match (&self.folder, self.index) {
             (Some(f), Some(i)) if self.partner().is_some() => format!("[{}-{}/{}] ", i + 1, i + 2, f.len()),
             (Some(f), Some(i)) => format!("[{}/{}] ", i + 1, f.len()),
@@ -564,7 +571,7 @@ impl App {
             (Some(cur), None) => {
                 let name = file_name(&cur.path);
                 match &cur.info {
-                    None => format!("{position}{name} — loading"),
+                    None => format!("{position}{name} — {}", t.loading),
                     Some(info) => {
                         let (w, h) = if self.edits.is_empty() {
                             info.display_size()
@@ -577,20 +584,20 @@ impl App {
                             .filter(|d| d.path == cur.path)
                             .map_or(String::new(), |d| format!(" — {}%", (d.view.zoom() * 100.0).round()));
                         let state = match (&cur.full, cur.load_time) {
-                            (Some(_), Some(t)) => {
-                                format!("{} · {} · {:.0} ms", info.format, info.codec, t.as_secs_f64() * 1000.0)
+                            (Some(_), Some(elapsed)) => {
+                                format!("{} · {} · {:.0} ms", info.format, info.codec, elapsed.as_secs_f64() * 1000.0)
                             }
-                            (Some(_), None) => format!("{} · {} · cached", info.format, info.codec),
-                            (None, _) if cur.preview.is_some() => format!("{} · preview", info.format),
-                            (None, _) => format!("{} · loading", info.format),
+                            (Some(_), None) => format!("{} · {} · {}", info.format, info.codec, t.cached),
+                            (None, _) if cur.preview.is_some() => format!("{} · {}", info.format, t.preview),
+                            (None, _) => format!("{} · {}", info.format, t.loading),
                         };
                         let edited = if self.edits.is_empty() { "" } else { "*" };
-                        let saving = if self.saving { " · saving…" } else { "" };
+                        let saving = if self.saving { format!(" · {}", t.saving) } else { String::new() };
                         format!("{position}{name}{edited} — {w}×{h}{zoom} — {state}{saving}")
                     }
                 }
             }
-            (None, None) => "image-viewer — Ctrl+O to open, or drop a file".to_string(),
+            (None, None) => format!("image-viewer — {}", t.title_empty),
         };
         let w = wide(&title);
         unsafe {
@@ -738,8 +745,8 @@ impl App {
             FormatId::ALL.iter().flat_map(|f| f.extensions().iter().map(|e| format!("*.{e}"))).collect();
         patterns.extend(["*.zip", "*.cbz", "*.7z", "*.cb7"].map(String::from));
         let filters = [
-            Filter { name: "Images and archives".into(), patterns: patterns.join(";") },
-            Filter { name: "All files".into(), patterns: "*.*".into() },
+            Filter { name: self.t().filter_images.into(), patterns: patterns.join(";") },
+            Filter { name: self.t().filter_all.into(), patterns: "*.*".into() },
         ];
         if let Some(path) = dialogs::open_file(hwnd, &filters) {
             self.open(path);
@@ -798,7 +805,7 @@ impl App {
         self.panel.open = !self.panel.open;
         self.trace.mark(&format!("edit panel: {}", if self.panel.open { "open" } else { "closed" }));
         match (self.panel.open, self.hwnd) {
-            (true, Some(h)) => match panel::show(h, !self.no_activate) {
+            (true, Some(h)) => match panel::show(h, !self.no_activate, self.t()) {
                 Ok(()) => self.sync_panel(),
                 Err(e) => {
                     self.panel.open = false;
@@ -826,7 +833,14 @@ impl App {
         match e {
             UiEvent::Panel(a) => self.apply_panel_action(a),
             UiEvent::SettingsChanged(s) => {
+                let language_changed = s.language != self.settings.language;
                 self.settings = s.clamped();
+                if language_changed {
+                    let t = self.t();
+                    panel::set_language(t);
+                    settings_window::set_language(t);
+                    self.update_title();
+                }
                 self.panel.quality = self.settings.save_quality;
                 self.settings_changed();
             }
@@ -849,7 +863,7 @@ impl App {
         let Some(path) = self.settings_path.clone() else { return };
         match self.settings.save(&path) {
             Ok(()) => self.trace.mark(&format!("settings saved to {}", path.display())),
-            Err(e) => self.set_error(format!("settings: {e}")),
+            Err(e) => self.set_error(fill(self.t().settings_error, &[("error", &e)])),
         }
     }
 
@@ -882,7 +896,7 @@ impl App {
             PanelAction::Adjust(a) => {
                 self.panel.adjust = a;
                 if self.spread.is_some() {
-                    self.set_error("editing works in single-page view (press D)".into());
+                    self.set_error(self.t().edit_single_page.into());
                 } else if self.current.as_ref().is_some_and(|c| c.info.is_some()) {
                     self.edits.push_or_replace(Op::Adjust(a), |o| matches!(o, Op::Adjust(_)));
                     self.after_edit_change();
@@ -989,7 +1003,7 @@ impl App {
 
     fn edit(&mut self, op: Op) {
         if self.spread.is_some() {
-            self.set_error("editing works in single-page view (press D)".into());
+            self.set_error(self.t().edit_single_page.into());
             return;
         }
         if self.current.as_ref().is_some_and(|c| c.info.is_some()) {
@@ -1090,9 +1104,9 @@ impl App {
             Err(e) => {
                 eprintln!("save failed: {e}");
                 if let Some(h) = self.hwnd {
-                    dialogs::show_error(h, &format!("Save failed: {e}"));
+                    dialogs::show_error(h, &fill(self.t().save_failed, &[("error", &e)]));
                 }
-                self.error = Some(format!("save failed: {e}"));
+                self.error = Some(fill(self.t().save_failed, &[("error", &e)]));
             }
         }
         self.sync_panel();
@@ -1107,12 +1121,12 @@ impl App {
         }
         let Some(hwnd) = self.hwnd else { return true };
         let name = self.current.as_ref().map(|c| file_name(&c.path)).unwrap_or_default();
-        match dialogs::ask_yes_no_cancel(hwnd, &format!("Save changes to {name}?")) {
+        match dialogs::ask_yes_no_cancel(hwnd, &fill(self.t().ask_save_changes, &[("name", &name)])) {
             Answer::Yes => {
                 let Some(cur) = &self.current else { return true };
                 let format_ok = cur.info.as_ref().and_then(|i| in_place_format(&self.encoders, i.format)).is_some();
                 if !format_ok {
-                    self.set_error("this format cannot be written; use Save As".into());
+                    self.set_error(self.t().format_not_writable.into());
                     return false;
                 }
                 let saved =
@@ -1128,7 +1142,7 @@ impl App {
                         true
                     }
                     Err(e) => {
-                        self.set_error(format!("save failed: {e}"));
+                        self.set_error(fill(self.t().save_failed, &[("error", &e)]));
                         false
                     }
                 }
@@ -1392,7 +1406,7 @@ impl App {
                     }
                     (x, y) = (pt.x, pt.y);
                 }
-                if let Some(cmd) = menu::show(hwnd, (x, y), &self.keymap, &self.menu_state()) {
+                if let Some(cmd) = menu::show(hwnd, (x, y), &self.keymap, self.t(), &self.menu_state()) {
                     self.run_command(cmd, false);
                 }
                 Some(LRESULT(0))

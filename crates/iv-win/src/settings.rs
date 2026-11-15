@@ -3,6 +3,8 @@
 
 use std::path::Path;
 
+use crate::i18n::Language;
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -20,6 +22,8 @@ pub struct Settings {
     pub nearest_above_zoom: f32,
     /// JPEG / WebP / AVIF quality for Save and Save As.
     pub save_quality: u8,
+    /// Language of menus, windows and messages (`"ko"` or `"en"`).
+    pub language: Language,
 }
 
 impl Default for Settings {
@@ -32,6 +36,7 @@ impl Default for Settings {
             spread_right_to_left: true,
             nearest_above_zoom: 3.0,
             save_quality: 90,
+            language: Language::Korean,
         }
     }
 }
@@ -76,7 +81,13 @@ mod tests {
     fn round_trip_and_partial_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("settings.toml");
-        let mut s = Settings { wrap: false, save_quality: 70, background: [255, 0, 10], ..Default::default() };
+        let mut s = Settings {
+            wrap: false,
+            save_quality: 70,
+            background: [255, 0, 10],
+            language: Language::English,
+            ..Default::default()
+        };
         s.save(&path).unwrap();
         assert_eq!(Settings::load(&path), (s.clone(), None));
 

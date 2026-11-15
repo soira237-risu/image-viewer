@@ -9,10 +9,11 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemServices::SS_SUNKEN;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::w;
+use windows::core::{PCWSTR, w};
 
 use super::controls::{self, Builder};
-use super::{UiEvent, dialogs, post_ui};
+use super::{UiEvent, dialogs, post_ui, wide};
+use crate::i18n::{Language, Strings};
 use crate::settings::Settings;
 
 const ID_PREFETCH: i32 = 100;
@@ -24,13 +25,18 @@ const ID_QUALITY: i32 = 105;
 const ID_COLOUR: i32 = 106;
 const ID_SAVE: i32 = 107;
 const ID_DEFAULTS: i32 = 108;
+const ID_LANGUAGE: i32 = 109;
 const ID_CANCEL: i32 = 2;
 
-const WIDTH: i32 = 340;
-const HEIGHT: i32 = 300;
+const WIDTH: i32 = 360;
+const HEIGHT: i32 = 334;
+
+/// A label in the current language, so controls can be relabelled when it changes.
+type Text = fn(&Strings) -> &'static str;
 
 struct Window {
     hwnd: HWND,
+    language: HWND,
     prefetch: HWND,
     cache: HWND,
     wrap: HWND,
@@ -38,6 +44,8 @@ struct Window {
     nearest: HWND,
     quality: HWND,
     swatch: HWND,
+    /// Controls showing translated text.
+    texts: Vec<(HWND, Text)>,
 }
 
 thread_local! {
@@ -51,7 +59,7 @@ pub fn hwnd() -> Option<HWND> {
     WINDOW.with(|w| w.borrow().as_ref().map(|w| w.hwnd))
 }
 
-fn create(owner: HWND) -> windows::core::Result<Window> {
+fn create(owner: HWND, s: &Strings) -> windows::core::Result<Window> {
     unsafe {
         let instance = GetModuleHandleW(None).expect("module handle");
         let class = WNDCLASSW {
@@ -71,10 +79,11 @@ fn create(owner: HWND) -> windows::core::Result<Window> {
         let mut o = RECT::default();
         let _ = GetWindowRect(owner, &mut o);
         let (w, h) = (r.right - r.left, r.bottom - r.top);
+        let title = wide(s.settings);
         let hwnd = CreateWindowExW(
             ex,
             w!("iv-settings"),
-            w!("Settings"),
+            PCWSTR(title.as_ptr()),
             style,
             (o.left + o.right - w) / 2,
             (o.top + o.bottom - h) / 2,
@@ -86,37 +95,54 @@ fn create(owner: HWND) -> windows::core::Result<Window> {
             None,
         )?;
         let b = Builder { parent: hwnd, dpi, font: controls::message_font(dpi) };
-        let label = |text: &str, y| b.add(w!("STATIC"), text, 0, 12, y + 3, 200, 18, 0);
+        let texts = RefCell::new(Vec::<(HWND, Text)>::new());
+        let keep = |h: HWND, text: Text| {
+            texts.borrow_mut().push((h, text));
+            h
+        };
+        let label = |text: Text, y| -> windows::core::Result<HWND> {
+            Ok(keep(b.add(w!("STATIC"), text(s), 0, 12, y + 3, 220, 18, 0)?, text))
+        };
         let field = |y, id, number: bool| {
             let mut style = ES_AUTOHSCROLL | WS_TABSTOP.0 as i32 | WS_BORDER.0 as i32;
             if number {
                 style |= ES_NUMBER;
             }
-            b.add(w!("EDIT"), "", style as u32, 220, y, 108, 24, id)
+            b.add(w!("EDIT"), "", style as u32, 240, y, 108, 24, id)
         };
-        let check = |text: &str, y, id| {
-            b.add(w!("BUTTON"), text, (BS_AUTOCHECKBOX | WS_TABSTOP.0 as i32) as u32, 12, y, 316, 22, id)
+        let check = |text: Text, y, id| -> windows::core::Result<HWND> {
+            let style = (BS_AUTOCHECKBOX | WS_TABSTOP.0 as i32) as u32;
+            Ok(keep(b.add(w!("BUTTON"), text(s), style, 12, y, 336, 22, id)?, text))
         };
-        label("Images decoded ahead", 10)?;
-        let prefetch = field(10, ID_PREFETCH, true)?;
-        label("Cache memory (MiB)", 40)?;
-        let cache = field(40, ID_CACHE, true)?;
-        let wrap = check("Wrap around at the ends", 70, ID_WRAP)?;
-        let rtl = check("Two pages read right to left", 96, ID_RTL)?;
-        label("Sharp pixels above zoom (×)", 124)?;
-        let nearest = field(124, ID_NEAREST, false)?;
-        label("Save quality (1–100)", 154)?;
-        let quality = field(154, ID_QUALITY, true)?;
-        label("Background", 186)?;
-        let swatch = b.add(w!("STATIC"), "", SS_SUNKEN.0, 220, 184, 40, 24, 0)?;
-        let button = |text: &str, x, y, w, id| {
-            b.add(w!("BUTTON"), text, (BS_PUSHBUTTON | WS_TABSTOP.0 as i32) as u32, x, y, w, 26, id)
+        let button = |text: Text, x, y, w, id| -> windows::core::Result<HWND> {
+            let style = (BS_PUSHBUTTON | WS_TABSTOP.0 as i32) as u32;
+            Ok(keep(b.add(w!("BUTTON"), text(s), style, x, y, w, 26, id)?, text))
         };
-        button("Choose…", 266, 183, 62, ID_COLOUR)?;
-        b.add(w!("STATIC"), "Cache memory applies after a restart.", 0, 12, 222, 316, 18, 0)?;
-        button("Save", 136, 258, 92, ID_SAVE)?;
-        button("Defaults", 236, 258, 92, ID_DEFAULTS)?;
-        Ok(Window { hwnd, prefetch, cache, wrap, rtl, nearest, quality, swatch })
+        label(|s| s.language, 10)?;
+        let combo_style = (CBS_DROPDOWNLIST | WS_TABSTOP.0 as i32 | WS_VSCROLL.0 as i32) as u32;
+        let language = b.add(w!("COMBOBOX"), "", combo_style, 240, 10, 108, 120, ID_LANGUAGE)?;
+        for l in Language::ALL {
+            let name = wide(l.native_name());
+            SendMessageW(language, CB_ADDSTRING, None, Some(LPARAM(name.as_ptr() as isize)));
+        }
+        label(|s| s.prefetch_count, 44)?;
+        let prefetch = field(44, ID_PREFETCH, true)?;
+        label(|s| s.cache_memory, 74)?;
+        let cache = field(74, ID_CACHE, true)?;
+        let wrap = check(|s| s.wrap, 104, ID_WRAP)?;
+        let rtl = check(|s| s.spread_rtl, 130, ID_RTL)?;
+        label(|s| s.sharp_pixels, 158)?;
+        let nearest = field(158, ID_NEAREST, false)?;
+        label(|s| s.save_quality_range, 188)?;
+        let quality = field(188, ID_QUALITY, true)?;
+        label(|s| s.background, 220)?;
+        let swatch = b.add(w!("STATIC"), "", SS_SUNKEN.0, 240, 218, 40, 24, 0)?;
+        button(|s| s.choose, 286, 217, 62, ID_COLOUR)?;
+        keep(b.add(w!("STATIC"), s.cache_note, 0, 12, 256, 336, 18, 0)?, |s| s.cache_note);
+        button(|s| s.save, 156, 292, 92, ID_SAVE)?;
+        button(|s| s.defaults, 256, 292, 92, ID_DEFAULTS)?;
+        let texts = texts.into_inner();
+        Ok(Window { hwnd, language, prefetch, cache, wrap, rtl, nearest, quality, swatch, texts })
     }
 }
 
@@ -150,6 +176,10 @@ fn fill(s: &Settings) {
         controls::set_checked(w.rtl, s.spread_right_to_left);
         controls::set_text(w.nearest, &format!("{}", s.nearest_above_zoom));
         controls::set_text(w.quality, &s.save_quality.to_string());
+        let index = Language::ALL.iter().position(|l| *l == s.language).unwrap_or(0);
+        unsafe {
+            SendMessageW(w.language, CB_SETCURSEL, Some(WPARAM(index)), None);
+        }
         SYNCING.with(|c| c.set(false));
     });
     set_swatch(s.background);
@@ -158,7 +188,9 @@ fn fill(s: &Settings) {
 /// Opens the window on a copy of `s`.
 pub fn show(owner: HWND, s: &Settings, activate: bool) -> Result<(), String> {
     if hwnd().is_none() {
-        let w = create(owner).map_err(|e| format!("cannot create the settings window: {e}"))?;
+        let t = s.language.strings();
+        let w =
+            create(owner, t).map_err(|e| crate::i18n::fill(t.settings_window_error, &[("error", &e.to_string())]))?;
         WINDOW.with(|c| *c.borrow_mut() = Some(w));
     }
     VALUE.with(|v| *v.borrow_mut() = s.clone());
@@ -169,6 +201,18 @@ pub fn show(owner: HWND, s: &Settings, activate: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Relabels the window (if it exists) in another language.
+pub fn set_language(s: &Strings) {
+    WINDOW.with(|w| {
+        let w = w.borrow();
+        let Some(w) = w.as_ref() else { return };
+        controls::set_text(w.hwnd, s.settings);
+        for (h, text) in &w.texts {
+            controls::set_text(*h, text(s));
+        }
+    });
 }
 
 pub fn hide() {
@@ -200,6 +244,10 @@ fn read(prev: &Settings) -> Settings {
         }
         s.wrap = controls::checked(w.wrap);
         s.spread_right_to_left = controls::checked(w.rtl);
+        let index = unsafe { SendMessageW(w.language, CB_GETCURSEL, None, None).0 };
+        if let Some(l) = usize::try_from(index).ok().and_then(|i| Language::ALL.get(i)) {
+            s.language = *l;
+        }
         s
     })
 }
@@ -215,7 +263,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             let (id, code) = ((wp.0 & 0xffff) as i32, ((wp.0 >> 16) & 0xffff) as u32);
             let current = VALUE.with(|v| v.borrow().clone());
             match (id, code) {
-                (ID_PREFETCH | ID_CACHE | ID_NEAREST | ID_QUALITY, EN_CHANGE) | (ID_WRAP | ID_RTL, BN_CLICKED) => {
+                (ID_PREFETCH | ID_CACHE | ID_NEAREST | ID_QUALITY, EN_CHANGE)
+                | (ID_WRAP | ID_RTL, BN_CLICKED)
+                | (ID_LANGUAGE, CBN_SELCHANGE) => {
                     changed(read(&current));
                 }
                 (ID_COLOUR, BN_CLICKED) => {

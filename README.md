@@ -65,6 +65,7 @@ cargo build --release
 | Ctrl+W, Ctrl+Q | 종료 |
 
 설정은 F2 또는 `%APPDATA%\image-viewer\settings.toml` (`--settings <파일>`로 다른 파일 지정).
+n화면 언어는 한국어가 기본이고 설정(F2)의 "언어"에서 English로 바꿀 수 있음 (바로 적용, `settings.toml`의 `language = "ko"` / `"en"`).
 
 단축키는 `%APPDATA%\image-viewer\keymap.toml`로 바꿀 수 있음 (`--keymap <파일>`로 다른 파일 지정):
 

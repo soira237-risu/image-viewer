@@ -47,3 +47,5 @@ debug = "line-tables-only"
 # Decoders are the hot path; keep them optimized even in dev builds so timings stay meaningful.
 [profile.dev.package."*"]
 opt-level = 3
+# dependencies carry no debug info: it made target/debug grow past 50 GB; our own crates keep theirs
+debug = false

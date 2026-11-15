@@ -4,6 +4,7 @@
 
 pub mod commands;
 pub mod edit;
+pub mod i18n;
 pub mod keymap;
 pub mod panel;
 pub mod raster;

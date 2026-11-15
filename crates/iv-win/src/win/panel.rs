@@ -12,10 +12,11 @@ use windows::Win32::System::SystemServices::SS_RIGHT;
 use windows::Win32::UI::Controls::{TBS_NOTICKS, TRACKBAR_CLASSW};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::w;
+use windows::core::{PCWSTR, w};
 
 use super::controls::{self, Builder};
-use super::{UiEvent, post_ui};
+use super::{UiEvent, post_ui, wide};
+use crate::i18n::{Strings, fill};
 use crate::panel::{
     PanelAction, PanelContext, PanelState, gamma_from_position, gamma_to_position, unit_from_position, unit_to_position,
 };
@@ -41,6 +42,9 @@ const ID_CANCEL: i32 = 2;
 const WIDTH: i32 = 260;
 const HEIGHT: i32 = 556;
 
+/// A label in the current language, so controls can be relabelled when it changes.
+type Text = fn(&Strings) -> &'static str;
+
 struct Panel {
     hwnd: HWND,
     /// brightness, contrast, saturation, gamma
@@ -57,6 +61,8 @@ struct Panel {
     quality: HWND,
     quality_value: HWND,
     edit_buttons: [HWND; 5],
+    /// Controls showing translated text.
+    texts: Vec<(HWND, Text)>,
 }
 
 thread_local! {
@@ -69,7 +75,7 @@ pub fn hwnd() -> Option<HWND> {
     PANEL.with(|p| p.borrow().as_ref().map(|p| p.hwnd))
 }
 
-fn create(owner: HWND) -> windows::core::Result<Panel> {
+fn create(owner: HWND, s: &Strings) -> windows::core::Result<Panel> {
     unsafe {
         let instance = GetModuleHandleW(None).expect("module handle");
         let class = WNDCLASSW {
@@ -89,10 +95,11 @@ fn create(owner: HWND) -> windows::core::Result<Panel> {
         let mut owner_rect = RECT::default();
         let _ = GetWindowRect(owner, &mut owner_rect);
         let (w, h) = (r.right - r.left, r.bottom - r.top);
+        let title = wide(s.panel_title);
         let hwnd = CreateWindowExW(
             ex,
             w!("iv-edit-panel"),
-            w!("Edit"),
+            PCWSTR(title.as_ptr()),
             style,
             owner_rect.right - w - 24 * dpi as i32 / 96,
             owner_rect.top + 64 * dpi as i32 / 96,
@@ -105,51 +112,53 @@ fn create(owner: HWND) -> windows::core::Result<Panel> {
         )?;
 
         let b = Builder { parent: hwnd, dpi, font: controls::message_font(dpi) };
-        let button = |text: &str, x, y, w, id| {
-            b.add(w!("BUTTON"), text, (BS_PUSHBUTTON | WS_TABSTOP.0 as i32) as u32, x, y, w, 26, id)
+        let texts = RefCell::new(Vec::<(HWND, Text)>::new());
+        let button = |text: Text, x, y, w, id| -> windows::core::Result<HWND> {
+            let h = b.add(w!("BUTTON"), text(s), (BS_PUSHBUTTON | WS_TABSTOP.0 as i32) as u32, x, y, w, 26, id)?;
+            texts.borrow_mut().push((h, text));
+            Ok(h)
         };
-        let label = |text: &str, x, y, w| b.add(w!("STATIC"), text, 0, x, y, w, 18, 0);
+        let label = |text: Text, x, y, w| -> windows::core::Result<HWND> {
+            let h = b.add(w!("STATIC"), text(s), 0, x, y, w, 18, 0)?;
+            texts.borrow_mut().push((h, text));
+            Ok(h)
+        };
         let edit_buttons = [
-            button("Rotate left", 10, 10, 115, ID_ROTATE_LEFT)?,
-            button("Rotate right", 135, 10, 115, ID_ROTATE_RIGHT)?,
-            button("Flip horizontally", 10, 40, 115, ID_FLIP_H)?,
-            button("Flip vertically", 135, 40, 115, ID_FLIP_V)?,
-            button("Reset adjustments", 10, 280, 240, ID_RESET)?,
+            button(|s| s.rotate_ccw, 10, 10, 115, ID_ROTATE_LEFT)?,
+            button(|s| s.rotate_cw, 135, 10, 115, ID_ROTATE_RIGHT)?,
+            button(|s| s.flip_h, 10, 40, 115, ID_FLIP_H)?,
+            button(|s| s.flip_v, 135, 40, 115, ID_FLIP_V)?,
+            button(|s| s.reset_adjustments, 10, 280, 240, ID_RESET)?,
         ];
+        let names: [Text; 4] = [|s| s.brightness, |s| s.contrast, |s| s.saturation, |s| s.gamma];
         let mut sliders = [HWND::default(); 4];
         let mut values = [HWND::default(); 4];
-        for (i, name) in ["Brightness", "Contrast", "Saturation", "Gamma"].iter().enumerate() {
+        for (i, name) in names.into_iter().enumerate() {
             let y = 76 + 50 * i as i32;
             label(name, 12, y, 150)?;
             values[i] = b.add(w!("STATIC"), "", SS_RIGHT.0, 190, y, 58, 18, 0)?;
             sliders[i] = b.add(TRACKBAR_CLASSW, "", TBS_NOTICKS | WS_TABSTOP.0, 4, y + 18, 252, 28, 200 + i as i32)?;
             controls::trackbar_init(sliders[i], -100, 100, 10);
         }
-        label("Resize", 12, 318, 150)?;
+        label(|s| s.resize, 12, 318, 150)?;
         let edit_style = (ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP.0 as i32 | WS_BORDER.0 as i32) as u32;
         let width = b.add(w!("EDIT"), "", edit_style, 10, 338, 90, 24, ID_WIDTH)?;
-        label("×", 108, 341, 14)?;
+        b.add(w!("STATIC"), "×", 0, 108, 341, 14, 18, 0)?;
         let height = b.add(w!("EDIT"), "", edit_style, 124, 338, 90, 24, ID_HEIGHT)?;
-        let keep_aspect = b.add(
-            w!("BUTTON"),
-            "Keep aspect ratio",
-            (BS_AUTOCHECKBOX | WS_TABSTOP.0 as i32) as u32,
-            10,
-            368,
-            240,
-            22,
-            ID_KEEP_ASPECT,
-        )?;
-        let half = button("50%", 10, 394, 115, ID_HALF)?;
-        let apply = button("Apply", 135, 394, 115, ID_APPLY)?;
-        let undo = button("Undo", 10, 430, 115, ID_UNDO)?;
-        let redo = button("Redo", 135, 430, 115, ID_REDO)?;
-        label("Save quality", 12, 466, 150)?;
+        let check_style = (BS_AUTOCHECKBOX | WS_TABSTOP.0 as i32) as u32;
+        let keep_aspect = b.add(w!("BUTTON"), s.keep_aspect, check_style, 10, 368, 240, 22, ID_KEEP_ASPECT)?;
+        texts.borrow_mut().push((keep_aspect, |s| s.keep_aspect));
+        let half =
+            b.add(w!("BUTTON"), "50%", (BS_PUSHBUTTON | WS_TABSTOP.0 as i32) as u32, 10, 394, 115, 26, ID_HALF)?;
+        let apply = button(|s| s.apply, 135, 394, 115, ID_APPLY)?;
+        let undo = button(|s| s.undo, 10, 430, 115, ID_UNDO)?;
+        let redo = button(|s| s.redo, 135, 430, 115, ID_REDO)?;
+        label(|s| s.save_quality, 12, 466, 150)?;
         let quality_value = b.add(w!("STATIC"), "", SS_RIGHT.0, 190, 466, 58, 18, 0)?;
         let quality = b.add(TRACKBAR_CLASSW, "", TBS_NOTICKS | WS_TABSTOP.0, 4, 484, 252, 28, 300)?;
         controls::trackbar_init(quality, 1, 100, 5);
-        let save = button("Save", 10, 520, 115, ID_SAVE)?;
-        let _ = button("Save as…", 135, 520, 115, ID_SAVE_AS)?;
+        let save = button(|s| s.save, 10, 520, 115, ID_SAVE)?;
+        button(|s| s.save_as, 135, 520, 115, ID_SAVE_AS)?;
         Ok(Panel {
             hwnd,
             sliders,
@@ -165,15 +174,16 @@ fn create(owner: HWND) -> windows::core::Result<Panel> {
             quality,
             quality_value,
             edit_buttons,
+            texts: texts.into_inner(),
         })
     }
 }
 
 /// Shows the panel (creating it on first use). With `activate` false it does not take focus.
-pub fn show(owner: HWND, activate: bool) -> Result<(), String> {
+pub fn show(owner: HWND, activate: bool, s: &Strings) -> Result<(), String> {
     let exists = PANEL.with(|p| p.borrow().is_some());
     if !exists {
-        let panel = create(owner).map_err(|e| format!("cannot create the edit panel: {e}"))?;
+        let panel = create(owner, s).map_err(|e| fill(s.panel_error, &[("error", &e.to_string())]))?;
         PANEL.with(|p| *p.borrow_mut() = Some(panel));
     }
     if let Some(h) = hwnd() {
@@ -182,6 +192,18 @@ pub fn show(owner: HWND, activate: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Relabels the panel (if it exists) in another language.
+pub fn set_language(s: &Strings) {
+    PANEL.with(|p| {
+        let p = p.borrow();
+        let Some(p) = p.as_ref() else { return };
+        controls::set_text(p.hwnd, s.panel_title);
+        for (h, text) in &p.texts {
+            controls::set_text(*h, text(s));
+        }
+    });
 }
 
 pub fn hide() {
