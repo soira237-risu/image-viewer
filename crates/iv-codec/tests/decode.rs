@@ -295,10 +295,14 @@ fn gif_decodes_exactly_when_the_palette_fits() {
     // four colours fit a GIF palette, so the round trip is exact
     let colours = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 255, 255]];
     let expected = RgbaImage::from_fn(12, 7, |x, y| Rgba(colours[((x / 3 + y) % 4) as usize]));
-    let d = decode("a.gif", encode(&DynamicImage::ImageRgba8(expected.clone()), ImageFormat::Gif));
+    let bytes = encode(&DynamicImage::ImageRgba8(expected.clone()), ImageFormat::Gif);
+    let probed = default_registry().probe(&Source::from_bytes("a.gif", bytes.clone())).unwrap();
+    assert_eq!(probed.frame_count, None, "a header probe cannot count GIF frames");
+    let d = decode("a.gif", bytes);
     assert_exact(&d, &expected);
     assert_eq!(d.info.format, FormatId::Gif);
-    assert_eq!(d.info.frame_count, None, "GIF frame count needs a full scan");
+    assert_eq!(d.info.frame_count, Some(1), "decoding scans every frame, so the count is known");
+    assert!(d.animation.is_none());
 }
 
 /// Lossless JPEG XL written by `zune-jpegxl`, decoded by jxl-oxide.
