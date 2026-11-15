@@ -105,7 +105,7 @@ impl Decoder for SvgDecoder {
             })
             .collect();
         let image = ImageBuf::new(info.width, info.height, PixelFormat::Rgba8, rgba)?;
-        Ok(Decoded { info, image })
+        Ok(Decoded::still(info, image))
     }
 }
 

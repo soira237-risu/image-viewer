@@ -22,6 +22,7 @@ bytemuck.workspace = true
 tempfile.workspace = true
 bytemuck.workspace = true
 zune-jpegxl.workspace = true
+png.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

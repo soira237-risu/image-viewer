@@ -246,6 +246,6 @@ impl Decoder for WicDecoder {
         cancel.check()?;
         let image = to_image(&frame.cast::<IWICBitmapSource>().map_err(wic_err)?, info.bits_per_channel > 8)?;
         cancel.check()?;
-        Ok(Decoded { info, image })
+        Ok(Decoded::still(info, image))
     }
 }

@@ -2,15 +2,17 @@
 //! OpenEXR, Radiance HDR — and JPEG as a fallback behind zune-jpeg.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use image::codecs::gif::GifDecoder;
 use image::codecs::png::PngDecoder;
 use image::codecs::webp::WebPDecoder;
-use image::{ColorType, DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
+use image::{AnimationDecoder, ColorType, DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
 use iv_core::{
     CancelToken, Error, FormatId, ImageBuf, ImageInfo, MAX_BUFFER_BYTES, Orientation, PixelFormat, Result, Source,
 };
 
-use crate::decoder::{Decoded, Decoder, DecoderInfo};
+use crate::decoder::{Animation, AnimationFrame, Decoded, Decoder, DecoderInfo};
 
 const ID: &str = "image-rs";
 
@@ -144,6 +146,57 @@ pub(crate) fn to_image_buf(img: DynamicImage) -> Result<ImageBuf> {
     }
 }
 
+/// Upper bound for the pixels of all frames of one animation. Longer animations are shown as
+/// their first frame rather than truncated (a cut animation would loop at the wrong point).
+pub const MAX_ANIMATION_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Browsers treat GIF delays of 0–10 ms as 100 ms; authors rely on it.
+pub fn effective_delay(numer: u32, denom: u32) -> Duration {
+    let ms = if denom == 0 { 0.0 } else { numer as f64 / denom as f64 };
+    if ms <= 10.0 { Duration::from_millis(100) } else { Duration::from_secs_f64(ms / 1000.0) }
+}
+
+/// Every composited frame of an animated GIF, WebP or APNG. `None` for formats or files that
+/// are not animation containers, and for animations over [`MAX_ANIMATION_BYTES`].
+fn decode_frames(src: &Source, format: FormatId, cancel: &CancelToken) -> Result<Option<Vec<AnimationFrame>>> {
+    let frames = match format {
+        FormatId::Gif => GifDecoder::new(src.reader()?).map_err(err)?.into_frames(),
+        FormatId::Webp => {
+            let dec = WebPDecoder::new(src.reader()?).map_err(err)?;
+            if !dec.has_animation() {
+                return Ok(None);
+            }
+            dec.into_frames()
+        }
+        FormatId::Png => {
+            let dec = PngDecoder::new(src.reader()?).map_err(err)?;
+            if !dec.is_apng().map_err(err)? {
+                return Ok(None);
+            }
+            dec.apng().map_err(err)?.into_frames()
+        }
+        _ => return Ok(None),
+    };
+    let mut out = Vec::new();
+    let mut total = 0u64;
+    for frame in frames {
+        cancel.check()?;
+        let frame = frame.map_err(err)?;
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        let buf = frame.into_buffer();
+        let (w, h) = buf.dimensions();
+        total += buf.len() as u64;
+        if total > MAX_ANIMATION_BYTES {
+            return Ok(None);
+        }
+        out.push(AnimationFrame {
+            image: ImageBuf::new(w, h, PixelFormat::Rgba8, buf.into_raw())?,
+            delay: effective_delay(numer, denom),
+        });
+    }
+    Ok((!out.is_empty()).then_some(out))
+}
+
 impl Decoder for ImageRsDecoder {
     fn info(&self) -> &DecoderInfo {
         &self.info
@@ -157,7 +210,19 @@ impl Decoder for ImageRsDecoder {
     fn decode(&self, src: &Source, format: FormatId, cancel: &CancelToken) -> Result<Decoded> {
         cancel.check()?;
         let mut dec = open(src, format)?;
-        let info = info_from(&mut dec, src, format)?;
+        let mut info = info_from(&mut dec, src, format)?;
+
+        if let Some(mut frames) = decode_frames(src, format, cancel)? {
+            info.frame_count = Some(frames.len() as u32);
+            // composited frames are 8-bit RGBA canvases
+            info.bits_per_channel = 8;
+            if frames.len() == 1 {
+                return Ok(Decoded::still(info, frames.remove(0).image));
+            }
+            let image = frames[0].image.clone();
+            return Ok(Decoded { info, image, animation: Some(Animation { frames }) });
+        }
+
         // refuse before allocating, with the size the RGBA output will need
         let out_format = match info.bits_per_channel {
             16 => PixelFormat::Rgba16,
@@ -169,6 +234,6 @@ impl Decoder for ImageRsDecoder {
         cancel.check()?;
         let image = to_image_buf(img)?;
         cancel.check()?;
-        Ok(Decoded { info, image })
+        Ok(Decoded::still(info, image))
     }
 }

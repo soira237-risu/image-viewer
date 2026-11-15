@@ -24,7 +24,7 @@ pub use builtin::jxl::JxlOxideDecoder;
 pub use builtin::svg::SvgDecoder;
 #[cfg(windows)]
 pub use builtin::wic::WicDecoder;
-pub use decoder::{Decoded, Decoder, DecoderInfo};
+pub use decoder::{Animation, AnimationFrame, Decoded, Decoder, DecoderInfo};
 pub use registry::{Identified, Registry};
 
 /// A registry with every built-in decoder registered.

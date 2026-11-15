@@ -212,7 +212,7 @@ impl Shared {
             match result {
                 Ok(decoded) => {
                     let decoded = Arc::new(decoded);
-                    let bytes = decoded.image.memory_size() as u64;
+                    let bytes = decoded.memory_size() as u64;
                     let is_current = st.plan.first() == Some(&job.path);
                     if st.plan.contains(&job.path) || quick_frame {
                         st.tick += 1;

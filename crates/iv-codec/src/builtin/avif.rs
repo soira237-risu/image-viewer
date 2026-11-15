@@ -102,7 +102,7 @@ impl Decoder for Rav1dAvifDecoder {
         let img = avif_decode::Decoder::from_avif(&bytes).and_then(|d| d.to_image()).map_err(err)?;
         let image = to_image_buf(img)?;
         cancel.check()?;
-        Ok(Decoded { info, image })
+        Ok(Decoded::still(info, image))
     }
 }
 

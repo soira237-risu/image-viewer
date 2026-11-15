@@ -32,6 +32,7 @@ avif-decode = { version = "3.0.0", default-features = false }
 avif-parse = "2.1"
 jxl-oxide = { version = "0.12.6", features = ["image"] }
 resvg = "0.50"
+png = "0.18"
 zune-jpegxl = "0.5.2"
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Imaging", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant"] }
 rfd = "0.18"

@@ -10,8 +10,9 @@ use iv_pipeline::{FolderList, Pipeline, PipelineConfig, PipelineEvent, prefetch_
 use iv_render::{Gpu, ImageRenderer, ViewState, ZoomMode, wgpu};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::StartCause;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
@@ -70,6 +71,46 @@ struct Display {
     path: PathBuf,
     kind: Shown,
     view: ViewState,
+    playback: Option<Playback>,
+}
+
+/// An animation being played on screen.
+struct Playback {
+    decoded: Arc<Decoded>,
+    frame: usize,
+    next_at: Instant,
+    started_at: Instant,
+    loop_logged: bool,
+}
+
+impl Playback {
+    fn start(decoded: &Arc<Decoded>) -> Option<Self> {
+        let anim = decoded.animation.as_ref()?;
+        let now = Instant::now();
+        Some(Self {
+            decoded: decoded.clone(),
+            frame: 0,
+            next_at: now + anim.frames[0].delay,
+            started_at: now,
+            loop_logged: false,
+        })
+    }
+
+    /// Advances to the frame that should be on screen at `now`, skipping frames when late.
+    /// Returns whether the frame changed.
+    fn advance(&mut self, now: Instant) -> bool {
+        let Some(anim) = self.decoded.animation.as_ref() else { return false };
+        let before = self.frame;
+        while now >= self.next_at {
+            self.frame = (self.frame + 1) % anim.frames.len();
+            self.next_at += anim.frames[self.frame].delay;
+            // after a long stall (minimised, debugger) resync instead of racing through frames
+            if now.saturating_duration_since(self.next_at) > Duration::from_secs(1) {
+                self.next_at = now + anim.frames[self.frame].delay;
+            }
+        }
+        self.frame != before
+    }
 }
 
 struct Surface {
@@ -103,6 +144,9 @@ pub struct App {
     last_click: Option<(Instant, PhysicalPosition<f64>)>,
     first_frame_logged: bool,
     gpu_init: Option<GpuInit>,
+    /// Open without taking keyboard focus (`--no-activate`, for automated checks that must not
+    /// capture keys meant for another window).
+    pub no_activate: bool,
 }
 
 /// GPU device creation started at launch, before the window exists.
@@ -175,6 +219,7 @@ impl App {
             last_click: None,
             first_frame_logged: false,
             gpu_init,
+            no_activate: false,
         }
     }
 
@@ -269,8 +314,10 @@ impl App {
     }
 
     fn create_surface(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
-        let attrs =
-            Window::default_attributes().with_title("image-viewer").with_inner_size(PhysicalSize::new(1280, 800));
+        let attrs = Window::default_attributes()
+            .with_title("image-viewer")
+            .with_inner_size(PhysicalSize::new(1280, 800))
+            .with_active(!self.no_activate);
         let window = Arc::new(event_loop.create_window(attrs).map_err(|e| e.to_string())?);
         self.trace.mark("window created");
 
@@ -355,12 +402,19 @@ impl App {
                 d.view.set_image_size(info.display_size());
             }
             _ => {
-                self.display =
-                    Some(Display { path: cur.path.clone(), kind, view: ViewState::new(info.display_size(), viewport) })
+                self.display = Some(Display {
+                    path: cur.path.clone(),
+                    kind,
+                    view: ViewState::new(info.display_size(), viewport),
+                    playback: None,
+                })
             }
         }
         if kind == Shown::Full {
             cur.preview = None;
+            if let (Some(d), Some(full)) = (&mut self.display, &cur.full) {
+                d.playback = Playback::start(full);
+            }
         }
         s.window.request_redraw();
     }
@@ -385,8 +439,12 @@ impl App {
             decoded.info.has_alpha,
         );
         self.trace.mark(&format!("passing image shown: {}", file_name(&path)));
-        self.display =
-            Some(Display { path, kind: Shown::Full, view: ViewState::new(decoded.info.display_size(), viewport) });
+        self.display = Some(Display {
+            path,
+            kind: Shown::Full,
+            view: ViewState::new(decoded.info.display_size(), viewport),
+            playback: None,
+        });
         s.window.request_redraw();
     }
 
@@ -615,7 +673,52 @@ impl App {
     }
 }
 
+impl App {
+    /// Shows the animation frame that is due, if any.
+    fn tick_animation(&mut self) {
+        let (Some(s), Some(d)) = (self.surface.as_mut(), self.display.as_mut()) else { return };
+        let Some(p) = d.playback.as_mut() else { return };
+        if !p.advance(Instant::now()) {
+            return;
+        }
+        let Some(anim) = p.decoded.animation.as_ref() else { return };
+        let info = &p.decoded.info;
+        s.renderer.set_image(
+            &s.gpu.device,
+            &s.gpu.queue,
+            &anim.frames[p.frame].image,
+            info.orientation,
+            info.has_alpha,
+        );
+        if p.frame == 0 && !p.loop_logged {
+            p.loop_logged = true;
+            let expected: Duration = anim.frames.iter().map(|f| f.delay).sum();
+            self.trace.mark(&format!(
+                "animation looped: {} frames in {:.0} ms (delays sum to {:.0} ms)",
+                anim.frames.len(),
+                p.started_at.elapsed().as_secs_f64() * 1000.0,
+                expected.as_secs_f64() * 1000.0
+            ));
+        }
+        s.window.request_redraw();
+    }
+}
+
 impl ApplicationHandler<AppEvent> for App {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if let StartCause::ResumeTimeReached { .. } = cause {
+            self.tick_animation();
+        }
+    }
+
+    /// Sleeps until the next animation frame is due, or until an event when nothing animates.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match self.display.as_ref().and_then(|d| d.playback.as_ref()) {
+            Some(p) => event_loop.set_control_flow(ControlFlow::WaitUntil(p.next_at)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.surface.is_some() {
             return;
@@ -707,5 +810,58 @@ mod tests {
         assert_eq!(map.lookup(&chord(Key::Named(NamedKey::Space), false, false)), Some(Command::NavNext));
         assert_eq!(map.lookup(&chord(Key::Named(NamedKey::ArrowLeft), false, false)), Some(Command::NavPrev));
         assert_eq!(map.lookup(&chord(Key::Named(NamedKey::Home), false, false)), Some(Command::NavFirst));
+    }
+}
+
+#[cfg(test)]
+mod playback_tests {
+    use super::*;
+    use iv_codec::{Animation, AnimationFrame};
+    use iv_core::{ImageBuf, ImageInfo, Orientation, PixelFormat};
+
+    fn animated(delays_ms: &[u64]) -> Arc<Decoded> {
+        let frame = || ImageBuf::new(1, 1, PixelFormat::Rgba8, vec![0, 0, 0, 255]).unwrap();
+        let info = ImageInfo {
+            format: FormatId::Gif,
+            codec: "test",
+            width: 1,
+            height: 1,
+            frame_count: Some(delays_ms.len() as u32),
+            has_alpha: false,
+            bits_per_channel: 8,
+            orientation: Orientation::Normal,
+            icc_profile: None,
+        };
+        let frames =
+            delays_ms.iter().map(|ms| AnimationFrame { image: frame(), delay: Duration::from_millis(*ms) }).collect();
+        Arc::new(Decoded { info, image: frame(), animation: Some(Animation { frames }) })
+    }
+
+    #[test]
+    fn frames_follow_their_own_delays_and_loop() {
+        let mut p = Playback::start(&animated(&[100, 50, 200])).unwrap();
+        let t0 = p.started_at;
+        assert!(!p.advance(t0 + Duration::from_millis(99)));
+        assert!(p.advance(t0 + Duration::from_millis(100)));
+        assert_eq!(p.frame, 1);
+        assert!(p.advance(t0 + Duration::from_millis(150)));
+        assert_eq!(p.frame, 2);
+        assert!(p.advance(t0 + Duration::from_millis(350)));
+        assert_eq!(p.frame, 0, "loops after the last frame");
+    }
+
+    #[test]
+    fn late_ticks_skip_frames_instead_of_drifting() {
+        let mut p = Playback::start(&animated(&[100, 100, 100])).unwrap();
+        let t0 = p.started_at;
+        assert!(p.advance(t0 + Duration::from_millis(250)));
+        assert_eq!(p.frame, 2, "two frames were due");
+        assert_eq!(p.next_at, t0 + Duration::from_millis(300), "schedule keeps its phase");
+    }
+
+    #[test]
+    fn stills_do_not_play() {
+        let d = Arc::new(Decoded::still(animated(&[1]).info.clone(), animated(&[1]).image.clone()));
+        assert!(Playback::start(&d).is_none());
     }
 }

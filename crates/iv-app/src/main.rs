@@ -1,4 +1,4 @@
-//! image-viewer: `image-viewer [--trace] [file]`
+//! image-viewer: `image-viewer [--trace] [--no-activate] [file]`
 
 // no console window for release builds launched from Explorer
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -26,10 +26,13 @@ fn main() {
     // the slowest startup step; overlaps argument parsing, keymap loading and window creation
     let gpu_init = app::start_gpu_init();
     let mut trace_enabled = false;
+    let mut no_activate = false;
     let mut file = None;
     for arg in std::env::args_os().skip(1) {
         if arg == "--trace" {
             trace_enabled = true;
+        } else if arg == "--no-activate" {
+            no_activate = true;
         } else {
             file = Some(PathBuf::from(arg));
         }
@@ -54,6 +57,7 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = App::new(event_loop.create_proxy(), keymap, trace, Some(gpu_init));
+    app.no_activate = no_activate;
     // decoding starts now and overlaps window and GPU creation
     if let Some(path) = file {
         app.open(path);

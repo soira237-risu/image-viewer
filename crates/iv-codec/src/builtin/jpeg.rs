@@ -95,6 +95,6 @@ impl Decoder for ZuneJpegDecoder {
         cancel.check()?;
         let (info, image) = decode_bytes(&bytes)?;
         cancel.check()?;
-        Ok(Decoded { info, image })
+        Ok(Decoded::still(info, image))
     }
 }

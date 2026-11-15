@@ -13,13 +13,42 @@ pub struct DecoderInfo {
     pub priority: i32,
 }
 
-/// A fully decoded still image plus what was learned while decoding it.
+/// A fully decoded image plus what was learned while decoding it.
 #[derive(Clone, Debug)]
 pub struct Decoded {
     pub info: ImageInfo,
-    /// Stored pixels, *not* rotated by `info.orientation`; the viewer applies orientation as a
-    /// display transform so edits and lossless saves can reason about the stored layout.
+    /// Stored pixels of the first frame, *not* rotated by `info.orientation`; the viewer applies
+    /// orientation as a display transform so edits and lossless saves can reason about the stored
+    /// layout.
     pub image: ImageBuf,
+    /// Every frame of an animated image (the first is `image` again, sharing its pixels).
+    pub animation: Option<Animation>,
+}
+
+impl Decoded {
+    pub fn still(info: ImageInfo, image: ImageBuf) -> Self {
+        Self { info, image, animation: None }
+    }
+
+    /// Pixel memory held, counting every animation frame once.
+    pub fn memory_size(&self) -> usize {
+        match &self.animation {
+            Some(a) => a.frames.iter().map(|f| f.image.memory_size()).sum(),
+            None => self.image.memory_size(),
+        }
+    }
+}
+
+/// Fully composited animation frames (each one a complete canvas, ready to show), played in a loop.
+#[derive(Clone, Debug)]
+pub struct Animation {
+    pub frames: Vec<AnimationFrame>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AnimationFrame {
+    pub image: ImageBuf,
+    pub delay: std::time::Duration,
 }
 
 /// A decoder for one or more formats.

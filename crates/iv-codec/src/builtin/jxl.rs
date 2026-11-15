@@ -67,6 +67,6 @@ impl Decoder for JxlOxideDecoder {
         cancel.check()?;
         let image = to_image_buf(img)?;
         cancel.check()?;
-        Ok(Decoded { info, image })
+        Ok(Decoded::still(info, image))
     }
 }
