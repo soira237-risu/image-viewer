@@ -251,3 +251,17 @@ impl Decoder for WicDecoder {
         Ok(Decoded::still(info, image))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bytes no installed codec recognises give WINCODEC_ERR_COMPONENTNOTFOUND, the code the HEIF
+    /// test treats as "HEIF Image Extensions not installed".
+    #[test]
+    fn unrecognised_bytes_report_component_not_found() {
+        let src = Source::from_bytes("junk.heic", vec![0x5au8; 64]);
+        let err = WicDecoder::primary().decode(&src, FormatId::Heif, &CancelToken::never()).err().unwrap();
+        assert!(err.to_string().contains("0x88982F50"), "{err}");
+    }
+}
