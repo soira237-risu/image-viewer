@@ -717,7 +717,7 @@ impl App {
         match cmd {
             Command::FileOpen => {
                 let mut exts: Vec<&str> = FormatId::ALL.iter().flat_map(|f| f.extensions().iter().copied()).collect();
-                exts.extend(["zip", "cbz"]);
+                exts.extend(["zip", "cbz", "7z", "cb7"]);
                 if let Some(path) = rfd::FileDialog::new().add_filter("Images", &exts).pick_file() {
                     self.open(path);
                 }
