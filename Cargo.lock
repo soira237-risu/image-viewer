@@ -1093,6 +1093,7 @@ dependencies = [
  "image",
  "iv-codec",
  "iv-core",
+ "iv-ops",
  "iv-pipeline",
  "iv-render",
  "pollster",

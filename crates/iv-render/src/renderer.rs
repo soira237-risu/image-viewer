@@ -2,8 +2,9 @@
 
 use iv_core::{ImageBuf, Orientation};
 
-use crate::orient::uv_transform;
+use crate::orient::{UvTransform, uv_transform};
 use crate::upload;
+use crate::view::ScreenRect;
 use crate::view::ViewState;
 
 /// sRGB texture: the sampler linearises, so mipmaps and filtering average light, not codes.
@@ -18,6 +19,8 @@ struct Params {
     uv_row1: [f32; 4],
     checker_a: [f32; 4],
     checker_b: [f32; 4],
+    /// Selection in screen pixels (x, y, w, h); width 0 = none. Outside it is dimmed.
+    selection: [f32; 4],
 }
 
 /// Appearance settings.
@@ -57,7 +60,8 @@ pub struct UploadInfo {
 
 struct GpuImage {
     bind_group: wgpu::BindGroup,
-    orientation: Orientation,
+    /// Shown UV → texture UV: the EXIF orientation, or an edit geometry set later.
+    uv: UvTransform,
     has_alpha: bool,
     // kept alive for the bind group
     _texture: wgpu::Texture,
@@ -74,6 +78,7 @@ pub struct ImageRenderer {
     mip_sampler: wgpu::Sampler,
     max_texture_side: u32,
     image: Option<GpuImage>,
+    selection: Option<ScreenRect>,
     pub style: Style,
 }
 
@@ -212,8 +217,22 @@ impl ImageRenderer {
             mip_layout,
             max_texture_side: device.limits().max_texture_dimension_2d,
             image: None,
+            selection: None,
             style: Style::default(),
         }
+    }
+
+    /// Replaces how the current image is mapped onto its rectangle: an edit geometry (crop,
+    /// rotation) shown without touching pixels. Reset by the next `set_image`.
+    pub fn set_uv_transform(&mut self, uv: UvTransform) {
+        if let Some(img) = &mut self.image {
+            img.uv = uv;
+        }
+    }
+
+    /// Dims everything outside `rect` (screen pixels), or nothing with `None`.
+    pub fn set_selection(&mut self, rect: Option<ScreenRect>) {
+        self.selection = rect.filter(|r| r.width >= 1.0 && r.height >= 1.0);
     }
 
     pub fn has_image(&self) -> bool {
@@ -273,7 +292,7 @@ impl ImageRenderer {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler_nearest) },
             ],
         });
-        self.image = Some(GpuImage { bind_group, orientation, has_alpha, _texture: texture });
+        self.image = Some(GpuImage { bind_group, uv: uv_transform(orientation), has_alpha, _texture: texture });
         UploadInfo { texture_width: w, texture_height: h, mip_levels, reduced: (w, h) != (img.width(), img.height()) }
     }
 
@@ -353,7 +372,7 @@ impl ImageRenderer {
         let (Some(image), Some(view)) = (&self.image, view) else { return };
 
         let rect = view.dest_rect();
-        let t = uv_transform(image.orientation);
+        let t = image.uv;
         let mut flags = 0u32;
         if image.has_alpha {
             flags |= 1;
@@ -369,6 +388,7 @@ impl ImageRenderer {
             uv_row1: [t[1][0], t[1][1], t[1][2], 0.0],
             checker_a: [s.checker_a[0], s.checker_a[1], s.checker_a[2], 1.0],
             checker_b: [s.checker_b[0], s.checker_b[1], s.checker_b[2], 1.0],
+            selection: self.selection.map_or([0.0; 4], |r| [r.x as f32, r.y as f32, r.width as f32, r.height as f32]),
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
         pass.set_pipeline(&self.pipeline);

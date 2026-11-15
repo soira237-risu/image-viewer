@@ -12,6 +12,8 @@ struct Params {
     // checkerboard colours (linear)
     checker_a: vec4<f32>,
     checker_b: vec4<f32>,
+    // selection in screen pixels: x, y, width, height (width 0 = none); outside is dimmed
+    selection: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -49,11 +51,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         c = textureSample(photo, smp_linear, st);
     }
 
+    var rgb = c.rgb;
     if ((flags & 1u) != 0u) {
         let cell = floor(in.pos.xy / p.viewport.z);
         let odd = (u32(cell.x) + u32(cell.y)) & 1u;
         let bg = select(p.checker_a.rgb, p.checker_b.rgb, odd == 1u);
-        return vec4<f32>(mix(bg, c.rgb, c.a), 1.0);
+        rgb = mix(bg, c.rgb, c.a);
     }
-    return vec4<f32>(c.rgb, 1.0);
+    if (p.selection.z > 0.0) {
+        let lo = p.selection.xy;
+        let hi = p.selection.xy + p.selection.zw;
+        let inside = all(in.pos.xy >= lo) && all(in.pos.xy < hi);
+        if (!inside) {
+            rgb = rgb * 0.35;
+        }
+    }
+    return vec4<f32>(rgb, 1.0);
 }

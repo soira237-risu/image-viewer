@@ -5,6 +5,16 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Command {
     FileOpen,
+    FileSave,
+    FileSaveAs,
+    EditRotateCw,
+    EditRotateCcw,
+    EditFlipH,
+    EditFlipV,
+    /// Crop to the selection (Shift+drag).
+    EditCrop,
+    EditUndo,
+    EditRedo,
     NavNext,
     NavPrev,
     NavFirst,
@@ -14,14 +24,23 @@ pub enum Command {
     ViewZoomIn,
     ViewZoomOut,
     ViewToggleFullscreen,
-    /// Leave full screen; when windowed, quit.
+    /// Clear the selection; else leave full screen; else quit.
     Escape,
     AppQuit,
 }
 
 impl Command {
-    pub const ALL: [Command; 12] = [
+    pub const ALL: [Command; 21] = [
         Command::FileOpen,
+        Command::FileSave,
+        Command::FileSaveAs,
+        Command::EditRotateCw,
+        Command::EditRotateCcw,
+        Command::EditFlipH,
+        Command::EditFlipV,
+        Command::EditCrop,
+        Command::EditUndo,
+        Command::EditRedo,
         Command::NavNext,
         Command::NavPrev,
         Command::NavFirst,
@@ -38,6 +57,15 @@ impl Command {
     pub fn id(self) -> &'static str {
         match self {
             Command::FileOpen => "file.open",
+            Command::FileSave => "file.save",
+            Command::FileSaveAs => "file.save_as",
+            Command::EditRotateCw => "edit.rotate_cw",
+            Command::EditRotateCcw => "edit.rotate_ccw",
+            Command::EditFlipH => "edit.flip_h",
+            Command::EditFlipV => "edit.flip_v",
+            Command::EditCrop => "edit.crop",
+            Command::EditUndo => "edit.undo",
+            Command::EditRedo => "edit.redo",
             Command::NavNext => "nav.next",
             Command::NavPrev => "nav.prev",
             Command::NavFirst => "nav.first",

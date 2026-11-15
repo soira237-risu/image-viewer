@@ -5,9 +5,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use iv_codec::Decoded;
+use iv_codec::encode::Encoders;
 use iv_core::{FormatId, ImageBuf, ImageInfo};
+use iv_ops::{EditStack, Geometry, Op};
+use iv_pipeline::export::{ExportOutcome, export};
 use iv_pipeline::{FolderList, Pipeline, PipelineConfig, PipelineEvent, prefetch_order, step};
-use iv_render::{Gpu, ImageRenderer, ViewState, ZoomMode, wgpu};
+use iv_render::{Gpu, ImageRenderer, ScreenRect, ViewState, ZoomMode, wgpu};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::StartCause;
@@ -17,6 +20,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::commands::Command;
+use crate::edit::{drag_rect, in_place_format, save_request, selection_to_crop};
 use crate::keymap::{Chord, Keymap, canonical_key};
 use crate::trace::Trace;
 
@@ -31,6 +35,7 @@ const WRAP: bool = true;
 pub enum AppEvent {
     Pipeline(PipelineEvent),
     Folder { for_path: PathBuf, result: Result<FolderList, String> },
+    Saved { source: PathBuf, dest: PathBuf, result: Result<ExportOutcome, String> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -147,6 +152,13 @@ pub struct App {
     /// Open without taking keyboard focus (`--no-activate`, for automated checks that must not
     /// capture keys meant for another window).
     pub no_activate: bool,
+    /// Edits to the current image (cleared when another image becomes current).
+    edits: EditStack,
+    /// Shift+drag selection: start corner while dragging, finished rectangle afterwards.
+    select_from: Option<PhysicalPosition<f64>>,
+    selection: Option<ScreenRect>,
+    saving: bool,
+    encoders: Encoders,
 }
 
 /// GPU device creation started at launch, before the window exists.
@@ -220,11 +232,19 @@ impl App {
             first_frame_logged: false,
             gpu_init,
             no_activate: false,
+            edits: EditStack::new(),
+            select_from: None,
+            selection: None,
+            saving: false,
+            encoders: Encoders::default(),
         }
     }
 
     /// Opens a file and lists its folder in the background for navigation.
     pub fn open(&mut self, path: PathBuf) {
+        if !self.confirm_discard() {
+            return;
+        }
         self.trace.mark(&format!("open {}", path.display()));
         self.folder = None;
         self.index = None;
@@ -265,6 +285,9 @@ impl App {
         if self.current.as_ref().map(|c| &c.path) != Some(&path) {
             self.current = Some(Current::new(path));
             self.error = None;
+            self.edits.clear();
+            self.selection = None;
+            self.sync_selection();
         }
         if let (Some(cur), Some(decoded)) = (self.current.as_mut(), hit) {
             if cur.full.is_none() {
@@ -288,6 +311,9 @@ impl App {
         };
         let Some(target) = target else { return };
         let Some(path) = folder.get(target).map(Path::to_path_buf) else { return };
+        if !self.confirm_discard() {
+            return;
+        }
         self.direction = match cmd {
             Command::NavPrev | Command::NavFirst => -1,
             _ => 1,
@@ -373,7 +399,15 @@ impl App {
     }
 
     /// Uploads the best image for the current request that is not on the GPU yet.
+    /// Uploads the best image for the current request, then re-applies the edits to it.
     fn sync_texture(&mut self) {
+        self.sync_texture_inner();
+        if !self.edits.is_empty() {
+            self.apply_edits_to_display();
+        }
+    }
+
+    fn sync_texture_inner(&mut self) {
         let viewport = self.viewport();
         let (Some(s), Some(cur)) = (self.surface.as_mut(), self.current.as_mut()) else { return };
         let same_image = self.display.as_ref().is_some_and(|d| d.path == cur.path);
@@ -459,7 +493,11 @@ impl App {
             (Some(cur), None) => {
                 let name = file_name(&cur.path);
                 let Some(info) = &cur.info else { return s.window.set_title(&format!("{position}{name} — loading")) };
-                let (w, h) = info.display_size();
+                let (w, h) = if self.edits.is_empty() {
+                    info.display_size()
+                } else {
+                    self.geometry().map_or(info.display_size(), |g| g.size)
+                };
                 let zoom = self
                     .display
                     .as_ref()
@@ -473,7 +511,9 @@ impl App {
                     (None, _) if cur.preview.is_some() => format!("{} · preview", info.format),
                     (None, _) => format!("{} · loading", info.format),
                 };
-                format!("{position}{name} — {w}×{h}{zoom} — {state}")
+                let edited = if self.edits.is_empty() { "" } else { "*" };
+                let saving = if self.saving { " · saving…" } else { "" };
+                format!("{position}{name}{edited} — {w}×{h}{zoom} — {state}{saving}")
             }
             (None, None) => "image-viewer — Ctrl+O to open, or drop a file".to_string(),
         };
@@ -554,6 +594,23 @@ impl App {
                     self.open(path);
                 }
             }
+            Command::FileSave => self.save_in_place(),
+            Command::FileSaveAs => self.save_as(),
+            Command::EditRotateCw => self.edit(Op::rotate_cw()),
+            Command::EditRotateCcw => self.edit(Op::rotate_ccw()),
+            Command::EditFlipH => self.edit(Op::flip_h()),
+            Command::EditFlipV => self.edit(Op::flip_v()),
+            Command::EditCrop => self.crop_to_selection(),
+            Command::EditUndo => {
+                if self.edits.undo() {
+                    self.after_edit_change();
+                }
+            }
+            Command::EditRedo => {
+                if self.edits.redo() {
+                    self.after_edit_change();
+                }
+            }
             Command::NavNext | Command::NavPrev | Command::NavFirst | Command::NavLast => self.navigate(cmd, repeat),
             Command::ViewFit => self.with_view(|v| v.fit()),
             Command::ViewActualSize => self.with_view(|v| v.actual_size_at(center)),
@@ -565,11 +622,22 @@ impl App {
                     s.window.set_fullscreen(next);
                 }
             }
-            Command::Escape => match &self.surface {
-                Some(s) if s.window.fullscreen().is_some() => s.window.set_fullscreen(None),
-                _ => event_loop.exit(),
-            },
-            Command::AppQuit => event_loop.exit(),
+            Command::Escape => {
+                if self.selection.take().is_some() {
+                    self.sync_selection();
+                } else if let Some(s) = self.surface.as_ref().filter(|s| s.window.fullscreen().is_some()) {
+                    s.window.set_fullscreen(None);
+                } else {
+                    self.quit(event_loop);
+                }
+            }
+            Command::AppQuit => self.quit(event_loop),
+        }
+    }
+
+    fn quit(&mut self, event_loop: &ActiveEventLoop) {
+        if self.confirm_discard() {
+            event_loop.exit();
         }
     }
 
@@ -650,6 +718,12 @@ impl App {
             return;
         }
         match state {
+            // Shift+drag selects a region (for cropping) instead of panning
+            ElementState::Pressed if self.modifiers.shift_key() => {
+                self.select_from = Some(self.cursor);
+                self.selection = None;
+                self.sync_selection();
+            }
             ElementState::Pressed => {
                 let now = Instant::now();
                 let pos = self.cursor;
@@ -668,7 +742,209 @@ impl App {
                     self.drag_from = Some(pos);
                 }
             }
-            ElementState::Released => self.drag_from = None,
+            ElementState::Released => {
+                self.drag_from = None;
+                self.select_from = None;
+            }
+        }
+    }
+}
+
+/// Editing and saving.
+impl App {
+    /// Geometry of the current image with its edits, once its size is known.
+    fn geometry(&self) -> Option<Geometry> {
+        let info = self.current.as_ref()?.info.as_ref()?;
+        Some(Geometry::new((info.width, info.height), info.orientation, self.edits.active()))
+    }
+
+    /// Texture mapping for the current edits, `None` when there are none (the plain orientation
+    /// mapping set with the texture is then right).
+    fn edit_uv(&self) -> Option<iv_render::orient::UvTransform> {
+        if self.edits.is_empty() {
+            return None;
+        }
+        self.geometry().map(|g| g.display_to_stored_uv().map(|r| r.map(|v| v as f32)))
+    }
+
+    /// Shows the current edits: texture mapping and view size follow the edit geometry.
+    fn apply_edits_to_display(&mut self) {
+        let Some(g) = self.geometry() else { return };
+        let uv = g.display_to_stored_uv().map(|r| r.map(|v| v as f32));
+        let (Some(s), Some(d), Some(cur)) = (self.surface.as_mut(), self.display.as_mut(), self.current.as_ref())
+        else {
+            return;
+        };
+        if d.path != cur.path {
+            return;
+        }
+        s.renderer.set_uv_transform(uv);
+        d.view.set_image_size(g.size);
+        s.window.request_redraw();
+    }
+
+    fn after_edit_change(&mut self) {
+        self.selection = None;
+        self.sync_selection();
+        self.apply_edits_to_display();
+        self.update_title();
+    }
+
+    fn edit(&mut self, op: Op) {
+        if self.current.as_ref().is_some_and(|c| c.info.is_some()) {
+            self.edits.push(op);
+            self.trace.mark(&format!("edit: {op:?}"));
+            self.after_edit_change();
+        }
+    }
+
+    fn crop_to_selection(&mut self) {
+        let crop = match (&self.display, self.selection) {
+            (Some(d), Some(sel)) => selection_to_crop(&d.view, sel),
+            _ => None,
+        };
+        if let Some(r) = crop {
+            self.edit(Op::Crop(r));
+        }
+    }
+
+    fn sync_selection(&mut self) {
+        if let Some(s) = &mut self.surface {
+            s.renderer.set_selection(self.selection);
+            s.window.request_redraw();
+        }
+    }
+
+    /// Saves the edits over the current file in its own format.
+    fn save_in_place(&mut self) {
+        let Some(cur) = &self.current else { return };
+        if self.edits.is_empty() {
+            return;
+        }
+        match cur.info.as_ref().and_then(|i| in_place_format(&self.encoders, i.format)) {
+            Some(_) => {
+                let dest = cur.path.clone();
+                self.start_save(dest);
+            }
+            // e.g. HEIC or RAW: nothing to write them with
+            None => self.save_as(),
+        }
+    }
+
+    fn save_as(&mut self) {
+        let Some(cur) = &self.current else { return };
+        let mut dialog = rfd::FileDialog::new()
+            .set_file_name(cur.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        if let Some(dir) = cur.path.parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        for enc in self.encoders.all() {
+            let f = enc.info().format;
+            dialog = dialog.add_filter(f.name(), f.extensions());
+        }
+        if let Some(dest) = dialog.save_file() {
+            self.start_save(dest);
+        }
+    }
+
+    /// Exports on a worker thread; the result arrives as [`AppEvent::Saved`].
+    fn start_save(&mut self, dest: PathBuf) {
+        let Some(cur) = &self.current else { return };
+        if self.saving {
+            return;
+        }
+        let req = match save_request(&self.encoders, &cur.path, self.edits.active(), dest) {
+            Ok(r) => r,
+            Err(e) => {
+                self.error = Some(e);
+                self.update_title();
+                return;
+            }
+        };
+        self.saving = true;
+        self.update_title();
+        let (proxy, encoders) = (self.proxy.clone(), self.encoders.clone());
+        std::thread::Builder::new()
+            .name("save".into())
+            .spawn(move || {
+                let result = export(&iv_codec::default_registry(), &encoders, &req).map_err(|e| e.to_string());
+                let _ = proxy.send_event(AppEvent::Saved { source: req.source, dest: req.dest, result });
+            })
+            .expect("spawn save thread");
+    }
+
+    fn handle_saved(&mut self, source: PathBuf, dest: PathBuf, result: Result<ExportOutcome, String>) {
+        self.saving = false;
+        match result {
+            Ok(outcome) => {
+                self.trace.mark(&format!("saved {} ({outcome:?})", dest.display()));
+                self.pipeline.invalidate(&dest);
+                self.edits.clear();
+                if dest == source {
+                    // show the file as it now is on disk: keep the old frame up until the new
+                    // decode arrives, but mark it stale so that decode replaces it
+                    if let Some(d) = &mut self.display {
+                        d.kind = Shown::Preview;
+                    }
+                    self.current = None;
+                    self.request(source);
+                } else {
+                    self.open(dest);
+                }
+            }
+            Err(e) => {
+                eprintln!("save failed: {e}");
+                self.error = Some(format!("save failed: {e}"));
+            }
+        }
+        self.update_title();
+    }
+
+    /// Before the current image is replaced or the app closes: asks to save unsaved edits.
+    /// `true` means go ahead.
+    fn confirm_discard(&mut self) -> bool {
+        if self.edits.is_empty() {
+            return true;
+        }
+        let name = self.current.as_ref().map(|c| file_name(&c.path)).unwrap_or_default();
+        let answer = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("image-viewer")
+            .set_description(format!("Save changes to {name}?"))
+            .set_buttons(rfd::MessageButtons::YesNoCancel)
+            .show();
+        match answer {
+            rfd::MessageDialogResult::Yes => {
+                let Some(cur) = &self.current else { return true };
+                let format_ok = cur.info.as_ref().and_then(|i| in_place_format(&self.encoders, i.format)).is_some();
+                if !format_ok {
+                    self.error = Some("this format cannot be written; use Save As".into());
+                    self.update_title();
+                    return false;
+                }
+                let saved =
+                    save_request(&self.encoders, &cur.path, self.edits.active(), cur.path.clone()).and_then(|req| {
+                        export(&iv_codec::default_registry(), &self.encoders, &req).map_err(|e| e.to_string())
+                    });
+                match saved {
+                    Ok(_) => {
+                        let path = cur.path.clone();
+                        self.pipeline.invalidate(&path);
+                        self.edits.clear();
+                        true
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("save failed: {e}"));
+                        self.update_title();
+                        false
+                    }
+                }
+            }
+            rfd::MessageDialogResult::No => {
+                self.edits.clear();
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -676,6 +952,7 @@ impl App {
 impl App {
     /// Shows the animation frame that is due, if any.
     fn tick_animation(&mut self) {
+        let edit_uv = self.edit_uv();
         let (Some(s), Some(d)) = (self.surface.as_mut(), self.display.as_mut()) else { return };
         let Some(p) = d.playback.as_mut() else { return };
         if !p.advance(Instant::now()) {
@@ -690,6 +967,9 @@ impl App {
             info.orientation,
             info.has_alpha,
         );
+        if let Some(uv) = edit_uv {
+            s.renderer.set_uv_transform(uv);
+        }
         if p.frame == 0 && !p.loop_logged {
             p.loop_logged = true;
             let expected: Duration = anim.frames.iter().map(|f| f.delay).sum();
@@ -740,12 +1020,13 @@ impl ApplicationHandler<AppEvent> for App {
         match event {
             AppEvent::Pipeline(e) => self.handle_pipeline(e),
             AppEvent::Folder { for_path, result } => self.handle_folder(for_path, result),
+            AppEvent::Saved { source, dest, result } => self.handle_saved(source, dest, result),
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.quit(event_loop),
             WindowEvent::Resized(size) => {
                 if let Some(s) = &mut self.surface {
                     s.config.width = size.width.max(1);
@@ -763,6 +1044,10 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::KeyboardInput { event, .. } => self.on_key(&event, event_loop),
             WindowEvent::CursorMoved { position, .. } => {
+                if let Some(from) = self.select_from {
+                    self.selection = Some(drag_rect((from.x, from.y), (position.x, position.y)));
+                    self.sync_selection();
+                }
                 if let Some(from) = self.drag_from {
                     let (dx, dy) = (position.x - from.x, position.y - from.y);
                     self.drag_from = Some(position);

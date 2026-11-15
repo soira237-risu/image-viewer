@@ -335,6 +335,15 @@ impl Pipeline {
         hit
     }
 
+    /// Forgets a cached decode, e.g. after the file was saved over.
+    pub fn invalidate(&self, path: &Path) {
+        let mut st = self.shared.lock();
+        if let Some(e) = st.cache.remove(path) {
+            st.used_bytes -= e.bytes;
+        }
+        st.failed.remove(path);
+    }
+
     pub fn cached(&self, path: &Path) -> Option<Arc<Decoded>> {
         self.shared.lock().cache.get(path).map(|e| e.decoded.clone())
     }

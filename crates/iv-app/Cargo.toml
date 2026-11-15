@@ -15,6 +15,7 @@ iv-core.workspace = true
 iv-codec.workspace = true
 iv-render.workspace = true
 iv-pipeline.workspace = true
+iv-ops.workspace = true
 winit.workspace = true
 pollster.workspace = true
 serde.workspace = true

@@ -154,3 +154,33 @@ fn sixteen_bit_images_upload() {
     let out = draw(&gpu, &r, &view);
     assert_eq!([px(&out, 20, 12), px(&out, 44, 12), px(&out, 20, 36), px(&out, 44, 36)], [RED, GREEN, BLUE, WHITE]);
 }
+
+#[test]
+fn uv_override_shows_an_edit_without_new_pixels() {
+    let gpu = gpu();
+    let mut r = ImageRenderer::new(&gpu.device, TARGET);
+    r.set_image(&gpu.device, &gpu.queue, &image(2, 2, &[RED, GREEN, BLUE, WHITE]), Orientation::Normal, false);
+    // crop to the right column (green over white), shown 1x2 scaled up
+    r.set_uv_transform([[0.5, 0.0, 0.5], [0.0, 1.0, 0.0]]);
+    let mut view = ViewState::new((1, 2), (W, H));
+    view.set_zoom_at(24.0, (32.0, 24.0));
+    let out = draw(&gpu, &r, &view);
+    assert_eq!(px(&out, 32, 12), GREEN);
+    assert_eq!(px(&out, 32, 36), WHITE);
+}
+
+#[test]
+fn selection_dims_the_outside() {
+    let gpu = gpu();
+    let mut r = ImageRenderer::new(&gpu.device, TARGET);
+    r.set_image(&gpu.device, &gpu.queue, &image(1, 1, &[WHITE]), Orientation::Normal, false);
+    let mut view = ViewState::new((1, 1), (W, H));
+    view.set_zoom_at(48.0, (32.0, 24.0));
+    r.set_selection(Some(iv_render::ScreenRect { x: 8.0, y: 0.0, width: 24.0, height: 48.0 }));
+    let out = draw(&gpu, &r, &view);
+    assert_eq!(px(&out, 20, 24), WHITE, "inside the selection");
+    let dim = px(&out, 44, 24);
+    assert!(dim[0] < 200 && dim[0] == dim[1] && dim[3] == 255, "outside is darkened: {dim:?}");
+    r.set_selection(None);
+    assert_eq!(px(&draw(&gpu, &r, &view), 44, 24), WHITE);
+}

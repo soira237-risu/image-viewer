@@ -1,10 +1,11 @@
-//! image-viewer: `image-viewer [--trace] [--no-activate] [file]`
+//! image-viewer: `image-viewer [--trace] [--no-activate] [--keymap <file.toml>] [file]`
 
 // no console window for release builds launched from Explorer
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod commands;
+mod edit;
 mod keymap;
 mod trace;
 
@@ -27,9 +28,13 @@ fn main() {
     let gpu_init = app::start_gpu_init();
     let mut trace_enabled = false;
     let mut no_activate = false;
+    let mut keymap_path: Option<PathBuf> = None;
     let mut file = None;
-    for arg in std::env::args_os().skip(1) {
-        if arg == "--trace" {
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--keymap" {
+            keymap_path = args.next().map(PathBuf::from);
+        } else if arg == "--trace" {
             trace_enabled = true;
         } else if arg == "--no-activate" {
             no_activate = true;
@@ -39,8 +44,9 @@ fn main() {
     }
     let trace = Trace::new(start, trace_enabled);
 
-    let (keymap, warnings) = match config_dir() {
-        Some(dir) => Keymap::load(&dir.join("keymap.toml")),
+    let keymap_path = keymap_path.or_else(|| config_dir().map(|d| d.join("keymap.toml")));
+    let (keymap, warnings) = match keymap_path {
+        Some(path) => Keymap::load(&path),
         None => (Keymap::defaults(), Vec::new()),
     };
     for w in warnings {
