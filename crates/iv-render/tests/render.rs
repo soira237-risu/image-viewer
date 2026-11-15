@@ -184,3 +184,24 @@ fn selection_dims_the_outside() {
     r.set_selection(None);
     assert_eq!(px(&draw(&gpu, &r, &view), 44, 24), WHITE);
 }
+
+#[test]
+fn two_pages_side_by_side_in_either_reading_direction() {
+    let gpu = gpu();
+    let mut r = ImageRenderer::new(&gpu.device, TARGET);
+    r.set_image(&gpu.device, &gpu.queue, &image(1, 1, &[RED]), Orientation::Normal, false);
+    // second page, equal width: each takes half of a 2x1 spread
+    r.set_second_image(&gpu.device, &gpu.queue, &image(1, 1, &[BLUE]), Orientation::Normal, false, 0.5, false);
+    let mut view = ViewState::new((2, 1), (W, H));
+    view.set_zoom_at(24.0, (32.0, 24.0));
+    let ltr = draw(&gpu, &r, &view);
+    assert_eq!([px(&ltr, 20, 24), px(&ltr, 44, 24)], [RED, BLUE], "left to right: main page first");
+
+    r.set_second_image(&gpu.device, &gpu.queue, &image(1, 1, &[BLUE]), Orientation::Normal, false, 0.5, true);
+    let rtl = draw(&gpu, &r, &view);
+    assert_eq!([px(&rtl, 20, 24), px(&rtl, 44, 24)], [BLUE, RED], "right to left: main page on the right");
+
+    r.clear_second();
+    let single = draw(&gpu, &r, &view);
+    assert_eq!(px(&single, 44, 24), RED, "one page fills the spread again");
+}

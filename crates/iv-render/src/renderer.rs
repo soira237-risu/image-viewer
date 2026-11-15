@@ -60,6 +60,7 @@ pub struct UploadInfo {
 
 struct GpuImage {
     bind_group: wgpu::BindGroup,
+    uniform: wgpu::Buffer,
     /// Shown UV → texture UV: the EXIF orientation, or an edit geometry set later.
     uv: UvTransform,
     has_alpha: bool,
@@ -70,7 +71,6 @@ struct GpuImage {
 pub struct ImageRenderer {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
-    uniform: wgpu::Buffer,
     sampler_linear: wgpu::Sampler,
     sampler_nearest: wgpu::Sampler,
     mip_pipeline: wgpu::RenderPipeline,
@@ -78,6 +78,11 @@ pub struct ImageRenderer {
     mip_sampler: wgpu::Sampler,
     max_texture_side: u32,
     image: Option<GpuImage>,
+    /// Two-page view: the page beside `image`.
+    second: Option<GpuImage>,
+    /// Share of the combined width taken by `image` when a second image is shown.
+    split: f32,
+    second_on_left: bool,
     selection: Option<ScreenRect>,
     pub style: Style,
 }
@@ -186,12 +191,6 @@ impl ImageRenderer {
             label: Some("mip layout"),
             entries: &[texture_entry(0), sampler_entry(1)],
         });
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("image params"),
-            size: std::mem::size_of::<Params>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         Self {
             pipeline: pipeline(
                 device,
@@ -210,16 +209,48 @@ impl ImageRenderer {
                 wgpu::PrimitiveTopology::TriangleList,
             ),
             layout,
-            uniform,
             sampler_linear: sampler(device, wgpu::FilterMode::Linear, "linear"),
             sampler_nearest: sampler(device, wgpu::FilterMode::Nearest, "nearest"),
             mip_sampler: sampler(device, wgpu::FilterMode::Linear, "mip"),
             mip_layout,
             max_texture_side: device.limits().max_texture_dimension_2d,
             image: None,
+            second: None,
+            split: 1.0,
+            second_on_left: false,
             selection: None,
             style: Style::default(),
         }
+    }
+
+    /// Shows a second image beside the main one (two-page view). `primary_fraction` is the share
+    /// of the combined width taken by the main image; `second_on_left` puts the second image on
+    /// the left (right-to-left reading).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_second_image(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        img: &ImageBuf,
+        orientation: Orientation,
+        has_alpha: bool,
+        primary_fraction: f32,
+        second_on_left: bool,
+    ) -> UploadInfo {
+        let (gpu, info) = self.upload(device, queue, img, orientation, has_alpha);
+        self.second = Some(gpu);
+        self.split = primary_fraction.clamp(0.0, 1.0);
+        self.second_on_left = second_on_left;
+        info
+    }
+
+    pub fn clear_second(&mut self) {
+        self.second = None;
+        self.split = 1.0;
+    }
+
+    pub fn has_second(&self) -> bool {
+        self.second.is_some()
     }
 
     /// Replaces how the current image is mapped onto its rectangle: an edit geometry (crop,
@@ -241,9 +272,11 @@ impl ImageRenderer {
 
     pub fn clear_image(&mut self) {
         self.image = None;
+        self.clear_second();
     }
 
-    /// Uploads `img` (stored layout) and builds its mip chain. The previous image is released.
+    /// Uploads `img` (stored layout) as the main image and builds its mip chain. The previous main
+    /// image is released; a second image (two-page view) stays until cleared.
     pub fn set_image(
         &mut self,
         device: &wgpu::Device,
@@ -252,6 +285,19 @@ impl ImageRenderer {
         orientation: Orientation,
         has_alpha: bool,
     ) -> UploadInfo {
+        let (gpu, info) = self.upload(device, queue, img, orientation, has_alpha);
+        self.image = Some(gpu);
+        info
+    }
+
+    fn upload(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        img: &ImageBuf,
+        orientation: Orientation,
+        has_alpha: bool,
+    ) -> (GpuImage, UploadInfo) {
         let pixels = upload::prepare(img, self.max_texture_side);
         let (w, h) = (pixels.width, pixels.height);
         let mip_levels = 32 - w.max(h).leading_zeros();
@@ -282,18 +328,31 @@ impl ImageRenderer {
         self.build_mips(device, queue, &texture, mip_levels);
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // each image has its own parameters: two images drawn in one pass must not share them
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("image params"),
+            size: std::mem::size_of::<Params>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("photo"),
             layout: &self.layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler_linear) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler_nearest) },
             ],
         });
-        self.image = Some(GpuImage { bind_group, uv: uv_transform(orientation), has_alpha, _texture: texture });
-        UploadInfo { texture_width: w, texture_height: h, mip_levels, reduced: (w, h) != (img.width(), img.height()) }
+        let gpu = GpuImage { bind_group, uniform, uv: uv_transform(orientation), has_alpha, _texture: texture };
+        let info = UploadInfo {
+            texture_width: w,
+            texture_height: h,
+            mip_levels,
+            reduced: (w, h) != (img.width(), img.height()),
+        };
+        (gpu, info)
     }
 
     fn build_mips(&self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, levels: u32) {
@@ -371,13 +430,43 @@ impl ImageRenderer {
         });
         let (Some(image), Some(view)) = (&self.image, view) else { return };
 
-        let rect = view.dest_rect();
+        // the view spans both pages; split it between them
+        let total = view.dest_rect();
+        let (main_rect, second_rect) = match &self.second {
+            None => (total, None),
+            Some(_) => {
+                let main_w = total.width * self.split as f64;
+                let second_w = total.width - main_w;
+                let (main_x, second_x) =
+                    if self.second_on_left { (total.x + second_w, total.x) } else { (total.x, total.x + main_w) };
+                (
+                    ScreenRect { x: main_x, width: main_w, ..total },
+                    Some(ScreenRect { x: second_x, width: second_w, ..total }),
+                )
+            }
+        };
+        pass.set_pipeline(&self.pipeline);
+        self.draw_image(queue, &mut pass, image, main_rect, viewport, view.zoom());
+        if let (Some(second), Some(rect)) = (&self.second, second_rect) {
+            self.draw_image(queue, &mut pass, second, rect, viewport, view.zoom());
+        }
+    }
+
+    fn draw_image(
+        &self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'_>,
+        image: &GpuImage,
+        rect: ScreenRect,
+        viewport: (u32, u32),
+        zoom: f64,
+    ) {
         let t = image.uv;
         let mut flags = 0u32;
         if image.has_alpha {
             flags |= 1;
         }
-        if view.zoom() > self.style.nearest_above_zoom {
+        if zoom > self.style.nearest_above_zoom {
             flags |= 2;
         }
         let s = &self.style;
@@ -390,8 +479,7 @@ impl ImageRenderer {
             checker_b: [s.checker_b[0], s.checker_b[1], s.checker_b[2], 1.0],
             selection: self.selection.map_or([0.0; 4], |r| [r.x as f32, r.y as f32, r.width as f32, r.height as f32]),
         };
-        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
-        pass.set_pipeline(&self.pipeline);
+        queue.write_buffer(&image.uniform, 0, bytemuck::bytes_of(&params));
         pass.set_bind_group(0, &image.bind_group, &[]);
         pass.draw(0..4, 0..1);
     }

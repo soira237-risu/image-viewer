@@ -153,6 +153,8 @@ const DEFAULTS: &[(&str, Command)] = &[
     ("-", Command::ViewZoomOut),
     ("Ctrl+-", Command::ViewZoomOut),
     ("F11", Command::ViewToggleFullscreen),
+    ("D", Command::ViewToggleSpread),
+    ("Shift+D", Command::ViewToggleDirection),
     ("Alt+Enter", Command::ViewToggleFullscreen),
     ("Esc", Command::Escape),
     ("Ctrl+W", Command::AppQuit),

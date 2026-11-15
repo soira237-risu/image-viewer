@@ -1,7 +1,7 @@
 //! Decode timings. Every number printed is measured on the current build; nothing is estimated.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -67,7 +67,7 @@ fn timed<T>(runs: usize, mut f: impl FnMut() -> iv_core::Result<T>) -> iv_core::
     Ok((median(times), last.expect("runs > 0")))
 }
 
-fn bench_one(path: &PathBuf, runs: usize) -> iv_core::Result<Row> {
+fn bench_one(path: &Path, runs: usize) -> iv_core::Result<Row> {
     let reg = default_registry();
     let src = iv_pipeline::archive::source_for(path)?;
     let cancel = CancelToken::never();
@@ -80,7 +80,7 @@ fn bench_one(path: &PathBuf, runs: usize) -> iv_core::Result<Row> {
     let (decode, decoded) = timed(runs, || reg.decode(&src, &cancel))?;
 
     Ok(Row {
-        path: path.clone(),
+        path: path.to_path_buf(),
         format: info.format,
         codec: decoded.info.codec,
         megapixels: info.width as f64 * info.height as f64 / 1e6,

@@ -24,13 +24,17 @@ pub enum Command {
     ViewZoomIn,
     ViewZoomOut,
     ViewToggleFullscreen,
+    /// Two pages side by side (comics).
+    ViewToggleSpread,
+    /// Two-page reading direction: right-to-left (manga) or left-to-right.
+    ViewToggleDirection,
     /// Clear the selection; else leave full screen; else quit.
     Escape,
     AppQuit,
 }
 
 impl Command {
-    pub const ALL: [Command; 21] = [
+    pub const ALL: [Command; 23] = [
         Command::FileOpen,
         Command::FileSave,
         Command::FileSaveAs,
@@ -50,6 +54,8 @@ impl Command {
         Command::ViewZoomIn,
         Command::ViewZoomOut,
         Command::ViewToggleFullscreen,
+        Command::ViewToggleSpread,
+        Command::ViewToggleDirection,
         Command::Escape,
         Command::AppQuit,
     ];
@@ -75,6 +81,8 @@ impl Command {
             Command::ViewZoomIn => "view.zoom_in",
             Command::ViewZoomOut => "view.zoom_out",
             Command::ViewToggleFullscreen => "view.toggle_fullscreen",
+            Command::ViewToggleSpread => "view.toggle_spread",
+            Command::ViewToggleDirection => "view.toggle_direction",
             Command::Escape => "app.escape",
             Command::AppQuit => "app.quit",
         }

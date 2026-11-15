@@ -77,6 +77,8 @@ struct Display {
     kind: Shown,
     view: ViewState,
     playback: Option<Playback>,
+    /// Two-page view: the page shown beside `path`.
+    second: Option<PathBuf>,
 }
 
 /// An animation being played on screen.
@@ -159,6 +161,8 @@ pub struct App {
     selection: Option<ScreenRect>,
     saving: bool,
     encoders: Encoders,
+    /// Two-page view: `Some(right_to_left)` when on.
+    spread: Option<bool>,
 }
 
 /// GPU device creation started at launch, before the window exists.
@@ -237,6 +241,7 @@ impl App {
             selection: None,
             saving: false,
             encoders: Encoders::default(),
+            spread: None,
         }
     }
 
@@ -285,15 +290,39 @@ impl App {
 
     /// Paths to prefetch around the current index, nearest first.
     fn prefetch_paths(&self) -> Vec<PathBuf> {
-        match (&self.folder, self.index) {
+        let mut paths: Vec<PathBuf> = match (&self.folder, self.index) {
             (Some(folder), Some(i)) if !self.quick_browsing => {
-                prefetch_order(i, folder.len(), self.direction, PREFETCH_COUNT, WRAP)
+                // two pages are shown at a time, so look twice as far
+                let count = if self.spread.is_some() { PREFETCH_COUNT * 2 } else { PREFETCH_COUNT };
+                prefetch_order(i, folder.len(), self.direction, count, WRAP)
                     .into_iter()
                     .filter_map(|j| folder.get(j).map(Path::to_path_buf))
                     .collect()
             }
             _ => Vec::new(),
+        };
+        // the facing page is needed right away
+        if let Some(partner) = self.partner() {
+            paths.retain(|p| *p != partner);
+            paths.insert(0, partner);
         }
+        paths
+    }
+
+    /// After the two-page setting changed: prefetch the facing page and show it (or remove it).
+    fn refresh_spread(&mut self) {
+        if let Some(path) = self.current.as_ref().map(|c| c.path.clone()) {
+            self.request(path);
+        }
+        self.sync_second();
+        self.update_title();
+    }
+
+    /// Two-page view: the page shown beside the current one.
+    fn partner(&self) -> Option<PathBuf> {
+        self.spread?;
+        let (folder, i) = (self.folder.as_ref()?, self.index?);
+        folder.get(i + 1).map(Path::to_path_buf)
     }
 
     /// Asks the pipeline for `path` (and its neighbours) and makes it current.
@@ -325,8 +354,8 @@ impl App {
         let (Some(folder), Some(index)) = (&self.folder, self.index) else { return };
         let len = folder.len();
         let target = match cmd {
-            Command::NavNext => step(index, len, 1, WRAP),
-            Command::NavPrev => step(index, len, -1, WRAP),
+            Command::NavNext => step(index, len, if self.spread.is_some() { 2 } else { 1 }, WRAP),
+            Command::NavPrev => step(index, len, if self.spread.is_some() { -2 } else { -1 }, WRAP),
             Command::NavFirst => (index != 0).then_some(0),
             Command::NavLast => (index + 1 != len).then(|| len - 1),
             _ => None,
@@ -427,6 +456,43 @@ impl App {
         if !self.edits.is_empty() {
             self.apply_edits_to_display();
         }
+        self.sync_second();
+    }
+
+    /// Two-page view: puts the facing page beside the current one once it is decoded, or
+    /// removes it when there is none (single-page view, last page).
+    fn sync_second(&mut self) {
+        let want = self.partner();
+        let current = self.current.as_ref().and_then(|c| Some((c.path.clone(), c.info.as_ref()?.display_size())));
+        let (Some(s), Some(d)) = (self.surface.as_mut(), self.display.as_mut()) else { return };
+        let Some((_, main_size)) = current.filter(|(p, _)| *p == d.path) else { return };
+        match want {
+            None => {
+                if d.second.take().is_some() {
+                    s.renderer.clear_second();
+                    d.view.set_image_size(main_size);
+                    s.window.request_redraw();
+                }
+            }
+            Some(partner) if d.second.as_ref() != Some(&partner) => {
+                let Some(page) = self.pipeline.cached(&partner) else { return };
+                let (total, fraction) = spread_layout(main_size, page.info.display_size());
+                let rtl = self.spread.unwrap_or(true);
+                s.renderer.set_second_image(
+                    &s.gpu.device,
+                    &s.gpu.queue,
+                    &page.image,
+                    page.info.orientation,
+                    page.info.has_alpha,
+                    fraction,
+                    rtl,
+                );
+                d.second = Some(partner);
+                d.view.set_image_size(total);
+                s.window.request_redraw();
+            }
+            Some(_) => {}
+        }
     }
 
     fn sync_texture_inner(&mut self) {
@@ -463,6 +529,7 @@ impl App {
                     kind,
                     view: ViewState::new(info.display_size(), viewport),
                     playback: None,
+                    second: None,
                 })
             }
         }
@@ -500,6 +567,7 @@ impl App {
             kind: Shown::Full,
             view: ViewState::new(decoded.info.display_size(), viewport),
             playback: None,
+            second: None,
         });
         s.window.request_redraw();
     }
@@ -507,6 +575,7 @@ impl App {
     fn update_title(&self) {
         let Some(s) = &self.surface else { return };
         let position = match (&self.folder, self.index) {
+            (Some(f), Some(i)) if self.partner().is_some() => format!("[{}-{}/{}] ", i + 1, i + 2, f.len()),
             (Some(f), Some(i)) => format!("[{}/{}] ", i + 1, f.len()),
             _ => String::new(),
         };
@@ -639,6 +708,21 @@ impl App {
             Command::ViewActualSize => self.with_view(|v| v.actual_size_at(center)),
             Command::ViewZoomIn => self.with_view(|v| v.zoom_by(ZOOM_STEP)),
             Command::ViewZoomOut => self.with_view(|v| v.zoom_by(1.0 / ZOOM_STEP)),
+            Command::ViewToggleSpread => {
+                self.spread = if self.spread.is_some() { None } else { Some(true) };
+                self.trace.mark(&format!("two-page view: {:?}", self.spread));
+                self.refresh_spread();
+            }
+            Command::ViewToggleDirection => {
+                if let Some(rtl) = self.spread {
+                    self.spread = Some(!rtl);
+                    // re-place the facing page on the other side
+                    if let Some(d) = &mut self.display {
+                        d.second = None;
+                    }
+                    self.refresh_spread();
+                }
+            }
             Command::ViewToggleFullscreen => {
                 if let Some(s) = &self.surface {
                     let next = if s.window.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) };
@@ -814,6 +898,11 @@ impl App {
     }
 
     fn edit(&mut self, op: Op) {
+        if self.spread.is_some() {
+            self.error = Some("editing works in single-page view (press D)".into());
+            self.update_title();
+            return;
+        }
         if self.current.as_ref().is_some_and(|c| c.info.is_some()) {
             self.edits.push(op);
             self.trace.mark(&format!("edit: {op:?}"));
@@ -1172,5 +1261,31 @@ mod playback_tests {
     fn stills_do_not_play() {
         let d = Arc::new(Decoded::still(animated(&[1]).info.clone(), animated(&[1]).image.clone()));
         assert!(Playback::start(&d).is_none());
+    }
+}
+
+/// Two pages scaled to a common height: the combined size, and the share of its width taken by
+/// the first page.
+pub fn spread_layout(main: (u32, u32), second: (u32, u32)) -> ((u32, u32), f32) {
+    let h = main.1.max(second.1).max(1) as f64;
+    let main_w = main.0 as f64 * h / main.1.max(1) as f64;
+    let second_w = second.0 as f64 * h / second.1.max(1) as f64;
+    (((main_w + second_w).round() as u32, h as u32), (main_w / (main_w + second_w)) as f32)
+}
+
+#[cfg(test)]
+mod spread_tests {
+    use super::spread_layout;
+
+    #[test]
+    fn pages_share_a_height() {
+        assert_eq!(spread_layout((800, 1200), (800, 1200)), ((1600, 1200), 0.5));
+        // a half-height page is scaled up to match
+        let ((w, h), f) = spread_layout((800, 1200), (400, 600));
+        assert_eq!((w, h), (1600, 1200));
+        assert!((f - 0.5).abs() < 1e-6);
+        // a double-width spread page takes two thirds
+        let (_, f) = spread_layout((1600, 1200), (800, 1200));
+        assert!((f - 2.0 / 3.0).abs() < 1e-6);
     }
 }
