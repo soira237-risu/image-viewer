@@ -831,6 +831,7 @@ mod playback_tests {
             bits_per_channel: 8,
             orientation: Orientation::Normal,
             icc_profile: None,
+            exif: None,
         };
         let frames =
             delays_ms.iter().map(|ms| AnimationFrame { image: frame(), delay: Duration::from_millis(*ms) }).collect();

@@ -48,6 +48,7 @@ fn info_from<T: zune_core::bytestream::ZByteReaderTrait>(dec: &JpegDecoder<T>) -
         bits_per_channel: 8,
         orientation: parsed_exif.as_ref().map(exif::orientation).unwrap_or_default(),
         icc_profile: dec.icc_profile().map(Arc::from),
+        exif: dec.exif().map(|e| Arc::from(e.as_slice())),
     })
 }
 

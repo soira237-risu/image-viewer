@@ -40,6 +40,7 @@ fn info_from(dec: &mut JxlDecoder<iv_core::SourceReader>, format: FormatId) -> I
         bits_per_channel,
         orientation: Orientation::Normal,
         icc_profile: dec.icc_profile().ok().flatten().map(Arc::from),
+        exif: None,
     }
 }
 

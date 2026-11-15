@@ -1,6 +1,7 @@
 //! Everything between "the user wants image N" and "decoded pixels are ready": folder listing in
 //! natural order, which neighbours to prefetch, and the decoding service with its bounded cache.
 
+pub mod export;
 mod folder;
 pub mod natord;
 mod order;

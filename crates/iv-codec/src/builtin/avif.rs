@@ -114,5 +114,6 @@ fn info_from(h: &Header, format: FormatId) -> ImageInfo {
         bits_per_channel: if h.bit_depth > 8 { 16 } else { 8 },
         orientation: Orientation::Normal,
         icc_profile: None,
+        exif: None,
     }
 }

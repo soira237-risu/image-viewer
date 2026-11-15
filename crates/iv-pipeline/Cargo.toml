@@ -9,7 +9,9 @@ publish.workspace = true
 [dependencies]
 iv-core.workspace = true
 iv-codec.workspace = true
+iv-ops.workspace = true
 
 [dev-dependencies]
+moxcms.workspace = true
 image.workspace = true
 tempfile.workspace = true

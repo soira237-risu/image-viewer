@@ -89,6 +89,13 @@ impl Registry {
     /// Decodes with the first decoder that succeeds. Pixels with an embedded RGB ICC profile come
     /// back converted to sRGB (`Decoded::color_managed`); `info.icc_profile` still describes the
     /// file.
+    /// Decodes without colour management: pixels stay in the file's colour space, described by
+    /// `info.icc_profile`. Used when saving, so a wide-gamut photo keeps its gamut.
+    pub fn decode_unmanaged(&self, src: &Source, cancel: &CancelToken) -> Result<Decoded> {
+        let id = self.identify(src)?;
+        self.try_each(src, id.format, |d| d.decode(src, id.format, cancel))
+    }
+
     pub fn decode(&self, src: &Source, cancel: &CancelToken) -> Result<Decoded> {
         let id = self.identify(src)?;
         let mut decoded = self.try_each(src, id.format, |d| d.decode(src, id.format, cancel))?;

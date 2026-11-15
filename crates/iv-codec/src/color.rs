@@ -118,6 +118,7 @@ mod tests {
             bits_per_channel: 8,
             orientation: iv_core::Orientation::Normal,
             icc_profile: Some(ColorProfile::new_srgb().encode().unwrap().into()),
+            exif: None,
         };
         let mut d = Decoded::still(info, img.clone());
         assert_eq!(to_srgb(&mut d), Ok(()));

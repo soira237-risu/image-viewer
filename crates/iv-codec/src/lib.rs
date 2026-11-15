@@ -14,6 +14,7 @@ mod builtin {
 pub mod color;
 mod decoder;
 pub mod encode;
+pub mod exif_edit;
 mod registry;
 pub mod sniff;
 mod webp_container;

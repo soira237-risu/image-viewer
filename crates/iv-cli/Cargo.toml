@@ -13,3 +13,6 @@ path = "src/main.rs"
 [dependencies]
 iv-core.workspace = true
 iv-codec.workspace = true
+iv-ops.workspace = true
+iv-pipeline.workspace = true
+rayon.workspace = true

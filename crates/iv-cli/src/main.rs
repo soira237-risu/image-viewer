@@ -4,9 +4,12 @@
 //! iv probe <file|dir>...              format, decoder, size, orientation; flags wrong extensions
 //! iv bench [--runs N] <file|dir>...   per-file probe / preview / decode timings and a per-format summary
 //! iv formats                          formats and the decoders registered for them
+//! iv convert --to <format> ...         convert / batch-convert, with optional rotate, flip, downscale
+//! iv fix-ext [--dry-run] <file|dir>... rename files whose extension does not match their content
 //! ```
 
 mod bench;
+mod convert;
 mod files;
 
 use std::process::ExitCode;
@@ -15,7 +18,15 @@ use iv_codec::default_registry;
 use iv_core::Source;
 
 fn usage() -> ExitCode {
-    eprintln!("usage:\n  iv probe <file|dir>...\n  iv bench [--runs N] <file|dir>...\n  iv formats");
+    eprintln!(
+        "usage:
+  iv probe <file|dir>...
+  iv bench [--runs N] <file|dir>...
+  iv formats
+  {}
+  iv fix-ext [--dry-run] <file|dir>...",
+        convert::CONVERT_USAGE
+    );
     ExitCode::from(2)
 }
 
@@ -29,6 +40,8 @@ fn main() -> ExitCode {
             None => usage(),
         },
         "formats" => formats(),
+        "convert" => convert::convert(rest),
+        "fix-ext" => convert::fix_ext(rest),
         _ => usage(),
     }
 }

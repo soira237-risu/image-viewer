@@ -71,6 +71,7 @@ fn info_from(tree: &usvg::Tree, format: FormatId) -> ImageInfo {
         bits_per_channel: 8,
         orientation: Orientation::Normal,
         icc_profile: None,
+        exif: None,
     }
 }
 

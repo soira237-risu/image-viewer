@@ -178,6 +178,7 @@ fn read_info(codec: &'static str, opened: &Opened, format: FormatId) -> Result<(
                 orientation(&frame)
             },
             icc_profile: icc_profile(&f, &frame),
+            exif: None,
         };
         Ok((info, frame))
     }

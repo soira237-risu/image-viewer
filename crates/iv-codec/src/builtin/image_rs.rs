@@ -116,6 +116,7 @@ fn info_from(dec: &mut impl ImageDecoder, src: &Source, format: FormatId) -> Res
         // a malformed orientation tag is not worth failing the image over
         orientation: dec.orientation().map(orientation).unwrap_or_default(),
         icc_profile: dec.icc_profile().ok().flatten().map(Arc::from),
+        exif: dec.exif_metadata().ok().flatten().map(Arc::from),
     })
 }
 
