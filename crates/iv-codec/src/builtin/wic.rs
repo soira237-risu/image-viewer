@@ -19,12 +19,13 @@ const ID: &str = "wic";
 const FALLBACK_ID: &str = "wic-fallback";
 
 /// Formats WIC handles first: nothing built in decodes them.
-const PRIMARY: &[FormatId] = &[FormatId::Heif, FormatId::Avif, FormatId::Raw];
+const PRIMARY: &[FormatId] = &[FormatId::Heif, FormatId::Raw];
 /// Formats WIC rescues when the Rust decoder fails on a feature it lacks (CMYK or arithmetic-coded
 /// JPEG, exotic TIFF compressions, unusual BMP headers, BCn DDS). PNG, GIF, ICO and WebP are left
 /// out on purpose: their Rust decoders are complete, so a failure means a damaged file, and WIC
 /// would report a truncated file as a success with the missing part blank.
-const FALLBACK: &[FormatId] = &[FormatId::Jpeg, FormatId::Bmp, FormatId::Tiff, FormatId::Jxl, FormatId::Dds];
+const FALLBACK: &[FormatId] =
+    &[FormatId::Jpeg, FormatId::Bmp, FormatId::Tiff, FormatId::Jxl, FormatId::Dds, FormatId::Avif];
 
 pub struct WicDecoder {
     info: DecoderInfo,

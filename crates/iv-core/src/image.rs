@@ -87,6 +87,42 @@ impl ImageBuf {
         &self.data
     }
 
+    /// The pixels as 8-bit RGBA: borrowed when already 8-bit, rounded from 16-bit, and sRGB-encoded
+    /// and clipped from (linear) float.
+    pub fn to_rgba8(&self) -> std::borrow::Cow<'_, [u8]> {
+        use std::borrow::Cow;
+        match self.format {
+            PixelFormat::Rgba8 => Cow::Borrowed(&self.data),
+            PixelFormat::Rgba16 => {
+                let src: &[u16] = bytemuck::cast_slice(&self.data);
+                Cow::Owned(src.iter().map(|&v| ((v as u32 + 128) / 257) as u8).collect())
+            }
+            PixelFormat::RgbaF32 => {
+                let srgb = |c: f32| if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+                let src: &[f32] = bytemuck::cast_slice(&self.data);
+                Cow::Owned(
+                    src.chunks_exact(4)
+                        .flat_map(|p| {
+                            let enc = |c: f32| (srgb(c.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
+                            [enc(p[0]), enc(p[1]), enc(p[2]), (p[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8]
+                        })
+                        .collect(),
+                )
+            }
+        }
+    }
+
+    /// Whether every pixel is fully opaque.
+    pub fn is_opaque(&self) -> bool {
+        match self.format {
+            PixelFormat::Rgba8 => self.data.chunks_exact(4).all(|p| p[3] == u8::MAX),
+            PixelFormat::Rgba16 => {
+                bytemuck::cast_slice::<u8, u16>(&self.data).chunks_exact(4).all(|p| p[3] == u16::MAX)
+            }
+            PixelFormat::RgbaF32 => bytemuck::cast_slice::<u8, f32>(&self.data).chunks_exact(4).all(|p| p[3] >= 1.0),
+        }
+    }
+
     /// Size of the pixel data in bytes (what a cache charges for this image).
     pub fn memory_size(&self) -> usize {
         self.data.len()

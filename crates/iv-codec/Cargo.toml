@@ -17,12 +17,13 @@ avif-parse.workspace = true
 jxl-oxide.workspace = true
 resvg.workspace = true
 moxcms.workspace = true
+webp.workspace = true
 bytemuck.workspace = true
+zune-jpegxl.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 bytemuck.workspace = true
-zune-jpegxl.workspace = true
 png.workspace = true
 moxcms.workspace = true
 

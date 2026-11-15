@@ -1,8 +1,9 @@
 //! AVIF through `rav1d` (a Rust port of dav1d), via `avif-decode`.
 //!
-//! On Windows this decoder only claims AVIF files with an alpha channel: the system AV1 codec
-//! drops alpha, but unlike this path it applies the container's rotation and reports the ICC
-//! profile, so opaque files stay with WIC. Elsewhere it decodes every AVIF.
+//! The primary AVIF decoder everywhere. The Windows AV1 codec was measured to be wrong twice:
+//! it drops alpha, and it decodes BT.601 files (libavif's default for 8-bit sRGB) with BT.709
+//! coefficients, turning pure red into (255, 25, 0); ffmpeg and this path give (254, 0, 0).
+//! Known gap: container rotation (`irot`/`imir`) and embedded ICC are not read yet.
 
 use avif_decode::Image;
 use iv_core::{CancelToken, Error, FormatId, ImageBuf, ImageInfo, Orientation, PixelFormat, Result, Source};
@@ -82,10 +83,6 @@ fn to_image_buf(img: Image) -> Result<ImageBuf> {
 impl Decoder for Rav1dAvifDecoder {
     fn info(&self) -> &DecoderInfo {
         &self.info
-    }
-
-    fn claims(&self, src: &Source, _format: FormatId) -> Result<bool> {
-        if cfg!(windows) { Ok(header(&src.read_all()?)?.has_alpha) } else { Ok(true) }
     }
 
     fn probe(&self, src: &Source, format: FormatId) -> Result<ImageInfo> {

@@ -316,13 +316,14 @@ export(source, edits, target_codec, options, dest):
   | JPEG | zune-jpeg → image-rs → WIC |
   | PNG/APNG, GIF, WebP, ICO, QOI, TGA, PNM, EXR, HDR | image-rs (애니메이션 포함) |
   | TIFF, BMP, DDS | image-rs → WIC |
-  | AVIF | 알파 있음: rav1d / 알파 없음: WIC (Windows) |
+  | AVIF | rav1d → WIC (rav1d 실패 시에만) |
   | HEIF/HEIC, Camera RAW | WIC (내장 썸네일을 미리보기로) |
   | JPEG XL | jxl-oxide → WIC |
   | SVG/SVGZ | resvg (긴 변 1024~8192로 래스터화) |
 
 - 확인된 사실과 그에 따른 결정
-  - Windows AV1 코덱은 AVIF 알파를 버림 (ffmpeg 디코드로 파일의 알파 1~254 확인 후 비교) → 알파 AVIF만 rav1d가 맡도록 `Decoder::claims` 확장 지점 추가. 불투명 AVIF는 회전·ICC를 지키는 WIC 유지 (속도: WIC 72ms, rav1d 80ms, 9.2MP)
+  - Windows AV1 코덱은 AVIF 알파를 버림 (ffmpeg 디코드로 파일의 알파 1~254 확인 후 비교) → rav1d 경로 추가, 내용 기반 선택을 위한 `Decoder::claims` 확장 지점 추가
+  - **(M4에서 정정)** 처음에는 불투명 AVIF를 회전·ICC 때문에 WIC에 맡겼으나, M4 인코더 왕복 테스트에서 Windows AV1 코덱이 BT.601 파일을 BT.709로 디코드함을 발견 (순수 빨강 → (255,25,0); ffmpeg·rav1d는 (254,0,0)). libavif의 8비트 sRGB 기본값이 BT.601이므로 실사용 AVIF 다수에 영향 → 모든 AVIF를 rav1d로. 남은 한계: AVIF 컨테이너 회전(irot/imir)과 내장 ICC 미적용
   - avif-decode의 10비트 출력은 이미 16비트 범위 (실측 56503 ≈ 220×257) → 처음 넣었던 추가 확장은 테스트에서 흰색으로 드러나 제거
   - WIC는 잘린 PNG를 성공으로 반환 → PNG/GIF/ICO/WebP는 WIC 보루에서 제외(손상 파일은 오류로 보고)
   - WIC의 AVIF 미리보기는 사실상 전체 디코드(9.2MP에서 46ms/76ms)이고 알파도 없음 → AVIF 미리보기 생략

@@ -8,16 +8,7 @@ use iv_core::Orientation;
 pub type UvTransform = [[f32; 3]; 2];
 
 pub fn uv_transform(o: Orientation) -> UvTransform {
-    match o {
-        Orientation::Normal => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-        Orientation::FlipH => [[-1.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
-        Orientation::Rotate180 => [[-1.0, 0.0, 1.0], [0.0, -1.0, 1.0]],
-        Orientation::FlipV => [[1.0, 0.0, 0.0], [0.0, -1.0, 1.0]],
-        Orientation::Transpose => [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
-        Orientation::Rotate90 => [[0.0, 1.0, 0.0], [-1.0, 0.0, 1.0]],
-        Orientation::Transverse => [[0.0, -1.0, 1.0], [-1.0, 0.0, 1.0]],
-        Orientation::Rotate270 => [[0.0, -1.0, 1.0], [1.0, 0.0, 0.0]],
-    }
+    o.display_to_stored_uv().map(|row| row.map(|v| v as f32))
 }
 
 pub fn apply(t: &UvTransform, u: f32, v: f32) -> (f32, f32) {

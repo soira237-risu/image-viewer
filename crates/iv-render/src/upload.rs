@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{PixelType, ResizeOptions, Resizer};
-use iv_core::{ImageBuf, PixelFormat};
+use iv_core::ImageBuf;
 
 /// RGBA8 pixels ready for upload, possibly reduced to fit the GPU's texture size limit.
 pub struct TexturePixels<'a> {
@@ -14,37 +14,11 @@ pub struct TexturePixels<'a> {
 }
 
 /// Linear → sRGB transfer, for float (scene-linear) sources.
-fn linear_to_srgb(c: f32) -> f32 {
-    if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
-}
-
-fn to_rgba8(img: &ImageBuf) -> Cow<'_, [u8]> {
-    match img.format() {
-        PixelFormat::Rgba8 => Cow::Borrowed(img.data()),
-        PixelFormat::Rgba16 => {
-            let src: &[u16] = bytemuck::cast_slice(img.data());
-            Cow::Owned(src.iter().map(|&v| ((v as u32 + 128) / 257) as u8).collect())
-        }
-        PixelFormat::RgbaF32 => {
-            // HDR tone mapping is a later milestone; for now clip to SDR. Alpha is linear coverage.
-            let src: &[f32] = bytemuck::cast_slice(img.data());
-            Cow::Owned(
-                src.chunks_exact(4)
-                    .flat_map(|p| {
-                        let enc = |c: f32| (linear_to_srgb(c.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
-                        [enc(p[0]), enc(p[1]), enc(p[2]), (p[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8]
-                    })
-                    .collect(),
-            )
-        }
-    }
-}
-
 /// Converts to RGBA8 and, if either side exceeds `max_side`, shrinks (Lanczos3, alpha-aware) so
 /// both sides fit. Large images get proper tiling in a later milestone; until then they are
 /// shown reduced rather than refused.
 pub fn prepare(img: &ImageBuf, max_side: u32) -> TexturePixels<'_> {
-    let rgba8 = to_rgba8(img);
+    let rgba8 = img.to_rgba8();
     let (w, h) = (img.width(), img.height());
     if w <= max_side && h <= max_side {
         return TexturePixels { width: w, height: h, rgba8 };
@@ -66,6 +40,7 @@ pub fn prepare(img: &ImageBuf, max_side: u32) -> TexturePixels<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iv_core::PixelFormat;
 
     #[test]
     fn rgba8_is_borrowed_not_copied() {

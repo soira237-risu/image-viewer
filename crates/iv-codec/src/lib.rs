@@ -13,8 +13,10 @@ mod builtin {
 }
 pub mod color;
 mod decoder;
+pub mod encode;
 mod registry;
 pub mod sniff;
+mod webp_container;
 
 use std::sync::Arc;
 

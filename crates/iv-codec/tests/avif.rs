@@ -65,8 +65,7 @@ fn ten_bit_avif_with_alpha_has_full_range_colour() {
 fn opaque_avif_decodes() {
     let d = decode("avif/opaque.avif");
     assert!(!d.info.has_alpha);
-    // the system codec keeps container rotation and ICC on Windows
-    assert_eq!(d.info.codec, if cfg!(windows) { "wic" } else { "rav1d" });
+    assert_eq!(d.info.codec, "rav1d");
     assert_halves(&d.image, false);
 }
 
@@ -84,4 +83,21 @@ fn heic_decodes_through_wic() {
     let bottom = rgba8_at(img, 200, 150);
     assert!(top[0] > 180 && top[1] < 80 && top[2] < 80 && top[3] == 255, "red: {top:?}");
     assert!(bottom[2] > 180 && bottom[0] < 80 && bottom[3] == 255, "blue: {bottom:?}");
+}
+
+/// `bt601-patches.avif` (written by ravif, BT.601 matrix, full range) holds red, green and
+/// (200, 100, 50) patches, 16 px wide each. ffmpeg decodes them to (254,0,0), (0,255,1),
+/// (200,100,50); the Windows AV1 codec applies BT.709 instead and gives (255,25,0) for red.
+#[test]
+fn bt601_avif_colours_are_right() {
+    let d = decode("avif/bt601-patches.avif");
+    assert_eq!(d.info.codec, "rav1d");
+    let expect = [[254u8, 0, 0], [0, 255, 1], [200, 100, 50]];
+    for (k, want) in expect.iter().enumerate() {
+        let got = rgba8_at(&d.image, k as u32 * 16 + 8, 8);
+        assert!(
+            got.iter().zip(want).all(|(a, b)| (*a as i32 - *b as i32).abs() <= 2),
+            "patch {k}: {got:?} vs {want:?}"
+        );
+    }
 }

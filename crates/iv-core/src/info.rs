@@ -53,6 +53,75 @@ impl Orientation {
         }
     }
 
+    pub const ALL: [Orientation; 8] = [
+        Orientation::Normal,
+        Orientation::FlipH,
+        Orientation::Rotate180,
+        Orientation::FlipV,
+        Orientation::Transpose,
+        Orientation::Rotate90,
+        Orientation::Transverse,
+        Orientation::Rotate270,
+    ];
+
+    /// The transform as a 2×2 integer matrix acting on centred pixel coordinates (x right,
+    /// y down): `shown = M · stored`.
+    fn matrix(self) -> [[i8; 2]; 2] {
+        match self {
+            Orientation::Normal => [[1, 0], [0, 1]],
+            Orientation::FlipH => [[-1, 0], [0, 1]],
+            Orientation::Rotate180 => [[-1, 0], [0, -1]],
+            Orientation::FlipV => [[1, 0], [0, -1]],
+            Orientation::Transpose => [[0, 1], [1, 0]],
+            Orientation::Rotate90 => [[0, -1], [1, 0]],
+            Orientation::Transverse => [[0, -1], [-1, 0]],
+            Orientation::Rotate270 => [[0, 1], [-1, 0]],
+        }
+    }
+
+    fn from_matrix(m: [[i8; 2]; 2]) -> Self {
+        Orientation::ALL
+            .into_iter()
+            .find(|o| o.matrix() == m)
+            .expect("the eight orientations are closed under composition")
+    }
+
+    /// `self` followed by `next`: e.g. a photo stored with EXIF `Rotate90` that the user then
+    /// flips horizontally is shown as `Rotate90.then(FlipH)`.
+    pub fn then(self, next: Orientation) -> Orientation {
+        let (a, b) = (self.matrix(), next.matrix());
+        let mut m = [[0i8; 2]; 2];
+        for (i, row) in m.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell = b[i][0] * a[0][j] + b[i][1] * a[1][j];
+            }
+        }
+        Orientation::from_matrix(m)
+    }
+
+    /// Affine map from upright (displayed) UV, 0..1 over the shown image, to stored UV:
+    /// `stored = [a b c; d e f] · [u v 1]`.
+    pub fn display_to_stored_uv(self) -> [[f64; 3]; 2] {
+        match self {
+            Orientation::Normal => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            Orientation::FlipH => [[-1.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+            Orientation::Rotate180 => [[-1.0, 0.0, 1.0], [0.0, -1.0, 1.0]],
+            Orientation::FlipV => [[1.0, 0.0, 0.0], [0.0, -1.0, 1.0]],
+            Orientation::Transpose => [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+            Orientation::Rotate90 => [[0.0, 1.0, 0.0], [-1.0, 0.0, 1.0]],
+            Orientation::Transverse => [[0.0, -1.0, 1.0], [-1.0, 0.0, 1.0]],
+            Orientation::Rotate270 => [[0.0, -1.0, 1.0], [1.0, 0.0, 0.0]],
+        }
+    }
+
+    /// The transform that undoes `self`.
+    pub fn inverse(self) -> Orientation {
+        Orientation::ALL
+            .into_iter()
+            .find(|o| self.then(*o) == Orientation::Normal)
+            .expect("every orientation is invertible")
+    }
+
     /// Whether showing the image upright swaps its width and height.
     pub fn swaps_dimensions(self) -> bool {
         matches!(
@@ -101,6 +170,30 @@ mod tests {
         }
         assert_eq!(Orientation::from_exif(0), Orientation::Normal);
         assert_eq!(Orientation::from_exif(9), Orientation::Normal);
+    }
+
+    #[test]
+    fn composition_follows_the_group_laws() {
+        use Orientation::*;
+        assert_eq!(Rotate90.then(Rotate90), Rotate180);
+        assert_eq!(Rotate90.then(Rotate90).then(Rotate90).then(Rotate90), Normal);
+        assert_eq!(Rotate90.then(Rotate270), Normal);
+        assert_eq!(FlipH.then(FlipH), Normal);
+        assert_eq!(FlipH.then(Rotate180), FlipV);
+        // EXIF 5 is "mirror horizontally, then rotate 270° clockwise"; 7 is mirror then 90°
+        assert_eq!(FlipH.then(Rotate270), Transpose);
+        assert_eq!(FlipH.then(Rotate90), Transverse);
+        for a in Orientation::ALL {
+            assert_eq!(a.then(a.inverse()), Normal, "{a:?}");
+            assert_eq!(a.inverse().then(a), Normal, "{a:?}");
+            assert_eq!(Normal.then(a), a);
+            for b in Orientation::ALL {
+                for c in Orientation::ALL {
+                    assert_eq!(a.then(b).then(c), a.then(b.then(c)), "associative");
+                }
+                assert_eq!(a.then(b).swaps_dimensions(), a.swaps_dimensions() != b.swaps_dimensions());
+            }
+        }
     }
 
     #[test]
