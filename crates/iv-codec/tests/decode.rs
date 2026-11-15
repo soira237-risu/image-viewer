@@ -289,3 +289,14 @@ fn image_buf_shares_pixels_on_clone() {
     let copy: ImageBuf = d.image.clone();
     assert_eq!(copy.data().as_ptr(), d.image.data().as_ptr());
 }
+
+#[test]
+fn gif_decodes_exactly_when_the_palette_fits() {
+    // four colours fit a GIF palette, so the round trip is exact
+    let colours = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 255, 255]];
+    let expected = RgbaImage::from_fn(12, 7, |x, y| Rgba(colours[((x / 3 + y) % 4) as usize]));
+    let d = decode("a.gif", encode(&DynamicImage::ImageRgba8(expected.clone()), ImageFormat::Gif));
+    assert_exact(&d, &expected);
+    assert_eq!(d.info.format, FormatId::Gif);
+    assert_eq!(d.info.frame_count, None, "GIF frame count needs a full scan");
+}

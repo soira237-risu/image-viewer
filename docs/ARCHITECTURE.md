@@ -276,6 +276,21 @@ export(source, edits, target_codec, options, dest):
   - BMP가 원시 형식임에도 느림(image-rs의 행 단위 처리) → 빈도 낮아 보류, 필요 시 전용 디코더
 - 벤치 코퍼스: `cargo run -p iv-codec --release --example make_corpus -- C:/Windows/Web/Wallpaper/ThemeC testdata/local/corpus 4`
 
+### M1 결과 (2026-11-15)
+
+- 구현
+  - `iv-render`: `ViewState`(창 맞춤·커서 기준 확대·이동 제한), EXIF 방향 → UV 변환, sRGB 텍스처 + GPU 밉맵(선형광 평균), 체커보드 알파 합성, 3배 초과 확대 시 nearest, GPU 한계 초과 이미지는 Lanczos3 축소
+  - `iv-app`: winit 0.30 창, 명령(`file.open`, `view.*`, `app.*`) + `%APPDATA%\image-viewer\keymap.toml` 재정의, 휠 확대·드래그 이동·더블클릭 맞춤/100%, 전체 화면, 드래그 앤 드롭, 파일 열기 대화상자, `--trace` 시작 계측
+- 시작 경로: 프로세스 시작 즉시 GPU 장치 생성 스레드와 디코드 스레드가 동시에 출발 → 창 생성과 겹침
+- 측정 (release, 6400×4000 JPEG, RX 9060, 5회 중앙값, 바이너리 첫 실행 제외)
+  - 백엔드 비교: 첫 전체 화면 Vulkan 380ms vs DX12 326ms → Windows는 DX12 우선(`WGPU_BACKEND`로 재정의 가능)
+  - GPU 초기화를 시작 직후로 이동한 뒤: GPU 준비 115ms, **첫 전체 화면 221ms**
+  - 내역: 디코드 67ms(GPU 준비와 병렬), 업로드+밉맵 40ms(102MB), 첫 present 약 16ms
+  - 바이너리를 새로 빌드한 직후 첫 실행은 드라이버 셰이더 캐시 생성으로 600~800ms까지 늘어남
+- 확인: 오프스크린 렌더 픽셀 검사 테스트(위치·방향 4종·체커보드·밉맵·16비트), 실제 창 캡처로 맞춤 표시·EXIF 6 회전·알파·키 확대 확인
+- 미확인: 실제 키보드로 같은 키를 연타했을 때의 동작(합성 키 메시지로는 3회 중 1회만 반영됨. 하네스 한계로 추정)
+- 남은 개선 후보: 업로드 40ms → 화면 크기 축소본 먼저 업로드 후 원본 교체(M2에서 측정)
+
 ## 7. 테스트 전략
 
 - **코덱**: 형식별 샘플 코퍼스(`testdata/`), probe 결과·크기·프레임 수 검증, 손상 파일에서 패닉 없이 오류 반환
