@@ -26,6 +26,7 @@ egui-wgpu.workspace = true
 egui-winit.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 image.workspace = true
 
 [dev-dependencies.egui_kittest]

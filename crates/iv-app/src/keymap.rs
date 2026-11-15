@@ -157,6 +157,7 @@ const DEFAULTS: &[(&str, Command)] = &[
     ("D", Command::ViewToggleSpread),
     ("Shift+D", Command::ViewToggleDirection),
     ("Alt+Enter", Command::ViewToggleFullscreen),
+    ("F2", Command::AppSettings),
     ("Esc", Command::Escape),
     ("Ctrl+W", Command::AppQuit),
     ("Ctrl+Q", Command::AppQuit),

@@ -23,14 +23,11 @@ use crate::commands::Command;
 use crate::edit::{drag_rect, in_place_format, save_request, selection_to_crop};
 use crate::keymap::{Chord, Keymap, canonical_key};
 use crate::panel::{self, PanelAction, PanelContext, PanelState};
+use crate::settings::Settings;
 use crate::trace::Trace;
 
 const ZOOM_STEP: f64 = 1.25;
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
-/// Neighbours kept decoded around the current image.
-const PREFETCH_COUNT: usize = 6;
-/// Stepping past the last image continues at the first.
-const WRAP: bool = true;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -173,6 +170,9 @@ pub struct App {
     /// Two-page view: `Some(right_to_left)` when on.
     spread: Option<bool>,
     panel: PanelState,
+    settings: Settings,
+    settings_path: Option<PathBuf>,
+    settings_open: bool,
 }
 
 /// GPU device creation started at launch, before the window exists.
@@ -220,9 +220,18 @@ fn file_name(p: &Path) -> String {
 }
 
 impl App {
-    pub fn new(proxy: EventLoopProxy<AppEvent>, keymap: Keymap, trace: Trace, gpu_init: Option<GpuInit>) -> Self {
+    pub fn new(
+        proxy: EventLoopProxy<AppEvent>,
+        keymap: Keymap,
+        trace: Trace,
+        gpu_init: Option<GpuInit>,
+        settings: Settings,
+        settings_path: Option<PathBuf>,
+    ) -> Self {
         let sink = proxy.clone();
-        let pipeline = Pipeline::new(Arc::new(iv_codec::default_registry()), PipelineConfig::default(), move |e| {
+        let config =
+            PipelineConfig { budget_bytes: settings.cache_mib as u64 * 1024 * 1024, ..PipelineConfig::default() };
+        let pipeline = Pipeline::new(Arc::new(iv_codec::default_registry()), config, move |e| {
             // the window may already be closing; nothing to do then
             let _ = sink.send_event(AppEvent::Pipeline(e));
         });
@@ -252,7 +261,10 @@ impl App {
             saving: false,
             encoders: Encoders::default(),
             spread: None,
-            panel: PanelState::default(),
+            panel: PanelState { quality: settings.save_quality, ..PanelState::default() },
+            settings,
+            settings_path,
+            settings_open: false,
         }
     }
 
@@ -304,8 +316,9 @@ impl App {
         let mut paths: Vec<PathBuf> = match (&self.folder, self.index) {
             (Some(folder), Some(i)) if !self.quick_browsing => {
                 // two pages are shown at a time, so look twice as far
-                let count = if self.spread.is_some() { PREFETCH_COUNT * 2 } else { PREFETCH_COUNT };
-                prefetch_order(i, folder.len(), self.direction, count, WRAP)
+                let n = self.settings.prefetch_count;
+                let count = if self.spread.is_some() { n * 2 } else { n };
+                prefetch_order(i, folder.len(), self.direction, count, self.settings.wrap)
                     .into_iter()
                     .filter_map(|j| folder.get(j).map(Path::to_path_buf))
                     .collect()
@@ -365,8 +378,8 @@ impl App {
         let (Some(folder), Some(index)) = (&self.folder, self.index) else { return };
         let len = folder.len();
         let target = match cmd {
-            Command::NavNext => step(index, len, if self.spread.is_some() { 2 } else { 1 }, WRAP),
-            Command::NavPrev => step(index, len, if self.spread.is_some() { -2 } else { -1 }, WRAP),
+            Command::NavNext => step(index, len, if self.spread.is_some() { 2 } else { 1 }, self.settings.wrap),
+            Command::NavPrev => step(index, len, if self.spread.is_some() { -2 } else { -1 }, self.settings.wrap),
             Command::NavFirst => (index != 0).then_some(0),
             Command::NavLast => (index + 1 != len).then(|| len - 1),
             _ => None,
@@ -446,7 +459,8 @@ impl App {
         surface.configure(&gpu.device, &config);
         self.trace.mark("surface configured");
 
-        let renderer = ImageRenderer::new(&gpu.device, view_format);
+        let mut renderer = ImageRenderer::new(&gpu.device, view_format);
+        apply_style(&mut renderer, &self.settings);
         self.trace.mark("pipelines created");
         let ctx = egui::Context::default();
         let state = egui_winit::State::new(
@@ -730,6 +744,12 @@ impl App {
             Command::ViewActualSize => self.with_view(|v| v.actual_size_at(center)),
             Command::ViewZoomIn => self.with_view(|v| v.zoom_by(ZOOM_STEP)),
             Command::ViewZoomOut => self.with_view(|v| v.zoom_by(1.0 / ZOOM_STEP)),
+            Command::AppSettings => {
+                self.settings_open = !self.settings_open;
+                if let Some(s) = &self.surface {
+                    s.window.request_redraw();
+                }
+            }
             Command::ViewToggleEditPanel => {
                 self.panel.open = !self.panel.open;
                 if let Some(s) = &self.surface {
@@ -737,7 +757,7 @@ impl App {
                 }
             }
             Command::ViewToggleSpread => {
-                self.spread = if self.spread.is_some() { None } else { Some(true) };
+                self.spread = if self.spread.is_some() { None } else { Some(self.settings.spread_right_to_left) };
                 self.trace.mark(&format!("two-page view: {:?}", self.spread));
                 self.refresh_spread();
             }
@@ -810,15 +830,36 @@ impl App {
         let view = self.display.as_ref().map(|d| &d.view);
         s.renderer.render(&s.gpu.queue, &mut encoder, &target, (s.config.width, s.config.height), view);
         let mut panel_actions = Vec::new();
-        if self.panel.open {
+        let mut ui_changed = false;
+        if self.panel.open || self.settings_open {
             let cx = self.panel_context();
             let s = self.surface.as_mut().expect("checked above");
-            panel_actions = draw_panel(s, &mut self.panel, &cx, &mut encoder, &target);
+            let before = (self.settings.clone(), self.panel.quality);
+            let mut save_settings = false;
+            panel_actions = draw_ui(
+                s,
+                &mut UiState {
+                    panel: &mut self.panel,
+                    settings: &mut self.settings,
+                    settings_open: &mut self.settings_open,
+                },
+                &cx,
+                &mut save_settings,
+                &mut encoder,
+                &target,
+            );
+            ui_changed = before != (self.settings.clone(), self.panel.quality) || save_settings;
+            if save_settings {
+                self.save_settings();
+            }
         }
         let s = self.surface.as_mut().expect("checked above");
         s.gpu.queue.submit([encoder.finish()]);
         s.window.pre_present_notify();
         s.gpu.queue.present(frame);
+        if ui_changed {
+            self.settings_changed();
+        }
         if !panel_actions.is_empty() {
             self.apply_panel_actions(panel_actions);
         }
@@ -930,6 +971,31 @@ impl App {
         }
         d.view.set_image_size(g.size);
         s.window.request_redraw();
+    }
+
+    /// Settings or the panel's quality changed: keep both in step and apply what is live.
+    fn settings_changed(&mut self) {
+        if self.panel.quality != self.settings.save_quality {
+            // whichever moved last wins; the panel slider is the more direct control
+            self.settings.save_quality = self.panel.quality;
+        }
+        self.settings = self.settings.clone().clamped();
+        self.panel.quality = self.settings.save_quality;
+        if let Some(s) = &mut self.surface {
+            apply_style(&mut s.renderer, &self.settings);
+            s.window.request_redraw();
+        }
+    }
+
+    fn save_settings(&mut self) {
+        let Some(path) = self.settings_path.clone() else { return };
+        match self.settings.save(&path) {
+            Ok(()) => self.trace.mark(&format!("settings saved to {}", path.display())),
+            Err(e) => {
+                self.error = Some(format!("settings: {e}"));
+                self.update_title();
+            }
+        }
     }
 
     fn panel_context(&self) -> PanelContext {
@@ -1227,9 +1293,9 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        // the edit panel gets first look at input; what it uses (clicks on it, typing in its
-        // fields) does not also reach the viewer
-        if self.panel.open {
+        // the edit panel and settings window get first look at input; what they use (clicks on
+        // them, typing in their fields) does not also reach the viewer
+        if self.panel.open || self.settings_open {
             if let Some(s) = &mut self.surface {
                 let response = s.egui.state.on_window_event(&s.window, &event);
                 if response.repaint {
@@ -1396,18 +1462,33 @@ mod spread_tests {
     }
 }
 
-/// Runs one egui frame for the edit panel and draws it over the image in `target`.
-fn draw_panel(
+/// What the egui frame edits.
+struct UiState<'a> {
+    panel: &'a mut PanelState,
+    settings: &'a mut Settings,
+    settings_open: &'a mut bool,
+}
+
+/// Runs one egui frame (edit panel and/or settings window) and draws it over the image.
+fn draw_ui(
     s: &mut Surface,
-    st: &mut PanelState,
+    ui_state: &mut UiState<'_>,
     cx: &PanelContext,
+    save_settings: &mut bool,
     encoder: &mut wgpu::CommandEncoder,
     target: &wgpu::TextureView,
 ) -> Vec<PanelAction> {
     let e = &mut s.egui;
     let raw = e.state.take_egui_input(&s.window);
     let mut actions = Vec::new();
-    let full = e.ctx.run_ui(raw, |ui| actions = panel::show(ui, st, cx));
+    let full = e.ctx.run_ui(raw, |ui| {
+        if ui_state.panel.open {
+            actions = panel::show(ui, ui_state.panel, cx);
+        }
+        if *ui_state.settings_open {
+            *save_settings |= crate::settings::show(ui.ctx(), ui_state.settings_open, ui_state.settings);
+        }
+    });
     e.state.handle_platform_output(&s.window, full.platform_output);
     let ppp = full.pixels_per_point;
     let jobs = e.ctx.tessellate(full.shapes, ppp);
@@ -1444,4 +1525,10 @@ fn draw_panel(
         s.window.request_redraw();
     }
     actions
+}
+
+/// Renderer appearance from the settings.
+fn apply_style(renderer: &mut ImageRenderer, settings: &Settings) {
+    renderer.style.background = settings.background_linear();
+    renderer.style.nearest_above_zoom = settings.nearest_above_zoom as f64;
 }

@@ -1,4 +1,4 @@
-//! image-viewer: `image-viewer [--trace] [--no-activate] [--keymap <file.toml>] [file]`
+//! image-viewer: `image-viewer [--trace] [--no-activate] [--keymap <file.toml>] [--settings <file.toml>] [file]`
 
 // no console window for release builds launched from Explorer
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -8,6 +8,7 @@ mod commands;
 mod edit;
 mod keymap;
 mod panel;
+mod settings;
 mod trace;
 
 use std::path::PathBuf;
@@ -17,6 +18,7 @@ use winit::event_loop::{ControlFlow, EventLoop};
 
 use crate::app::{App, AppEvent};
 use crate::keymap::Keymap;
+use crate::settings::Settings;
 use crate::trace::Trace;
 
 fn config_dir() -> Option<PathBuf> {
@@ -30,11 +32,14 @@ fn main() {
     let mut trace_enabled = false;
     let mut no_activate = false;
     let mut keymap_path: Option<PathBuf> = None;
+    let mut settings_path: Option<PathBuf> = None;
     let mut file = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--keymap" {
             keymap_path = args.next().map(PathBuf::from);
+        } else if arg == "--settings" {
+            settings_path = args.next().map(PathBuf::from);
         } else if arg == "--trace" {
             trace_enabled = true;
         } else if arg == "--no-activate" {
@@ -63,7 +68,15 @@ fn main() {
     };
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = App::new(event_loop.create_proxy(), keymap, trace, Some(gpu_init));
+    let settings_path = settings_path.or_else(|| config_dir().map(|d| d.join("settings.toml")));
+    let (settings, warning) = match &settings_path {
+        Some(p) => Settings::load(p),
+        None => (Settings::default(), None),
+    };
+    if let Some(w) = warning {
+        eprintln!("settings: {w}");
+    }
+    let mut app = App::new(event_loop.create_proxy(), keymap, trace, Some(gpu_init), settings, settings_path);
     app.no_activate = no_activate;
     // decoding starts now and overlaps window and GPU creation
     if let Some(path) = file {

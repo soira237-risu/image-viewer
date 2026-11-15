@@ -30,13 +30,15 @@ pub enum Command {
     ViewToggleSpread,
     /// Two-page reading direction: right-to-left (manga) or left-to-right.
     ViewToggleDirection,
+    /// The settings window.
+    AppSettings,
     /// Clear the selection; else leave full screen; else quit.
     Escape,
     AppQuit,
 }
 
 impl Command {
-    pub const ALL: [Command; 24] = [
+    pub const ALL: [Command; 25] = [
         Command::FileOpen,
         Command::FileSave,
         Command::FileSaveAs,
@@ -59,6 +61,7 @@ impl Command {
         Command::ViewToggleEditPanel,
         Command::ViewToggleSpread,
         Command::ViewToggleDirection,
+        Command::AppSettings,
         Command::Escape,
         Command::AppQuit,
     ];
@@ -87,6 +90,7 @@ impl Command {
             Command::ViewToggleEditPanel => "view.toggle_edit_panel",
             Command::ViewToggleSpread => "view.toggle_spread",
             Command::ViewToggleDirection => "view.toggle_direction",
+            Command::AppSettings => "app.settings",
             Command::Escape => "app.escape",
             Command::AppQuit => "app.quit",
         }
