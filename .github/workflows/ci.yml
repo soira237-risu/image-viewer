@@ -41,6 +41,6 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # GPU tests run on WARP, the software adapter; the HEIF test skips itself when the runner
-      # has no WIC HEIF codec
+      # has no WIC HEIF/HEVC codec. --no-fail-fast reports every failing test binary at once.
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast

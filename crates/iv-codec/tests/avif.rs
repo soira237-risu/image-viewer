@@ -72,18 +72,19 @@ fn opaque_avif_decodes() {
 /// `testdata/heic/halves.heic` was written by the Windows HEIF encoder (`heic_fixture` example)
 /// from the same 400x200 red/blue image; the encoder drops alpha.
 ///
-/// HEIF support in WIC comes from the optional "HEIF Image Extensions" package. Where it is not
-/// installed (e.g. CI runners) WIC reports WINCODEC_ERR_COMPONENTNOTFOUND and the test is
-/// skipped; any other failure still fails.
+/// HEIF in WIC needs two optional codecs: the HEIF container decoder and the HEVC video decoder it
+/// loads. Without the first WIC reports WINCODEC_ERR_COMPONENTNOTFOUND; with the container but no
+/// HEVC codec (the GitHub Windows runner) it reports WINCODEC_ERR_COMPONENTINITIALIZEFAILURE.
+/// Either means the codecs are not installed and the test is skipped; any other failure fails.
 #[cfg(windows)]
 #[test]
 fn heic_decodes_through_wic() {
-    const COMPONENT_NOT_FOUND: &str = "0x88982F50";
+    const CODEC_MISSING: [&str; 2] = ["0x88982F50", "0x88982F8B"];
     let src = Source::from_path(testdata("heic/halves.heic"));
     let d = match default_registry().decode(&src, &CancelToken::never()) {
         Ok(d) => d,
-        Err(e) if e.to_string().contains(COMPONENT_NOT_FOUND) => {
-            eprintln!("skipped: no WIC HEIF decoder installed ({e})");
+        Err(e) if CODEC_MISSING.iter().any(|c| e.to_string().contains(c)) => {
+            eprintln!("skipped: WIC HEIF/HEVC codecs not installed ({e})");
             return;
         }
         Err(e) => panic!("HEIF decode failed: {e}"),
