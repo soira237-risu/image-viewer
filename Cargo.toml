@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/iv-core", "crates/iv-codec", "crates/iv-cli", "crates/iv-render", "crates/iv-app"]
+members = ["crates/iv-core", "crates/iv-codec", "crates/iv-cli", "crates/iv-render", "crates/iv-app", "crates/iv-pipeline"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ publish = false
 iv-core = { path = "crates/iv-core" }
 iv-codec = { path = "crates/iv-codec" }
 iv-render = { path = "crates/iv-render" }
+iv-pipeline = { path = "crates/iv-pipeline" }
 
 thiserror = "2"
 image = { version = "0.25.10", default-features = false, features = [

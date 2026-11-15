@@ -6,18 +6,15 @@
 mod app;
 mod commands;
 mod keymap;
-mod loader;
 mod trace;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 
 use crate::app::{App, AppEvent};
 use crate::keymap::Keymap;
-use crate::loader::Loader;
 use crate::trace::Trace;
 
 fn config_dir() -> Option<PathBuf> {
@@ -56,8 +53,7 @@ fn main() {
     };
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let loader = Loader::new(Arc::new(iv_codec::default_registry()));
-    let mut app = App::new(event_loop.create_proxy(), loader, keymap, trace, Some(gpu_init));
+    let mut app = App::new(event_loop.create_proxy(), keymap, trace, Some(gpu_init));
     // decoding starts now and overlaps window and GPU creation
     if let Some(path) = file {
         app.open(path);

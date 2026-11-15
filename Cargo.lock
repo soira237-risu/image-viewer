@@ -901,6 +901,7 @@ dependencies = [
  "image",
  "iv-codec",
  "iv-core",
+ "iv-pipeline",
  "iv-render",
  "pollster",
  "rfd",
@@ -935,6 +936,16 @@ name = "iv-core"
 version = "0.1.0"
 dependencies = [
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "iv-pipeline"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "iv-codec",
+ "iv-core",
+ "tempfile",
 ]
 
 [[package]]

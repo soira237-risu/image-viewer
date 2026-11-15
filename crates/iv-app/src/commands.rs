@@ -5,18 +5,27 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Command {
     FileOpen,
+    NavNext,
+    NavPrev,
+    NavFirst,
+    NavLast,
     ViewFit,
     ViewActualSize,
     ViewZoomIn,
     ViewZoomOut,
     ViewToggleFullscreen,
+    /// Leave full screen; when windowed, quit.
     Escape,
     AppQuit,
 }
 
 impl Command {
-    pub const ALL: [Command; 8] = [
+    pub const ALL: [Command; 12] = [
         Command::FileOpen,
+        Command::NavNext,
+        Command::NavPrev,
+        Command::NavFirst,
+        Command::NavLast,
         Command::ViewFit,
         Command::ViewActualSize,
         Command::ViewZoomIn,
@@ -29,6 +38,10 @@ impl Command {
     pub fn id(self) -> &'static str {
         match self {
             Command::FileOpen => "file.open",
+            Command::NavNext => "nav.next",
+            Command::NavPrev => "nav.prev",
+            Command::NavFirst => "nav.first",
+            Command::NavLast => "nav.last",
             Command::ViewFit => "view.fit",
             Command::ViewActualSize => "view.actual_size",
             Command::ViewZoomIn => "view.zoom_in",
@@ -41,6 +54,11 @@ impl Command {
 
     pub fn from_id(id: &str) -> Option<Command> {
         Command::ALL.into_iter().find(|c| c.id() == id)
+    }
+
+    /// Navigation commands: holding their key flips through images quickly.
+    pub fn is_navigation(self) -> bool {
+        matches!(self, Command::NavNext | Command::NavPrev | Command::NavFirst | Command::NavLast)
     }
 }
 

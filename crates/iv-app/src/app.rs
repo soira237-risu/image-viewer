@@ -1,11 +1,12 @@
-//! The window: input → commands, load events → textures, redraws on demand.
+//! The window: input → commands, pipeline events → textures, redraws on demand.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use iv_codec::Decoded;
 use iv_core::{FormatId, ImageBuf, ImageInfo};
+use iv_pipeline::{FolderList, Pipeline, PipelineConfig, PipelineEvent, prefetch_order, step};
 use iv_render::{Gpu, ImageRenderer, ViewState, ZoomMode, wgpu};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -16,32 +17,58 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::commands::Command;
 use crate::keymap::{Chord, Keymap, canonical_key};
-use crate::loader::{LoadEvent, Loader};
 use crate::trace::Trace;
 
 const ZOOM_STEP: f64 = 1.25;
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// Neighbours kept decoded around the current image.
+const PREFETCH_COUNT: usize = 6;
+/// Stepping past the last image continues at the first.
+const WRAP: bool = true;
 
 #[derive(Debug)]
 pub enum AppEvent {
-    Load(LoadEvent),
+    Pipeline(PipelineEvent),
+    Folder { for_path: PathBuf, result: Result<FolderList, String> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shown {
-    Nothing,
     Preview,
     Full,
 }
 
-/// The photo being shown and what has arrived for it so far.
+/// The image the user asked for and what has arrived for it so far.
 struct Current {
     path: PathBuf,
-    info: ImageInfo,
+    info: Option<ImageInfo>,
     preview: Option<ImageBuf>,
-    full: Option<Decoded>,
+    full: Option<Arc<Decoded>>,
+    /// Decode time for a fresh load; `None` when it came from the cache.
     load_time: Option<Duration>,
-    shown: Shown,
+    requested_at: Instant,
+    shown_logged: bool,
+}
+
+impl Current {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            info: None,
+            preview: None,
+            full: None,
+            load_time: None,
+            requested_at: Instant::now(),
+            shown_logged: false,
+        }
+    }
+}
+
+/// What is on the GPU right now. It can lag behind [`Current`]: the previous image stays on
+/// screen until the next one has something to show, so navigation never flashes black.
+struct Display {
+    path: PathBuf,
+    kind: Shown,
     view: ViewState,
 }
 
@@ -57,11 +84,18 @@ struct Surface {
 
 pub struct App {
     proxy: EventLoopProxy<AppEvent>,
-    loader: Loader,
+    pipeline: Pipeline,
     keymap: Keymap,
     trace: Trace,
     surface: Option<Surface>,
     current: Option<Current>,
+    display: Option<Display>,
+    folder: Option<FolderList>,
+    index: Option<usize>,
+    /// Last navigation direction (+1 / −1), 0 right after opening a file.
+    direction: i32,
+    /// A navigation key is being held: flip without prefetching.
+    quick_browsing: bool,
     error: Option<String>,
     modifiers: ModifiersState,
     cursor: PhysicalPosition<f64>,
@@ -111,38 +145,123 @@ pub fn key_name(key: &Key) -> Option<String> {
     }
 }
 
+fn file_name(p: &Path) -> String {
+    p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
 impl App {
-    pub fn new(
-        proxy: EventLoopProxy<AppEvent>,
-        loader: Loader,
-        keymap: Keymap,
-        trace: Trace,
-        gpu_init: Option<GpuInit>,
-    ) -> Self {
+    pub fn new(proxy: EventLoopProxy<AppEvent>, keymap: Keymap, trace: Trace, gpu_init: Option<GpuInit>) -> Self {
+        let sink = proxy.clone();
+        let pipeline = Pipeline::new(Arc::new(iv_codec::default_registry()), PipelineConfig::default(), move |e| {
+            // the window may already be closing; nothing to do then
+            let _ = sink.send_event(AppEvent::Pipeline(e));
+        });
         Self {
-            gpu_init,
             proxy,
-            loader,
+            pipeline,
             keymap,
             trace,
             surface: None,
             current: None,
+            display: None,
+            folder: None,
+            index: None,
+            direction: 0,
+            quick_browsing: false,
             error: None,
             modifiers: ModifiersState::empty(),
             cursor: PhysicalPosition::new(0.0, 0.0),
             drag_from: None,
             last_click: None,
             first_frame_logged: false,
+            gpu_init,
         }
     }
 
+    /// Opens a file and lists its folder in the background for navigation.
     pub fn open(&mut self, path: PathBuf) {
+        self.trace.mark(&format!("open {}", path.display()));
+        self.folder = None;
+        self.index = None;
+        self.direction = 0;
+        self.request(path.clone());
+
         let proxy = self.proxy.clone();
-        self.trace.mark(&format!("load start {}", path.display()));
-        self.loader.load(path, move |e| {
-            // the window may already be closing; nothing to do then
-            let _ = proxy.send_event(AppEvent::Load(e));
-        });
+        std::thread::Builder::new()
+            .name("folder-scan".into())
+            .spawn(move || {
+                let result = FolderList::for_file(&path).map_err(|e| e.to_string());
+                let _ = proxy.send_event(AppEvent::Folder { for_path: path, result });
+            })
+            .expect("spawn folder scan");
+    }
+
+    /// Paths to prefetch around the current index, nearest first.
+    fn prefetch_paths(&self) -> Vec<PathBuf> {
+        match (&self.folder, self.index) {
+            (Some(folder), Some(i)) if !self.quick_browsing => {
+                prefetch_order(i, folder.len(), self.direction, PREFETCH_COUNT, WRAP)
+                    .into_iter()
+                    .filter_map(|j| folder.get(j).map(Path::to_path_buf))
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Asks the pipeline for `path` (and its neighbours) and makes it current.
+    fn request(&mut self, path: PathBuf) {
+        let hit = if self.quick_browsing {
+            self.pipeline.request_quick(&path)
+        } else {
+            let prefetch = self.prefetch_paths();
+            self.pipeline.request(&path, &prefetch)
+        };
+        if self.current.as_ref().map(|c| &c.path) != Some(&path) {
+            self.current = Some(Current::new(path));
+            self.error = None;
+        }
+        if let (Some(cur), Some(decoded)) = (self.current.as_mut(), hit) {
+            if cur.full.is_none() {
+                cur.info = Some(decoded.info.clone());
+                cur.full = Some(decoded);
+            }
+        }
+        self.sync_texture();
+        self.update_title();
+    }
+
+    fn navigate(&mut self, cmd: Command, repeat: bool) {
+        let (Some(folder), Some(index)) = (&self.folder, self.index) else { return };
+        let len = folder.len();
+        let target = match cmd {
+            Command::NavNext => step(index, len, 1, WRAP),
+            Command::NavPrev => step(index, len, -1, WRAP),
+            Command::NavFirst => (index != 0).then_some(0),
+            Command::NavLast => (index + 1 != len).then(|| len - 1),
+            _ => None,
+        };
+        let Some(target) = target else { return };
+        let Some(path) = folder.get(target).map(Path::to_path_buf) else { return };
+        self.direction = match cmd {
+            Command::NavPrev | Command::NavFirst => -1,
+            _ => 1,
+        };
+        self.index = Some(target);
+        if repeat {
+            self.quick_browsing = true;
+        }
+        self.request(path);
+    }
+
+    /// The navigation key was released: resume prefetching around where the user stopped.
+    fn end_quick_browsing(&mut self) {
+        if self.quick_browsing {
+            self.quick_browsing = false;
+            if let Some(path) = self.current.as_ref().map(|c| c.path.clone()) {
+                self.request(path);
+            }
+        }
     }
 
     fn viewport(&self) -> (u32, u32) {
@@ -206,120 +325,166 @@ impl App {
         Ok((gpu, surface))
     }
 
-    /// Uploads the best image that has arrived but is not on the GPU yet.
+    /// Uploads the best image for the current request that is not on the GPU yet.
     fn sync_texture(&mut self) {
+        let viewport = self.viewport();
         let (Some(s), Some(cur)) = (self.surface.as_mut(), self.current.as_mut()) else { return };
-        let orientation = cur.info.orientation;
-        if let Some(full) = &cur.full {
-            if cur.shown != Shown::Full {
-                let t = Instant::now();
-                let up =
-                    s.renderer.set_image(&s.gpu.device, &s.gpu.queue, &full.image, orientation, full.info.has_alpha);
-                cur.shown = Shown::Full;
-                cur.preview = None;
-                self.trace.mark(&format!(
-                    "full image uploaded {}x{} ({} mips{}) in {:.1} ms",
-                    up.texture_width,
-                    up.texture_height,
-                    up.mip_levels,
-                    if up.reduced { ", reduced to GPU limit" } else { "" },
-                    t.elapsed().as_secs_f64() * 1000.0
-                ));
-                s.window.request_redraw();
+        let same_image = self.display.as_ref().is_some_and(|d| d.path == cur.path);
+        let shown = self.display.as_ref().filter(|_| same_image).map(|d| d.kind);
+
+        let (image, info, kind) = match (&cur.full, &cur.preview, &cur.info) {
+            (Some(full), _, _) if shown != Some(Shown::Full) => (&full.image, &full.info, Shown::Full),
+            (None, Some(preview), Some(info)) if shown.is_none() => (preview, info, Shown::Preview),
+            _ => return,
+        };
+        let t = Instant::now();
+        let up = s.renderer.set_image(&s.gpu.device, &s.gpu.queue, image, info.orientation, info.has_alpha);
+        self.trace.mark(&format!(
+            "{} uploaded {}x{} ({} mips{}) in {:.1} ms",
+            if kind == Shown::Full { "image" } else { "preview" },
+            up.texture_width,
+            up.texture_height,
+            up.mip_levels,
+            if up.reduced { ", reduced to GPU limit" } else { "" },
+            t.elapsed().as_secs_f64() * 1000.0
+        ));
+        match &mut self.display {
+            // the full image replacing its own preview keeps the user's zoom
+            Some(d) if same_image => {
+                d.kind = kind;
+                d.view.set_image_size(info.display_size());
             }
-        } else if let Some(preview) = &cur.preview {
-            if cur.shown == Shown::Nothing {
-                s.renderer.set_image(&s.gpu.device, &s.gpu.queue, preview, orientation, cur.info.has_alpha);
-                cur.shown = Shown::Preview;
-                self.trace.mark(&format!("preview uploaded {}x{}", preview.width(), preview.height()));
-                s.window.request_redraw();
+            _ => {
+                self.display =
+                    Some(Display { path: cur.path.clone(), kind, view: ViewState::new(info.display_size(), viewport) })
             }
         }
+        if kind == Shown::Full {
+            cur.preview = None;
+        }
+        s.window.request_redraw();
+    }
+
+    /// Puts an image that is no longer current on screen (quick browsing), unless the current one
+    /// is already showing.
+    fn show_passing(&mut self, path: PathBuf, decoded: &Decoded) {
+        let viewport = self.viewport();
+        let Some(s) = self.surface.as_mut() else { return };
+        let current_shown = match (&self.current, &self.display) {
+            (Some(c), Some(d)) => d.path == c.path,
+            _ => false,
+        };
+        if current_shown {
+            return;
+        }
+        s.renderer.set_image(
+            &s.gpu.device,
+            &s.gpu.queue,
+            &decoded.image,
+            decoded.info.orientation,
+            decoded.info.has_alpha,
+        );
+        self.trace.mark(&format!("passing image shown: {}", file_name(&path)));
+        self.display =
+            Some(Display { path, kind: Shown::Full, view: ViewState::new(decoded.info.display_size(), viewport) });
+        s.window.request_redraw();
     }
 
     fn update_title(&self) {
         let Some(s) = &self.surface else { return };
+        let position = match (&self.folder, self.index) {
+            (Some(f), Some(i)) => format!("[{}/{}] ", i + 1, f.len()),
+            _ => String::new(),
+        };
         let title = match (&self.current, &self.error) {
-            (_, Some(err)) => format!("image-viewer — {err}"),
+            (_, Some(err)) => format!("{position}image-viewer — {err}"),
             (Some(cur), None) => {
-                let name =
-                    cur.path.file_name().map_or_else(|| cur.path.display().to_string(), |n| n.to_string_lossy().into());
-                let (w, h) = cur.info.display_size();
-                let zoom = (cur.view.zoom() * 100.0).round();
-                let state = match (cur.shown, cur.load_time) {
-                    (Shown::Full, Some(t)) => {
-                        format!("{} · {} · {:.0} ms", cur.info.format, cur.info.codec, t.as_secs_f64() * 1000.0)
+                let name = file_name(&cur.path);
+                let Some(info) = &cur.info else { return s.window.set_title(&format!("{position}{name} — loading")) };
+                let (w, h) = info.display_size();
+                let zoom = self
+                    .display
+                    .as_ref()
+                    .filter(|d| d.path == cur.path)
+                    .map_or(String::new(), |d| format!(" — {}%", (d.view.zoom() * 100.0).round()));
+                let state = match (&cur.full, cur.load_time) {
+                    (Some(_), Some(t)) => {
+                        format!("{} · {} · {:.0} ms", info.format, info.codec, t.as_secs_f64() * 1000.0)
                     }
-                    (Shown::Preview, _) => format!("{} · preview", cur.info.format),
-                    _ => format!("{} · loading", cur.info.format),
+                    (Some(_), None) => format!("{} · {} · cached", info.format, info.codec),
+                    (None, _) if cur.preview.is_some() => format!("{} · preview", info.format),
+                    (None, _) => format!("{} · loading", info.format),
                 };
-                format!("{name} — {w}×{h} — {zoom}% — {state}")
+                format!("{position}{name} — {w}×{h}{zoom} — {state}")
             }
             (None, None) => "image-viewer — Ctrl+O to open, or drop a file".to_string(),
         };
         s.window.set_title(&title);
     }
 
-    fn handle_load(&mut self, event: LoadEvent) {
-        let current_gen = self.loader.current_generation();
+    fn handle_pipeline(&mut self, event: PipelineEvent) {
+        let is_current = |p: &Path, cur: &Option<Current>| cur.as_ref().is_some_and(|c| c.path == p);
         match event {
-            LoadEvent::Probed { generation, path, info } if generation == current_gen => {
-                self.trace.mark(&format!("probed {}x{} {}", info.width, info.height, info.format));
-                let view = ViewState::new(info.display_size(), self.viewport());
-                self.error = None;
-                self.current = Some(Current {
-                    path,
-                    info,
-                    preview: None,
-                    full: None,
-                    load_time: None,
-                    shown: Shown::Nothing,
-                    view,
-                });
-                if let Some(s) = &mut self.surface {
-                    s.renderer.clear_image();
-                    s.window.request_redraw();
+            PipelineEvent::Probed { path, info } if is_current(&path, &self.current) => {
+                let cur = self.current.as_mut().expect("checked");
+                if cur.info.is_none() {
+                    cur.info = Some(info);
                 }
             }
-            LoadEvent::Preview { generation, image } if generation == current_gen => {
+            PipelineEvent::Preview { path, image } if is_current(&path, &self.current) => {
                 self.trace.mark(&format!("preview decoded {}x{}", image.width(), image.height()));
-                if let Some(cur) = &mut self.current {
-                    cur.preview = Some(image);
-                }
+                self.current.as_mut().expect("checked").preview = Some(image);
             }
-            LoadEvent::Decoded { generation, decoded, elapsed } if generation == current_gen => {
+            PipelineEvent::Ready { path, decoded, elapsed } if is_current(&path, &self.current) => {
                 self.trace.mark(&format!(
-                    "decoded by {} ({:.1} ms since load start)",
+                    "decoded {} by {} in {:.1} ms",
+                    file_name(&path),
                     decoded.info.codec,
                     elapsed.as_secs_f64() * 1000.0
                 ));
-                if let Some(cur) = &mut self.current {
-                    cur.info = decoded.info.clone();
-                    cur.view.set_image_size(cur.info.display_size());
-                    cur.load_time = Some(elapsed);
-                    cur.full = Some(decoded);
-                }
+                let cur = self.current.as_mut().expect("checked");
+                cur.info = Some(decoded.info.clone());
+                cur.load_time = Some(elapsed);
+                cur.full = Some(decoded);
             }
-            LoadEvent::Failed { generation, path, error } if generation == current_gen => {
+            PipelineEvent::Failed { path, error } if is_current(&path, &self.current) => {
                 eprintln!("{}: {error}", path.display());
-                self.error = Some(format!(
-                    "{}: {error}",
-                    path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into())
-                ));
-                self.current = None;
+                self.error = Some(format!("{}: {error}", file_name(&path)));
+                // nothing truthful to show for this file
+                self.display = None;
                 if let Some(s) = &mut self.surface {
                     s.renderer.clear_image();
                     s.window.request_redraw();
                 }
             }
-            // a superseded load finished late
+            // while a key is held, an image the user flipped past is shown as soon as it is
+            // decoded, so the screen moves with the key instead of freezing until release
+            PipelineEvent::Ready { path, decoded, .. } if self.quick_browsing => self.show_passing(path, &decoded),
+            // prefetch results live in the pipeline's cache until asked for
             _ => {}
         }
         self.sync_texture();
         self.update_title();
     }
 
-    fn run_command(&mut self, cmd: Command, event_loop: &ActiveEventLoop) {
+    fn handle_folder(&mut self, for_path: PathBuf, result: Result<FolderList, String>) {
+        // a newer open superseded this scan
+        if self.current.as_ref().map(|c| &c.path) != Some(&for_path) {
+            return;
+        }
+        match result {
+            Ok(folder) => {
+                self.trace.mark(&format!("folder listed: {} images", folder.len()));
+                self.index = folder.position(&for_path);
+                self.folder = Some(folder);
+                // now that neighbours are known, start prefetching them
+                self.request(for_path);
+            }
+            Err(e) => eprintln!("cannot list folder of {}: {e}", for_path.display()),
+        }
+    }
+
+    fn run_command(&mut self, cmd: Command, repeat: bool, event_loop: &ActiveEventLoop) {
         let center = {
             let (w, h) = self.viewport();
             (w as f64 / 2.0, h as f64 / 2.0)
@@ -331,6 +496,7 @@ impl App {
                     self.open(path);
                 }
             }
+            Command::NavNext | Command::NavPrev | Command::NavFirst | Command::NavLast => self.navigate(cmd, repeat),
             Command::ViewFit => self.with_view(|v| v.fit()),
             Command::ViewActualSize => self.with_view(|v| v.actual_size_at(center)),
             Command::ViewZoomIn => self.with_view(|v| v.zoom_by(ZOOM_STEP)),
@@ -350,8 +516,8 @@ impl App {
     }
 
     fn with_view(&mut self, f: impl FnOnce(&mut ViewState)) {
-        if let Some(cur) = &mut self.current {
-            f(&mut cur.view);
+        if let Some(d) = &mut self.display {
+            f(&mut d.view);
             self.update_title();
             if let Some(s) = &self.surface {
                 s.window.request_redraw();
@@ -380,7 +546,7 @@ impl App {
             .texture
             .create_view(&wgpu::TextureViewDescriptor { format: Some(s.view_format), ..Default::default() });
         let mut encoder = s.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
-        let view = self.current.as_ref().filter(|c| c.shown != Shown::Nothing).map(|c| &c.view);
+        let view = self.display.as_ref().map(|d| &d.view);
         s.renderer.render(&s.gpu.queue, &mut encoder, &target, (s.config.width, s.config.height), view);
         s.gpu.queue.submit([encoder.finish()]);
         s.window.pre_present_notify();
@@ -390,24 +556,34 @@ impl App {
             self.first_frame_logged = true;
             self.trace.mark("first frame presented");
         }
-        if let Some(cur) = &self.current {
-            self.trace.mark_once(match cur.shown {
-                Shown::Preview => "first preview frame presented",
-                Shown::Full => "first full-image frame presented",
-                Shown::Nothing => "",
-            });
+        // time from asking for an image to its full-resolution frame being on screen
+        if let (Some(cur), Some(d)) = (&mut self.current, &self.display) {
+            if d.path == cur.path && d.kind == Shown::Full && !cur.shown_logged {
+                cur.shown_logged = true;
+                let stats = self.pipeline.stats();
+                self.trace.mark(&format!(
+                    "shown {} {:.1} ms after request ({}) | cache {} images, {:.0} MiB of {:.0} MiB{}",
+                    file_name(&cur.path),
+                    cur.requested_at.elapsed().as_secs_f64() * 1000.0,
+                    if cur.load_time.is_some() { "decoded" } else { "cache hit" },
+                    stats.cached,
+                    stats.used_bytes as f64 / 1048576.0,
+                    self.pipeline.budget_bytes() as f64 / 1048576.0,
+                    if self.quick_browsing { " | quick browsing" } else { "" }
+                ));
+            }
         }
     }
 
     fn on_key(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) {
-        if event.state != ElementState::Pressed {
-            return;
-        }
         let Some(name) = key_name(&event.logical_key) else { return };
         let m = self.modifiers;
         let chord = Chord::new(name, m.control_key(), m.alt_key(), m.shift_key());
-        if let Some(cmd) = self.keymap.lookup(&chord) {
-            self.run_command(cmd, event_loop);
+        let Some(cmd) = self.keymap.lookup(&chord) else { return };
+        match event.state {
+            ElementState::Pressed => self.run_command(cmd, event.repeat, event_loop),
+            ElementState::Released if cmd.is_navigation() => self.end_quick_browsing(),
+            ElementState::Released => {}
         }
     }
 
@@ -459,7 +635,8 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
-            AppEvent::Load(e) => self.handle_load(e),
+            AppEvent::Pipeline(e) => self.handle_pipeline(e),
+            AppEvent::Folder { for_path, result } => self.handle_folder(for_path, result),
         }
     }
 
@@ -474,8 +651,8 @@ impl ApplicationHandler<AppEvent> for App {
                     s.window.request_redraw();
                 }
                 let vp = self.viewport();
-                if let Some(cur) = &mut self.current {
-                    cur.view.set_viewport(vp);
+                if let Some(d) = &mut self.display {
+                    d.view.set_viewport(vp);
                 }
                 self.update_title();
             }
@@ -520,11 +697,15 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_o_from_winit_hits_the_default_binding() {
-        let chord = Chord::new(key_name(&Key::Character("o".into())).unwrap(), true, false, false);
-        assert_eq!(Keymap::defaults().lookup(&chord), Some(Command::FileOpen));
+    fn default_bindings_reach_commands_from_winit_keys() {
+        let map = Keymap::defaults();
+        let chord = |key: Key, ctrl, shift| Chord::new(key_name(&key).unwrap(), ctrl, false, shift);
+        assert_eq!(map.lookup(&chord(Key::Character("o".into()), true, false)), Some(Command::FileOpen));
         // Shift+= delivers "+"
-        let plus = Chord::new(key_name(&Key::Character("+".into())).unwrap(), false, false, true);
-        assert_eq!(Keymap::defaults().lookup(&plus), Some(Command::ViewZoomIn));
+        assert_eq!(map.lookup(&chord(Key::Character("+".into()), false, true)), Some(Command::ViewZoomIn));
+        assert_eq!(map.lookup(&chord(Key::Named(NamedKey::ArrowRight), false, false)), Some(Command::NavNext));
+        assert_eq!(map.lookup(&chord(Key::Named(NamedKey::Space), false, false)), Some(Command::NavNext));
+        assert_eq!(map.lookup(&chord(Key::Named(NamedKey::ArrowLeft), false, false)), Some(Command::NavPrev));
+        assert_eq!(map.lookup(&chord(Key::Named(NamedKey::Home), false, false)), Some(Command::NavFirst));
     }
 }

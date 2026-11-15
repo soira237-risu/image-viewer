@@ -9,8 +9,8 @@ Rust로 만드는 빠른 Windows 이미지 뷰어.
 
 ## 상태
 
-M1(보기) 완료: GPU 창에 한 장 표시, 확대/이동/전체 화면, EXIF 회전, 투명 배경, 키 설정.
-폴더 넘김과 미리 읽기는 M2에서.
+M2(넘김) 완료: 폴더 안 자연 정렬 넘김, 방향을 고려한 미리 읽기, 메모리 예산 캐시, 키를 누르고 있을 때의 빠른 넘김.
+추가 형식(HEIC·AVIF·RAW·JXL·SVG)과 애니메이션은 M3에서.
 
 설계와 개발 단계는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 참고.
 
@@ -32,6 +32,8 @@ cargo build --release
 | 키 | 동작 |
 |---|---|
 | Ctrl+O | 파일 열기 |
+| →, Space, PageDown / ←, Backspace, PageUp | 다음 / 이전 (누르고 있으면 빠른 넘김) |
+| Home / End | 처음 / 마지막 |
 | F, Ctrl+0 | 창에 맞춤 |
 | 1, Ctrl+1 | 100% |
 | +, =, Ctrl++ / -, Ctrl+- | 확대 / 축소 |

@@ -121,6 +121,14 @@ pub struct Keymap {
 
 const DEFAULTS: &[(&str, Command)] = &[
     ("Ctrl+O", Command::FileOpen),
+    ("Right", Command::NavNext),
+    ("Space", Command::NavNext),
+    ("PageDown", Command::NavNext),
+    ("Left", Command::NavPrev),
+    ("Backspace", Command::NavPrev),
+    ("PageUp", Command::NavPrev),
+    ("Home", Command::NavFirst),
+    ("End", Command::NavLast),
     ("F", Command::ViewFit),
     ("Ctrl+0", Command::ViewFit),
     ("1", Command::ViewActualSize),
