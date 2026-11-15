@@ -545,12 +545,14 @@ impl App {
         let t = Instant::now();
         let up = s.renderer.set_image(&s.gpu.device, &s.gpu.queue, image, info.orientation, info.has_alpha);
         self.trace.mark(&format!(
-            "{} uploaded {}x{} ({} mips{}) in {:.1} ms",
+            "{} uploaded {}x{} ({} tile{}, {} mips{}) in {:.1} ms",
             if kind == Shown::Full { "image" } else { "preview" },
             up.texture_width,
             up.texture_height,
+            up.tiles,
+            if up.tiles == 1 { "" } else { "s" },
             up.mip_levels,
-            if up.reduced { ", reduced to GPU limit" } else { "" },
+            if up.reduced { ", reduced" } else { "" },
             t.elapsed().as_secs_f64() * 1000.0
         ));
         match &mut self.display {

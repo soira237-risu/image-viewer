@@ -61,20 +61,30 @@ pub struct UploadInfo {
     pub texture_width: u32,
     pub texture_height: u32,
     pub mip_levels: u32,
-    /// The image exceeded the GPU texture limit and was reduced.
+    /// GPU textures used (more than one when the image exceeds the texture size limit).
+    pub tiles: usize,
+    /// The image exceeded even a full grid of tiles and was reduced.
     pub reduced: bool,
 }
 
-struct GpuImage {
+/// One GPU texture holding part (or all) of an image.
+struct Tile {
     bind_group: wgpu::BindGroup,
     uniform: wgpu::Buffer,
-    /// Tone adjustments previewed on this image (at most [`MAX_ADJUSTMENTS`]).
-    adjust: Vec<[f32; 4]>,
-    /// Shown UV → texture UV: the EXIF orientation, or an edit geometry set later.
-    uv: UvTransform,
-    has_alpha: bool,
+    /// Region of the whole image it holds, in stored UV: s0, t0, s1, t1.
+    rect: [f64; 4],
     // kept alive for the bind group
     _texture: wgpu::Texture,
+}
+
+struct GpuImage {
+    /// One tile, or a grid of them when the image is larger than a GPU texture can be.
+    tiles: Vec<Tile>,
+    /// Tone adjustments previewed on this image (at most [`MAX_ADJUSTMENTS`]).
+    adjust: Vec<[f32; 4]>,
+    /// Shown UV → stored UV of the whole image: the EXIF orientation, or an edit geometry.
+    uv: UvTransform,
+    has_alpha: bool,
 }
 
 pub struct ImageRenderer {
@@ -284,6 +294,11 @@ impl ImageRenderer {
         self.selection = rect.filter(|r| r.width >= 1.0 && r.height >= 1.0);
     }
 
+    /// Lowers the largest texture side used (tests use it to exercise tiling on small images).
+    pub fn set_max_texture_side(&mut self, side: u32) {
+        self.max_texture_side = side.max(1);
+    }
+
     pub fn has_image(&self) -> bool {
         self.image.is_some()
     }
@@ -316,8 +331,51 @@ impl ImageRenderer {
         orientation: Orientation,
         has_alpha: bool,
     ) -> (GpuImage, UploadInfo) {
-        let pixels = upload::prepare(img, self.max_texture_side);
+        // beyond the GPU's texture size the image is split into tiles; only past a grid of
+        // MAX_TILES_PER_SIDE tiles per side is it reduced
+        let side = self.max_texture_side;
+        let pixels = upload::prepare(img, side.saturating_mul(MAX_TILES_PER_SIDE));
         let (w, h) = (pixels.width, pixels.height);
+        let mut tiles = Vec::new();
+        let mut mip_levels = 0;
+        for y0 in (0..h).step_by(side as usize) {
+            for x0 in (0..w).step_by(side as usize) {
+                let (tw, th) = (side.min(w - x0), side.min(h - y0));
+                let (tile, levels) = self.upload_tile(device, queue, &pixels.rgba8, w, (x0, y0), (tw, th));
+                mip_levels = mip_levels.max(levels);
+                tiles.push(Tile {
+                    rect: [
+                        x0 as f64 / w as f64,
+                        y0 as f64 / h as f64,
+                        (x0 + tw) as f64 / w as f64,
+                        (y0 + th) as f64 / h as f64,
+                    ],
+                    ..tile
+                });
+            }
+        }
+        let info = UploadInfo {
+            texture_width: w,
+            texture_height: h,
+            mip_levels,
+            tiles: tiles.len(),
+            reduced: (w, h) != (img.width(), img.height()),
+        };
+        (GpuImage { tiles, adjust: Vec::new(), uv: uv_transform(orientation), has_alpha }, info)
+    }
+
+    /// Uploads the `size` region at `origin` of an RGBA8 image `full_width` wide as one texture
+    /// with mips. The rows are read in place (no copy of the region).
+    fn upload_tile(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        rgba8: &[u8],
+        full_width: u32,
+        origin: (u32, u32),
+        size: (u32, u32),
+    ) -> (Tile, u32) {
+        let (w, h) = size;
         let mip_levels = 32 - w.max(h).leading_zeros();
         let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -339,8 +397,12 @@ impl ImageRenderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &pixels.rgba8,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+            rgba8,
+            wgpu::TexelCopyBufferLayout {
+                offset: (origin.1 as u64 * full_width as u64 + origin.0 as u64) * 4,
+                bytes_per_row: Some(full_width * 4),
+                rows_per_image: Some(h),
+            },
             size,
         );
         self.build_mips(device, queue, &texture, mip_levels);
@@ -363,21 +425,7 @@ impl ImageRenderer {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler_nearest) },
             ],
         });
-        let gpu = GpuImage {
-            bind_group,
-            uniform,
-            adjust: Vec::new(),
-            uv: uv_transform(orientation),
-            has_alpha,
-            _texture: texture,
-        };
-        let info = UploadInfo {
-            texture_width: w,
-            texture_height: h,
-            mip_levels,
-            reduced: (w, h) != (img.width(), img.height()),
-        };
-        (gpu, info)
+        (Tile { bind_group, uniform, rect: [0.0, 0.0, 1.0, 1.0], _texture: texture }, mip_levels)
     }
 
     fn build_mips(&self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, levels: u32) {
@@ -486,7 +534,11 @@ impl ImageRenderer {
         viewport: (u32, u32),
         zoom: f64,
     ) {
-        let t = image.uv;
+        // tiles are placed by mapping their stored-UV corners back to the screen; whatever falls
+        // outside the image's rectangle (cropped away) is cut off by the scissor
+        let Some(scissor) = clip_to_viewport(rect, viewport) else { return };
+        pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
+
         let mut flags = 0u32;
         if image.has_alpha {
             flags |= 1;
@@ -495,19 +547,76 @@ impl ImageRenderer {
             flags |= 2;
         }
         let s = &self.style;
-        let params = Params {
-            dest: [rect.x as f32, rect.y as f32, rect.width as f32, rect.height as f32],
-            viewport: [viewport.0.max(1) as f32, viewport.1.max(1) as f32, s.checker_size, flags as f32],
-            uv_row0: [t[0][0], t[0][1], t[0][2], 0.0],
-            uv_row1: [t[1][0], t[1][1], t[1][2], 0.0],
-            checker_a: [s.checker_a[0], s.checker_a[1], s.checker_a[2], 1.0],
-            checker_b: [s.checker_b[0], s.checker_b[1], s.checker_b[2], 1.0],
-            selection: self.selection.map_or([0.0; 4], |r| [r.x as f32, r.y as f32, r.width as f32, r.height as f32]),
-            adjust: std::array::from_fn(|i| image.adjust.get(i).copied().unwrap_or([0.0, 0.0, 1.0, 0.0])),
-            misc: [image.adjust.len() as f32, 0.0, 0.0, 0.0],
-        };
-        queue.write_buffer(&image.uniform, 0, bytemuck::bytes_of(&params));
-        pass.set_bind_group(0, &image.bind_group, &[]);
-        pass.draw(0..4, 0..1);
+        let t = image.uv.map(|r| r.map(|v| v as f64));
+        let Some(inverse) = invert(&t) else { return };
+        for tile in &image.tiles {
+            let [s0, t0, s1, t1] = tile.rect;
+            let a = apply_affine(&inverse, s0, t0);
+            let b = apply_affine(&inverse, s1, t1);
+            let (u0, u1) = (a.0.min(b.0), a.0.max(b.0));
+            let (v0, v1) = (a.1.min(b.1), a.1.max(b.1));
+            if u1 <= 0.0 || v1 <= 0.0 || u0 >= 1.0 || v0 >= 1.0 {
+                continue; // entirely cropped away
+            }
+            let dest = ScreenRect {
+                x: rect.x + u0 * rect.width,
+                y: rect.y + v0 * rect.height,
+                width: (u1 - u0) * rect.width,
+                height: (v1 - v0) * rect.height,
+            };
+            // quad-local UV → shown UV → stored UV → this tile's texture UV, as one affine map
+            let to_tile = |lu: f64, lv: f64| {
+                let (u, v) = (u0 + lu * (u1 - u0), v0 + lv * (v1 - v0));
+                let (ss, tt) = apply_affine(&t, u, v);
+                ((ss - s0) / (s1 - s0), (tt - t0) / (t1 - t0))
+            };
+            let (o, ex, ey) = (to_tile(0.0, 0.0), to_tile(1.0, 0.0), to_tile(0.0, 1.0));
+            let m = [[ex.0 - o.0, ey.0 - o.0, o.0], [ex.1 - o.1, ey.1 - o.1, o.1]].map(|r| r.map(|v| v as f32));
+            let params = Params {
+                dest: [dest.x as f32, dest.y as f32, dest.width as f32, dest.height as f32],
+                viewport: [viewport.0.max(1) as f32, viewport.1.max(1) as f32, s.checker_size, flags as f32],
+                uv_row0: [m[0][0], m[0][1], m[0][2], 0.0],
+                uv_row1: [m[1][0], m[1][1], m[1][2], 0.0],
+                checker_a: [s.checker_a[0], s.checker_a[1], s.checker_a[2], 1.0],
+                checker_b: [s.checker_b[0], s.checker_b[1], s.checker_b[2], 1.0],
+                selection: self
+                    .selection
+                    .map_or([0.0; 4], |r| [r.x as f32, r.y as f32, r.width as f32, r.height as f32]),
+                adjust: std::array::from_fn(|i| image.adjust.get(i).copied().unwrap_or([0.0, 0.0, 1.0, 0.0])),
+                misc: [image.adjust.len() as f32, 0.0, 0.0, 0.0],
+            };
+            queue.write_buffer(&tile.uniform, 0, bytemuck::bytes_of(&params));
+            pass.set_bind_group(0, &tile.bind_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        pass.set_scissor_rect(0, 0, viewport.0.max(1), viewport.1.max(1));
     }
+}
+
+/// Image grids beyond this many tiles per side are reduced instead (each tile is a full
+/// GPU-limit texture, so this is already 8 × 16384 px per side on common hardware).
+const MAX_TILES_PER_SIDE: u32 = 8;
+
+fn apply_affine(m: &[[f64; 3]; 2], u: f64, v: f64) -> (f64, f64) {
+    (m[0][0] * u + m[0][1] * v + m[0][2], m[1][0] * u + m[1][1] * v + m[1][2])
+}
+
+/// Inverse of an affine map `[a b c; d e f]`, if it is not degenerate.
+fn invert(m: &[[f64; 3]; 2]) -> Option<[[f64; 3]; 2]> {
+    let [[a, b, c], [d, e, f]] = *m;
+    let det = a * e - b * d;
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let (ia, ib, id, ie) = (e / det, -b / det, -d / det, a / det);
+    Some([[ia, ib, -(ia * c + ib * f)], [id, ie, -(id * c + ie * f)]])
+}
+
+/// `rect` ∩ the viewport, as a scissor rectangle in whole pixels; `None` when empty.
+fn clip_to_viewport(rect: ScreenRect, viewport: (u32, u32)) -> Option<[u32; 4]> {
+    let x0 = rect.x.floor().max(0.0) as u32;
+    let y0 = rect.y.floor().max(0.0) as u32;
+    let x1 = ((rect.x + rect.width).ceil().max(0.0) as u32).min(viewport.0);
+    let y1 = ((rect.y + rect.height).ceil().max(0.0) as u32).min(viewport.1);
+    (x1 > x0 && y1 > y0).then(|| [x0, y0, x1 - x0, y1 - y0])
 }

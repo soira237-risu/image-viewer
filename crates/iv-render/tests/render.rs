@@ -227,3 +227,46 @@ fn adjustment_preview_matches_the_saved_result() {
     assert!(near(got, want, 2), "GPU preview {got:?} vs saved {want:?}");
     assert_ne!(got, [200, 100, 50, 255], "the adjustment did something");
 }
+
+/// Images larger than a GPU texture are split into tiles. Drawn with sharp pixels, a tiled image
+/// must look exactly like the same image in one texture, through orientation and crops.
+#[test]
+fn tiled_images_draw_exactly_like_single_textures() {
+    let gpu = gpu();
+    // 6x4, every pixel distinct
+    let pixels: Vec<[u8; 4]> =
+        (0..24).map(|i| [(i * 10) as u8, (240 - i * 9) as u8, ((i * 37) % 256) as u8, 255]).collect();
+    let img = image(6, 4, &pixels);
+    let crop_centre = [[0.5f32, 0.0, 0.25], [0.0, 0.5, 0.25]];
+
+    for side in [4u32, 3] {
+        for orientation in [Orientation::Normal, Orientation::Rotate90, Orientation::FlipH, Orientation::Transverse] {
+            for crop in [None, Some(crop_centre)] {
+                let mut single = ImageRenderer::new(&gpu.device, TARGET);
+                let mut tiled = ImageRenderer::new(&gpu.device, TARGET);
+                tiled.set_max_texture_side(side);
+                single.set_image(&gpu.device, &gpu.queue, &img, orientation, false);
+                let info = tiled.set_image(&gpu.device, &gpu.queue, &img, orientation, false);
+                assert!(info.tiles > 1, "side {side}: {info:?}");
+                assert!(!info.reduced);
+
+                let shown = if orientation.swaps_dimensions() { (4, 6) } else { (6, 4) };
+                let mut view = ViewState::new(shown, (W, H));
+                if let Some(c) = crop {
+                    // compose the crop after the orientation, as an edit geometry would
+                    let o = iv_render::orient::uv_transform(orientation);
+                    let compose = |row: [f32; 3]| [c[0][0] * row[0], c[0][0] * row[1], c[0][0] * row[2] + c[0][2]];
+                    let compose_t = |row: [f32; 3]| [c[1][1] * row[0], c[1][1] * row[1], c[1][1] * row[2] + c[1][2]];
+                    let uv = [compose(o[0]), compose_t(o[1])];
+                    single.set_uv_transform(uv);
+                    tiled.set_uv_transform(uv);
+                    view = ViewState::new((shown.0 / 2, shown.1 / 2), (W, H));
+                }
+                view.set_zoom_at(6.0, (32.0, 24.0));
+                let a = draw(&gpu, &single, &view);
+                let b = draw(&gpu, &tiled, &view);
+                assert!(a == b, "side {side}, {orientation:?}, crop {}: tiled output differs", crop.is_some());
+            }
+        }
+    }
+}
