@@ -10,8 +10,10 @@ publish.workspace = true
 iv-core.workspace = true
 iv-codec.workspace = true
 iv-ops.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 moxcms.workspace = true
+zip.workspace = true
 image.workspace = true
 tempfile.workspace = true

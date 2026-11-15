@@ -249,6 +249,28 @@ impl App {
         self.folder = None;
         self.index = None;
         self.direction = 0;
+
+        // an archive opens on its first page; its listing is the "folder"
+        if iv_pipeline::archive::is_archive(&path) && path.is_file() {
+            match FolderList::for_file(&path) {
+                Ok(list) if !list.is_empty() => {
+                    let first = list.files()[0].clone();
+                    self.trace.mark(&format!("archive listed: {} images", list.len()));
+                    self.folder = Some(list);
+                    self.index = Some(0);
+                    self.request(first);
+                }
+                Ok(_) => {
+                    self.error = Some(format!("{}: no images inside", file_name(&path)));
+                    self.update_title();
+                }
+                Err(e) => {
+                    self.error = Some(format!("{}: {e}", file_name(&path)));
+                    self.update_title();
+                }
+            }
+            return;
+        }
         self.request(path.clone());
 
         let proxy = self.proxy.clone();
@@ -589,7 +611,8 @@ impl App {
         };
         match cmd {
             Command::FileOpen => {
-                let exts: Vec<&str> = FormatId::ALL.iter().flat_map(|f| f.extensions().iter().copied()).collect();
+                let mut exts: Vec<&str> = FormatId::ALL.iter().flat_map(|f| f.extensions().iter().copied()).collect();
+                exts.extend(["zip", "cbz"]);
                 if let Some(path) = rfd::FileDialog::new().add_filter("Images", &exts).pick_file() {
                     self.open(path);
                 }

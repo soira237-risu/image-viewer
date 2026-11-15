@@ -37,6 +37,16 @@ impl FolderList {
     /// The folder holding `file`, scanned. `file` itself is included even when its extension is
     /// unknown (it was opened explicitly, so the user wants to see it).
     pub fn for_file(file: &Path) -> std::io::Result<Self> {
+        // an archive (or a page inside one) browses the archive's images
+        let archive = if crate::archive::is_archive(file) && file.is_file() {
+            Some(file.to_path_buf())
+        } else {
+            crate::archive::split(file).map(|(a, _)| a)
+        };
+        if let Some(archive) = archive {
+            let files = crate::archive::list_images(&archive).map_err(|e| std::io::Error::other(e.to_string()))?;
+            return Ok(Self { dir: archive, files });
+        }
         let dir = file.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
         let mut list = Self::scan(dir)?;
         if list.position(file).is_none() {
@@ -66,8 +76,13 @@ impl FolderList {
         &self.files
     }
 
-    /// Index of `path` in the list, matching by file name (case-insensitively on Windows).
+    /// Index of `path` in the list: the exact path, else the same file name (case-insensitively
+    /// on Windows).
     pub fn position(&self, path: &Path) -> Option<usize> {
+        // exact first: archive pages in different folders can share a file name
+        if let Some(i) = self.files.iter().position(|f| f == path) {
+            return Some(i);
+        }
         let name = path.file_name()?;
         self.files.iter().position(|f| match f.file_name() {
             Some(n) if cfg!(windows) => n.eq_ignore_ascii_case(name),

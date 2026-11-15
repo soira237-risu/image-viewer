@@ -200,3 +200,33 @@ fn wrong_extensions_are_fixed_without_overwriting() {
     assert!(fix_extension(&reg, &clash).is_err());
     assert_eq!(std::fs::read(dir.path().join("clash.png")).unwrap(), b"someone else's file");
 }
+
+#[test]
+fn archive_pages_decode_and_can_be_saved_as_files() {
+    use std::fs::File;
+    let dir = tempfile::tempdir().unwrap();
+    let cbz = dir.path().join("book.cbz");
+    {
+        let mut w = zip::ZipWriter::new(File::create(&cbz).unwrap());
+        for (name, px) in [("p10.png", pattern()), ("p2.png", pattern())] {
+            w.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(&encode(&px, ImageFormat::Png)).unwrap();
+        }
+        w.finish().unwrap();
+    }
+    let pages = iv_pipeline::archive::list_images(&cbz).unwrap();
+    assert_eq!(
+        pages.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        ["p2.png", "p10.png"]
+    );
+
+    let folder = iv_pipeline::FolderList::for_file(&pages[1]).unwrap();
+    assert_eq!(folder.len(), 2);
+    assert_eq!(folder.position(&pages[1]), Some(1));
+
+    let dest = dir.path().join("page.webp");
+    run(&request(&pages[0], &dest, FormatId::Webp, vec![Op::rotate_cw()]));
+    let d = default_registry().decode(&Source::from_path(&dest), &CancelToken::never()).unwrap();
+    assert_eq!((d.image.width(), d.image.height()), (4, 6));
+    assert!(fix_extension(&default_registry(), &pages[0]).is_err(), "archive pages cannot be renamed");
+}

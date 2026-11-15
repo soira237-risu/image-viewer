@@ -15,7 +15,6 @@ mod files;
 use std::process::ExitCode;
 
 use iv_codec::default_registry;
-use iv_core::Source;
 
 fn usage() -> ExitCode {
     eprintln!(
@@ -51,8 +50,8 @@ fn probe(inputs: &[String]) -> ExitCode {
     let paths = files::collect(inputs);
     let mut failed = 0;
     for path in &paths {
-        let src = Source::from_path(path);
-        let line = reg.identify(&src).and_then(|id| reg.probe(&src).map(|info| (id, info)));
+        let line = iv_pipeline::archive::source_for(path)
+            .and_then(|src| reg.identify(&src).and_then(|id| reg.probe(&src).map(|info| (id, info))));
         match line {
             Ok((id, info)) => {
                 let frames = info.frame_count.map_or("?".to_string(), |n| n.to_string());

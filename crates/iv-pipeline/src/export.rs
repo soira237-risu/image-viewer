@@ -62,7 +62,7 @@ pub fn write_atomic(dest: &Path, write: impl FnOnce(&mut File) -> std::io::Resul
 /// Saves `req`. Rotations/flips of a JPEG saved as JPEG are done losslessly via EXIF; anything
 /// else is decoded (in the file's own colour space), edited, encoded and written atomically.
 pub fn export(registry: &Registry, encoders: &Encoders, req: &ExportRequest) -> Result<ExportOutcome> {
-    let src = Source::from_path(&req.source);
+    let src = crate::archive::source_for(&req.source)?;
     let identified = registry.identify(&src)?;
     let info = registry.probe(&src)?;
 
@@ -114,6 +114,9 @@ pub fn with_extension(path: &Path, format: FormatId) -> PathBuf {
 /// right extension, without touching its bytes. Returns the new path, or `None` when the
 /// extension already fits. Never overwrites an existing file.
 pub fn fix_extension(registry: &Registry, path: &Path) -> Result<Option<PathBuf>> {
+    if crate::archive::split(path).is_some() {
+        return Err(Error::Io(std::io::Error::other("files inside an archive cannot be renamed")));
+    }
     let id = registry.identify(&Source::from_path(path))?;
     if !id.extension_mismatch() {
         return Ok(None);

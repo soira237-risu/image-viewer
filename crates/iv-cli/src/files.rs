@@ -3,18 +3,25 @@ use std::path::{Path, PathBuf};
 use iv_core::FormatId;
 
 /// Expands the inputs: files are kept as given, directories are walked recursively for files
-/// whose extension names a known image format. The result is sorted and deduplicated.
+/// whose extension names a known image format, and archives named explicitly expand to their
+/// images. The result is naturally sorted and deduplicated.
 pub fn collect(inputs: &[String]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for input in inputs {
         let p = Path::new(input);
         if p.is_dir() {
             walk(p, &mut out);
+        } else if iv_pipeline::archive::is_archive(p) {
+            // an archive named explicitly stands for the images inside it
+            match iv_pipeline::archive::list_images(p) {
+                Ok(pages) => out.extend(pages),
+                Err(e) => eprintln!("{}: {e}", p.display()),
+            }
         } else {
             out.push(p.to_path_buf());
         }
     }
-    out.sort();
+    out.sort_by(|a, b| iv_pipeline::natord::natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
     out.dedup();
     out
 }

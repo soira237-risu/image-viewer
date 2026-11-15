@@ -87,7 +87,8 @@ fn parse(args: &[String]) -> Result<ConvertArgs, String> {
 fn ops_for(path: &Path, a: &ConvertArgs) -> Result<Vec<Op>, String> {
     let mut ops = a.ops.clone();
     if let Some(max) = a.max_side {
-        let info = default_registry().probe(&Source::from_path(path)).map_err(|e| e.to_string())?;
+        let src = iv_pipeline::archive::source_for(path).map_err(|e| e.to_string())?;
+        let info = default_registry().probe(&src).map_err(|e| e.to_string())?;
         let shown = iv_ops::Geometry::new((info.width, info.height), info.orientation, &ops).size;
         let long = shown.0.max(shown.1);
         if long > max {

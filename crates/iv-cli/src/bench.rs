@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use iv_codec::default_registry;
-use iv_core::{CancelToken, FormatId, Source};
+use iv_core::{CancelToken, FormatId};
 
 use crate::files;
 
@@ -69,7 +69,7 @@ fn timed<T>(runs: usize, mut f: impl FnMut() -> iv_core::Result<T>) -> iv_core::
 
 fn bench_one(path: &PathBuf, runs: usize) -> iv_core::Result<Row> {
     let reg = default_registry();
-    let src = Source::from_path(path);
+    let src = iv_pipeline::archive::source_for(path)?;
     let cancel = CancelToken::never();
 
     // warm the OS file cache so the numbers measure decoding, not the disk

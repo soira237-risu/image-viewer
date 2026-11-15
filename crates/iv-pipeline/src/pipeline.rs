@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use iv_codec::{Decoded, Registry};
-use iv_core::{CancelToken, Error, ImageBuf, ImageInfo, Source};
+use iv_core::{CancelToken, Error, ImageBuf, ImageInfo};
 
 /// Longest side asked of a preview.
 const PREVIEW_TARGET: u32 = 1920;
@@ -187,8 +187,8 @@ impl Shared {
 
     fn run(&self, job: Job, cancel: CancelToken) {
         let started = Instant::now();
-        let src = Source::from_path(&job.path);
         let result = (|| {
+            let src = crate::archive::source_for(&job.path)?;
             if job.kind == Kind::Foreground {
                 let info = self.registry.probe(&src)?;
                 (self.sink)(PipelineEvent::Probed { path: job.path.clone(), info });
