@@ -182,6 +182,15 @@ impl Keymap {
         self.bindings.get(chord).copied()
     }
 
+    /// The shortest chord bound to `cmd` (ties broken alphabetically), for showing next to a
+    /// menu item.
+    pub fn chord_for(&self, cmd: Command) -> Option<Chord> {
+        self.bindings.iter().filter(|(_, c)| **c == cmd).map(|(chord, _)| chord.clone()).min_by_key(|chord| {
+            let s = chord.to_string();
+            (s.len(), s)
+        })
+    }
+
     /// Applies overrides from TOML text. Returns one warning per entry that could not be used;
     /// valid entries still apply.
     pub fn apply_toml(&mut self, text: &str) -> Result<Vec<String>, String> {
@@ -283,5 +292,19 @@ mod tests {
         let (map, warnings) = Keymap::load(Path::new("Z:/definitely/not/here/keymap.toml"));
         assert!(warnings.is_empty());
         assert!(map.lookup(&Chord::parse("F11").unwrap()).is_some());
+    }
+}
+
+#[cfg(test)]
+mod chord_for_tests {
+    use super::*;
+
+    #[test]
+    fn menu_shortcut_is_the_shortest_binding() {
+        let map = Keymap::defaults();
+        assert_eq!(map.chord_for(Command::EditRotateCw).unwrap().to_string(), "R");
+        assert_eq!(map.chord_for(Command::FileSaveAs).unwrap().to_string(), "Ctrl+Shift+S");
+        // Right, Space and PageDown: "Right" is shortest
+        assert_eq!(map.chord_for(Command::NavNext).unwrap().to_string(), "Right");
     }
 }

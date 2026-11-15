@@ -3,23 +3,13 @@
 // no console window for release builds launched from Explorer
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod commands;
-mod edit;
-mod keymap;
-mod panel;
-mod settings;
-mod trace;
-
 use std::path::PathBuf;
 use std::time::Instant;
 
-use winit::event_loop::{ControlFlow, EventLoop};
-
-use crate::app::{App, AppEvent};
-use crate::keymap::Keymap;
-use crate::settings::Settings;
-use crate::trace::Trace;
+use iv_win::keymap::Keymap;
+use iv_win::settings::Settings;
+use iv_win::trace::Trace;
+use iv_win::win::window::{Options, run};
 
 fn config_dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("image-viewer"))
@@ -27,8 +17,6 @@ fn config_dir() -> Option<PathBuf> {
 
 fn main() {
     let start = Instant::now();
-    // the slowest startup step; overlaps argument parsing, keymap loading and window creation
-    let gpu_init = app::start_gpu_init();
     let mut trace_enabled = false;
     let mut no_activate = false;
     let mut keymap_path: Option<PathBuf> = None;
@@ -58,16 +46,6 @@ fn main() {
     for w in warnings {
         eprintln!("keymap: {w}");
     }
-
-    let event_loop = match EventLoop::<AppEvent>::with_user_event().build() {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("cannot create the event loop: {e}");
-            std::process::exit(1);
-        }
-    };
-    event_loop.set_control_flow(ControlFlow::Wait);
-
     let settings_path = settings_path.or_else(|| config_dir().map(|d| d.join("settings.toml")));
     let (settings, warning) = match &settings_path {
         Some(p) => Settings::load(p),
@@ -76,14 +54,5 @@ fn main() {
     if let Some(w) = warning {
         eprintln!("settings: {w}");
     }
-    let mut app = App::new(event_loop.create_proxy(), keymap, trace, Some(gpu_init), settings, settings_path);
-    app.no_activate = no_activate;
-    // decoding starts now and overlaps window and GPU creation
-    if let Some(path) = file {
-        app.open(path);
-    }
-    if let Err(e) = event_loop.run_app(&mut app) {
-        eprintln!("event loop error: {e}");
-        std::process::exit(1);
-    }
+    std::process::exit(run(Options { file, keymap, settings, settings_path, trace, no_activate }));
 }

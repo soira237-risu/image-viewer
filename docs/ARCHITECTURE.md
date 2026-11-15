@@ -37,14 +37,14 @@ libjpeg-turbo, libheif, libjxl 등 C/C++ 의존성은 이후 cargo feature로 �
 ## 2. 전체 구조
 
 ```
-┌────────────────────────────── iv-app (winit + wgpu + egui) ───────────────────────────┐
+┌──────────────────────────── iv-win (순수 Win32 + GDI, M6~) ────────────────────────────┐
 │  입력 → Keymap → Command ─┬─> Navigator ──> Library(목록·정렬) ──> Prefetcher(나선형) │
 │                           ├─> EditSession(EditStack, undo/redo)                        │
 │                           └─> Exporter(저장·변환)                                       │
-│  Renderer(wgpu 텍스처·확대/이동·타일) <── DecodeService(작업자 스레드·세대 취소)        │
+│  raster(CPU 렌더러·보이는 부분만 리샘플) <── DecodeService(작업자 스레드·세대 취소)    │
 └────────────────────────────────────────────────────────────────────────────────────────┘
           │                         │                       │
-     iv-render                 iv-pipeline              iv-ops
+       (raster, view)          iv-pipeline              iv-ops
           │                         │                       │
           └──────────── iv-codec (Codec 트레이트 + Registry) ┘
                                     │
@@ -61,8 +61,7 @@ iv-cli : iv-pipeline + iv-ops + iv-codec 재사용 (일괄 변환·벤치마크�
 | `iv-codec` | 코덱 트레이트, 레지스트리, 형식 판별, 내장 코덱(feature별) | 없음 |
 | `iv-ops` | 편집 연산, EditStack, 무손실 변환 판정 | 없음 |
 | `iv-pipeline` | 폴더 목록·자연 정렬, 디코드 서비스, 캐시, 미리 읽기, 내보내기 | 없음 |
-| `iv-render` | wgpu 텍스처 업로드, 확대/이동 변환, 타일·밉맵 | wgpu |
-| `iv-app` | 창, 입력, 명령, 설정, egui 오버레이/대화상자 | 전부 |
+| `iv-win` | 창(Win32), 입력, 명령, 설정, CPU 렌더러(`raster`), 편집 패널·설정 창(기본 컨트롤) | Win32 (렌더러·명령·키맵·설정은 플랫폼 독립) |
 | `iv-cli` | `iv convert`, `iv bench`, `iv probe` | 없음 |
 
 UI 없는 크레이트가 핵심 로직 전부를 담아 **CLI·테스트·벤치마크에서 그대로 검증**하는 것이 원칙.
@@ -238,16 +237,14 @@ export(source, edits, target_codec, options, dest):
 
 | 용도 | 크레이트 |
 |---|---|
-| 창/입력 | `winit` 0.30 |
-| GPU 렌더링 | `wgpu` 30 |
-| UI 오버레이·대화상자 | `egui` / `egui-wgpu` 0.37 |
+| 창/입력·대화상자 | Win32 직접 (`windows` 0.62) — M5까지는 `winit` + `wgpu` + `egui`, M6에서 교체 |
 | 리사이즈 (SIMD) | `fast_image_resize` 6.1 |
 | 병렬 처리 | `rayon` 1.12 |
 | EXIF 읽기 | `kamadak-exif` 0.6 |
 | 메타데이터 이식 (JPEG/PNG/WebP 청크) | `img-parts` 0.4 |
 | 색 관리 | `moxcms` 0.9 (순수 Rust, `image`도 내부 사용) vs `lcms2` 6.2 (C 빌드) — M3에서 결정 |
 | 폴더 감시 | `notify` 8.2 |
-| 파일 대화상자 | `rfd` 0.18 |
+| 파일 대화상자 | `IFileDialog` 직접 호출 (M5까지 `rfd`) |
 | 휴지통 | `trash` 5.3 |
 | 클립보드 | `arboard` 3.7 |
 | 압축파일 | `zip` 9.5, `sevenz-rust2` 0.25, `unrar` 0.5 (unRAR 라이선스 확인 필요) |
@@ -262,6 +259,7 @@ export(source, edits, target_codec, options, dest):
 | **M3 형식** | WIC 보루(HEIC/AVIF/RAW), JXL, SVG, 애니메이션, EXIF 방향, ICC | 형식별 샘플 코퍼스 전부 열림, 회귀 테스트 |
 | **M4 편집·변환** | EditStack(회전·뒤집기·자르기·크기·보정), undo/redo, 저장/다른 이름으로 저장, 옵션 자동 UI, 안전한 쓰기, 메타데이터 정책, `iv convert` | 왕복 테스트(PSNR 기준), 원본 무손상 테스트, 연산 골든 테스트 |
 | **M5 확장** | 일괄 변환, 확장자 바로잡기, 압축파일 감상, 두 쪽 보기(만화), 거대 이미지 타일, 설정 화면 | 기능별 통합 테스트 |
+| **M6 경량화** | wgpu·egui 창을 순수 Win32 + GDI(CPU 렌더러)로 교체 | 기존 기능 전부 동작, 메모리·첫 화면 시간 측정 |
 | 이후 | JPEG 무손실 변환(turbojpeg), HDR 톤매핑, 런타임 플러그인 ABI, 탐색기 정렬 순서 연동 | |
 
 ### M0 결과 (2026-11-15)
@@ -363,6 +361,52 @@ export(source, edits, target_codec, options, dest):
   - 패널 위젯에 포커스가 있을 때 →키가 슬라이더와 "다음 사진" 둘 다에 적용되던 문제
 - 미확인: 합성 마우스 입력으로는 egui 조작을 재현할 수 없어(실제 커서가 창 밖이라 포인터가 즉시 사라짐) 패널 마우스 조작은 egui_kittest(실제 패널 코드에 버튼 클릭·슬라이더 키 입력)로 검증. 실제 창에서는 키보드로 패널 버튼 동작 확인
 
+### M6: Win32 직접 프런트엔드 (2026-11-15 결정)
+
+목표: 극도로 작고 빠른 뷰어. wgpu + egui 창(`iv-app`, `iv-render`)을 순수 Win32 창(`iv-win`)으로 교체.
+
+결정 근거 — 같은 PC(RX 9060), 같은 3840×2400 JPEG, `iv-win/examples/backend_probe.rs`로 측정:
+
+| 표시 방식 | Private bytes | 첫 화면 (디코딩 ~50 ms 포함) |
+|---|---|---|
+| 빈 Win32 창 | 1.4 MB | 6 ms |
+| GDI + CPU 확대·축소 (fast_image_resize SIMD) | 40 MB (이미지 자체가 37 MB) | 89~127 ms |
+| Direct2D (D3D11 드라이버 로드) | 137~141 MB | 146~199 ms |
+| 기존 wgpu DX12 + egui | 382 MB | — |
+
+GPU를 쓰는 순간 드라이버(AMD `amdxc64.dll` 등)가 100 MB대 바닥을 깔기 때문에 GDI + CPU 경로를 택함.
+
+구조:
+
+- `raster`: 플랫폼 독립 CPU 렌더러 (테스트 가능). 화면에 보이는 부분만 원본에서 잘라 화면 크기로 리샘플(소수점 crop) → 방향(D4) 적용 → 보정(`Adjust::apply`, 저장과 같은 함수) → 투명 체커·선택 영역 어둡게 → BGRA 프레임. 이미지 전체를 BGRA로 복사하거나 회전본을 만들지 않으므로 추가 메모리는 화면 크기 정도
+- `view`: 확대·이동 수학 (`iv-render`에서 이전)
+- Win32 셸: 창·메시지 루프·키보드(VK → keymap 이름)·마우스·끌어 놓기·전체 화면·우클릭 메뉴, 파이프라인 이벤트는 채널 + `PostMessageW`
+- 편집 패널·설정: 기본 Win32 컨트롤(트랙바·버튼·입력란, comctl32 v6), 색 선택은 `ChooseColorW`, 파일 대화상자는 `IFileDialog` 직접 호출 (`rfd` 제거)
+- commands / keymap / settings / edit는 `iv-app`에서 그대로 이전
+
+완료 기준: 기존 기능 전부(넘김·빠른 넘김·미리보기 먼저·애니메이션·두 쪽 보기·압축파일·편집·저장·설정·단축키) 동작, `iv-app`·`iv-render` 제거, 메모리·첫 화면 시간 측정 기록.
+
+### M6 결과 (2026-11-15)
+
+- `iv-win`(바이너리 `image-viewer`)이 `iv-app`·`iv-render`를 대체. wgpu·winit·egui·rfd 제거로 의존 패키지 213개 감소, 실행 파일 28 MB → 17.8 MB (대부분 디코더)
+- 실측 (3840×2400 JPEG 한 장, `--trace`, 3회):
+
+| | M5 (wgpu + egui) | M6 (Win32 + GDI) |
+|---|---|---|
+| 창 생성 | 43~55 ms | 10~14 ms |
+| 사진이 화면에 | 첫 프레임만 221 ms | 49~52 ms (디코딩 ~40 ms 포함) |
+| Private bytes | 382 MB | 42.6 MB (이미지 35 MiB 포함) |
+| 빈 창 | — | 5.6 MB |
+
+- CPU 렌더러(`raster_bench`, 3840×2400 원본): 1280×800 창 맞춤 7 ms, 100% 1.5 ms, 보정 적용 11 ms / 2560×1440 맞춤 15 ms / 3840×2160 맞춤 26 ms
+- 렌더러 테스트: 8가지 방향·자르기·회전·보정 조합에서 100% 미리보기 = 저장 결과(`iv_ops::apply::render`) 픽셀 단위 일치. 방향 재매핑을 일부러 틀리게 바꾸면 3개 테스트가 실패함을 확인
+- 실제 창 확인 (포커스를 뺏지 않는 `--no-activate`, 자기 창에만 메시지 보내고 `PrintWindow`로 캡처): 넘김·미리 읽기, 키 누르고 있기(지나가는 사진 8장 표시 후 놓은 자리에 정착), 회전·확대, GIF 루프(20프레임 2004 ms / 지연 합 2000 ms), 투명 체커, CBZ 두 쪽 보기(오른쪽→왼쪽), 편집 패널(테마 적용 컨트롤, 밝기 슬라이더·회전 버튼·크기 입력란 연동), 저장(JPEG 무손실 회전: EXIF 방향 태그), 설정 창 저장(`settings.toml` 반영), 정상 종료(코드 0)
+- 발견·수정
+  - 창보다 먼저 디코딩이 끝난 애니메이션은 타이머를 걸 창이 없어 재생되지 않던 문제 → 창 연결 시 타이머 시작
+  - 창 생성 실패가 창 프로시저 안에서 패닉하던 코드 → 오류로 반환해 제목 표시줄에 보고
+- 미확인: 실제 마우스 끌기·휠(메시지 경로는 키보드와 같은 코드이나 실제 장치 입력은 미시험), 파일 열기·저장 대화상자와 우클릭 메뉴(모달이고 우클릭 메뉴는 창을 앞으로 가져와야 해서 사용자 작업을 방해하지 않으려고 자동 시험하지 않음)
+- 측정 당시 시스템 커밋 메모리가 거의 가득 차 있어(다른 프로그램) 작업 집합 수치는 낮게 나왔을 수 있음. Private bytes는 이 영향을 받지 않음
+
 ### 남은 일 (다음 단계 후보)
 
 - AVIF 컨테이너 회전(irot/imir)·내장 ICC 읽기 (rav1d 경로)
@@ -370,7 +414,8 @@ export(source, edits, target_codec, options, dest):
 - RAR/CBR (unRAR 라이선스 확인 후)
 - HDR 톤매핑 (현재 부동소수 이미지는 SDR로 자름), 모니터 ICC 프로파일
 - JPEG XL 손실 인코딩, 애니메이션 WebP/AVIF로 변환
-- 거대 이미지 타일 경계의 선형 필터링 이음새 (1px 겹침)
+- 거대 이미지(8000×6000 이상) 창 맞춤 렌더링: 원본 전체를 리샘플해 20~75 ms → 절반 크기 단계(밉맵)를 CPU로 만들어 두면 단축 가능
+- 4K 화면에서 보정 슬라이더 미리보기 52 ms → 채널별 보정을 표(LUT)로 계산해 단축 가능
 
 ## 7. 테스트 전략
 

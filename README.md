@@ -1,6 +1,6 @@
 # image-viewer
 
-Rust로 만드는 빠른 Windows 이미지 뷰어.
+Rust로 만드는 작고 빠른 Windows 이미지 뷰어. GPU 드라이버도 UI 툴킷도 쓰지 않는 순수 Win32 창: 사진 한 장 띄운 상태 메모리 약 43 MB, 실행 후 50 ms 안에 사진 표시.
 
 - **속도 우선**: 저해상도 미리보기 먼저 표시, 나선형 미리 읽기, GC 없는 일정한 반응성
 - **다양한 형식**: JPEG, PNG, WebP, GIF, TIFF, AVIF, HEIC, JPEG XL, RAW, SVG 등
@@ -9,9 +9,9 @@ Rust로 만드는 빠른 Windows 이미지 뷰어.
 
 ## 상태
 
-M0~M5 완료:
+M0~M6 완료:
 
-- 빠른 보기: GPU 렌더링, 미리보기 먼저, 방향 고려 미리 읽기, 키를 누르고 있을 때의 빠른 넘김
+- 빠른 보기: CPU 렌더러(보이는 부분만 SIMD 리샘플, GDI로 표시), 미리보기 먼저, 방향 고려 미리 읽기, 키를 누르고 있을 때의 빠른 넘김
 - 형식: JPEG, PNG/APNG, GIF, WebP, AVIF, HEIC, JPEG XL, TIFF, BMP, ICO, QOI, TGA, PNM, DDS, EXR, HDR, SVG, 카메라 RAW(Windows 코덱), ICC 색 관리
 - 압축파일: ZIP/CBZ, 7z/CB7 (만화 두 쪽 보기)
 - 편집: 회전·뒤집기·자르기·보정·크기 변경, 실행 취소, 저장/다른 이름으로 저장 (JPEG 회전은 무손실)
@@ -35,7 +35,7 @@ cargo build --release
 ./target/release/iv bench <파일|폴더>   # probe / preview / decode 시간 측정
 ./target/release/iv convert --to webp --opt quality=82 --max 1920 --out out <파일|폴더>   # 일괄 변환
 ./target/release/iv fix-ext --dry-run <파일|폴더>   # 내용과 다른 확장자 찾기 (빼면 실제로 바꿈)
-./target/release/image-viewer <파일>    # 뷰어 (--trace: 시작 단계별 시간 출력)
+./target/release/image-viewer <파일>    # 뷰어 (--trace: 시작 단계별 시간 출력, --no-activate: 포커스를 가져가지 않고 열기)
 ```
 
 ### 기본 단축키
@@ -59,6 +59,7 @@ cargo build --release
 | F11, Alt+Enter | 전체 화면 |
 | D / Shift+D | 두 쪽 보기 / 읽는 방향 전환 |
 | E | 편집 패널 (보정 슬라이더, 크기 변경, 저장 품질) |
+| 우클릭 | 모든 명령 메뉴 (단축키 표시) |
 | F2 | 설정 |
 | Esc | 선택 해제 → 전체 화면 해제 → 종료 |
 | Ctrl+W, Ctrl+Q | 종료 |

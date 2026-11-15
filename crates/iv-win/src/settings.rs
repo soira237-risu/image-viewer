@@ -47,14 +47,6 @@ impl Settings {
         self
     }
 
-    /// The background as the renderer's linear clear colour.
-    pub fn background_linear(&self) -> [f64; 3] {
-        self.background.map(|c| {
-            let c = c as f64 / 255.0;
-            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
-        })
-    }
-
     /// Reads `path`; a missing file gives defaults, a broken one gives defaults and a warning.
     pub fn load(path: &Path) -> (Self, Option<String>) {
         match std::fs::read_to_string(path) {
@@ -74,47 +66,6 @@ impl Settings {
         }
         std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
     }
-}
-
-/// The settings window (F2). Edits `s` in place; returns `true` when the user asked to save.
-pub fn show(ctx: &egui::Context, open: &mut bool, s: &mut Settings) -> bool {
-    let mut save = false;
-    egui::Window::new("Settings").open(open).resizable(false).collapsible(false).show(ctx, |ui| {
-        egui::Grid::new("settings-grid").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-            ui.label("Images decoded ahead");
-            ui.add(egui::DragValue::new(&mut s.prefetch_count).range(0..=32));
-            ui.end_row();
-            ui.label("Cache memory (MiB)");
-            ui.add(egui::DragValue::new(&mut s.cache_mib).range(64..=65536).speed(16));
-            ui.end_row();
-            ui.label("Wrap around at the ends");
-            ui.checkbox(&mut s.wrap, "");
-            ui.end_row();
-            ui.label("Two pages read right to left");
-            ui.checkbox(&mut s.spread_right_to_left, "");
-            ui.end_row();
-            ui.label("Sharp pixels above zoom");
-            ui.add(egui::DragValue::new(&mut s.nearest_above_zoom).range(1.0..=64.0).speed(0.1).suffix("×"));
-            ui.end_row();
-            ui.label("Save quality");
-            ui.add(egui::Slider::new(&mut s.save_quality, 1..=100));
-            ui.end_row();
-            ui.label("Background");
-            ui.color_edit_button_srgb(&mut s.background);
-            ui.end_row();
-        });
-        ui.separator();
-        ui.horizontal(|ui| {
-            if ui.button("Save").clicked() {
-                save = true;
-            }
-            if ui.button("Defaults").clicked() {
-                *s = Settings::default();
-            }
-        });
-        ui.label("Cache memory applies after a restart.");
-    });
-    save
 }
 
 #[cfg(test)]
@@ -145,13 +96,5 @@ mod tests {
         assert!(warning.is_some());
         s = Settings::load(&dir.path().join("none.toml")).0;
         assert_eq!(s, Settings::default());
-    }
-
-    #[test]
-    fn background_is_linearised_for_the_renderer() {
-        let s = Settings { background: [0, 255, 188], ..Default::default() };
-        let [r, g, b] = s.background_linear();
-        assert_eq!((r, g), (0.0, 1.0));
-        assert!((b - 0.5).abs() < 0.01, "{b}");
     }
 }

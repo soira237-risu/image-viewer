@@ -3,11 +3,11 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::view::{ScreenRect, ViewState};
 use iv_codec::encode::{EncodeOptions, Encoders};
 use iv_core::FormatId;
 use iv_ops::{Op, Rect};
 use iv_pipeline::export::ExportRequest;
-use iv_render::{ScreenRect, ViewState};
 
 /// A screen rectangle from two drag corners, in any order.
 pub fn drag_rect(a: (f64, f64), b: (f64, f64)) -> ScreenRect {
@@ -30,12 +30,6 @@ pub fn selection_to_crop(view: &ViewState, sel: ScreenRect) -> Option<Rect> {
         width: (x1 - x0) as u32,
         height: (y1 - y0) as u32,
     })
-}
-
-/// The adjustments of `g` in the renderer's preview form: (brightness, contrast, gamma,
-/// saturation), in the order they are applied when saving.
-pub fn preview_adjustments(g: &iv_ops::Geometry) -> Vec<[f32; 4]> {
-    g.adjusts.iter().map(|a| [a.brightness, a.contrast, a.gamma, a.saturation]).collect()
 }
 
 /// Format to use when saving over `format` in place, if it can be written.
@@ -78,7 +72,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn adjustments_reach_the_preview_in_order_and_identities_are_dropped() {
+    fn slider_drags_collapse_and_identity_adjustments_are_dropped() {
         use iv_core::Orientation;
         use iv_ops::{Adjust, EditStack, Geometry};
         let is_adjust = |o: &Op| matches!(o, Op::Adjust(_));
@@ -91,7 +85,10 @@ mod tests {
         edits.push_or_replace(Op::Adjust(Adjust { saturation: -1.0, ..Default::default() }), is_adjust);
         edits.push(Op::Adjust(Adjust::default()));
         let g = Geometry::new((10, 10), Orientation::Normal, edits.active());
-        assert_eq!(preview_adjustments(&g), vec![[0.4, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, -1.0]]);
+        assert_eq!(
+            g.adjusts,
+            vec![Adjust { brightness: 0.4, ..Default::default() }, Adjust { saturation: -1.0, ..Default::default() }]
+        );
     }
 
     #[test]
