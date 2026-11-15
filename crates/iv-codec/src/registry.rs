@@ -68,6 +68,10 @@ impl Registry {
         let head = src.read_head(SNIFF_LEN)?;
         let extension_format = src.extension().as_deref().and_then(FormatId::from_extension);
         match sniff(&head) {
+            // DNG, NEF, CR2, ARW … are TIFF containers; the RAW extension tells them apart
+            Some(FormatId::Tiff) if extension_format == Some(FormatId::Raw) => {
+                Ok(Identified { format: FormatId::Raw, by_content: true, extension_format })
+            }
             Some(format) => Ok(Identified { format, by_content: true, extension_format }),
             None => match extension_format {
                 Some(format) => Ok(Identified { format, by_content: false, extension_format }),
@@ -79,13 +83,13 @@ impl Registry {
     /// Probes with the first decoder that succeeds.
     pub fn probe(&self, src: &Source) -> Result<ImageInfo> {
         let id = self.identify(src)?;
-        self.try_each(id.format, |d| d.probe(src, id.format))
+        self.try_each(src, id.format, |d| d.probe(src, id.format))
     }
 
     /// Decodes with the first decoder that succeeds.
     pub fn decode(&self, src: &Source, cancel: &CancelToken) -> Result<Decoded> {
         let id = self.identify(src)?;
-        self.try_each(id.format, |d| d.decode(src, id.format, cancel))
+        self.try_each(src, id.format, |d| d.decode(src, id.format, cancel))
     }
 
     /// The first preview any decoder for the format can produce cheaply.
@@ -93,6 +97,9 @@ impl Registry {
         let id = self.identify(src)?;
         for d in self.decoders_for(id.format) {
             cancel.check()?;
+            if !d.claims(src, id.format).unwrap_or(false) {
+                continue;
+            }
             match d.preview(src, id.format, target_side, cancel) {
                 Ok(Some(img)) => return Ok(Some(img)),
                 Ok(None) => {}
@@ -104,9 +111,17 @@ impl Registry {
         Ok(None)
     }
 
-    fn try_each<T>(&self, format: FormatId, mut f: impl FnMut(&dyn Decoder) -> Result<T>) -> Result<T> {
+    fn try_each<T>(&self, src: &Source, format: FormatId, mut f: impl FnMut(&dyn Decoder) -> Result<T>) -> Result<T> {
         let mut failures = Vec::new();
         for d in self.decoders_for(format) {
+            match d.claims(src, format) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    failures.push(format!("{}: {e}", d.info().id));
+                    continue;
+                }
+            }
             match f(d.as_ref()) {
                 Ok(v) => return Ok(v),
                 Err(Error::Cancelled) => return Err(Error::Cancelled),

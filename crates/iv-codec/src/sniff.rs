@@ -41,8 +41,12 @@ pub fn sniff(head: &[u8]) -> Option<FormatId> {
     if starts(&[0xFF, 0x0A]) || starts(&[0, 0, 0, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A]) {
         return Some(FormatId::Jxl);
     }
-    // TIFF, little- and big-endian, classic and BigTIFF. (TIFF-based camera RAW files also
-    // match; RAW gets its own format once a RAW decoder exists.)
+    // camera RAW with their own signatures: Fujifilm RAF, Olympus ORF, Panasonic RW2
+    if starts(b"FUJIFILMCCD-RAW") || starts(b"IIRO") || starts(b"IIRS") || starts(b"MMOR") || starts(b"IIU\0") {
+        return Some(FormatId::Raw);
+    }
+    // TIFF, little- and big-endian, classic and BigTIFF. Most camera RAW files (DNG, NEF, CR2,
+    // ARW …) are TIFF containers too; `Registry::identify` lets a RAW extension decide those.
     if starts(b"II*\0") || starts(b"MM\0*") || starts(b"II+\0") || starts(b"MM\0+") {
         return Some(FormatId::Tiff);
     }
@@ -78,6 +82,8 @@ fn sniff_isobmff(head: &[u8]) -> Option<FormatId> {
     for brand in brands {
         match brand {
             b"avif" | b"avis" => return Some(FormatId::Avif),
+            // Canon CR3
+            b"crx " => return Some(FormatId::Raw),
             b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis" | b"hevm" | b"hevs" | b"mif1" | b"msf1" => {
                 heif = true
             }
@@ -159,6 +165,14 @@ mod tests {
         assert_eq!(sniff(&ftyp(b"heic", &[b"mif1"])), Some(FormatId::Heif));
         assert_eq!(sniff(&ftyp(b"mif1", &[b"heic"])), Some(FormatId::Heif));
         assert_eq!(sniff(&ftyp(b"isom", &[b"mp41"])), None, "an MP4 video is not an image");
+        assert_eq!(sniff(&ftyp(b"crx ", &[b"isom"])), Some(FormatId::Raw), "Canon CR3");
+    }
+
+    #[test]
+    fn raw_signatures() {
+        assert_eq!(sniff(b"FUJIFILMCCD-RAW 0201"), Some(FormatId::Raw));
+        assert_eq!(sniff(b"IIRO\x08\0\0\0"), Some(FormatId::Raw));
+        assert_eq!(sniff(b"IIU\0\x08\0\0\0"), Some(FormatId::Raw));
     }
 
     #[test]

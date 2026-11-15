@@ -16,7 +16,11 @@ M2(넘김) 완료: 폴더 안 자연 정렬 넘김, 방향을 고려한 미리 �
 
 ## 빌드
 
-필요: Rust stable (MSVC 툴체인), Visual Studio 2022 Build Tools (C++ 워크로드).
+필요: Rust stable (MSVC 툴체인), Visual Studio 2022 Build Tools (C++ 워크로드), NASM (AV1 디코더 `rav1d`의 어셈블리 최적화용).
+
+```bash
+winget install NASM.NASM   # PATH에 없으면 환경 변수 NASM에 nasm.exe 경로 지정
+```
 
 ```bash
 cargo test

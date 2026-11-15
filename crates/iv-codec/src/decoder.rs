@@ -28,6 +28,12 @@ pub struct Decoded {
 pub trait Decoder: Send + Sync {
     fn info(&self) -> &DecoderInfo;
 
+    /// Whether this decoder wants this particular file, beyond its format. Lets a decoder take
+    /// only the files it is better at (e.g. AVIF with alpha) and leave the rest to the next one.
+    fn claims(&self, _src: &Source, _format: FormatId) -> Result<bool> {
+        Ok(true)
+    }
+
     /// Reads dimensions, frame count, orientation and ICC profile without decoding pixels.
     fn probe(&self, src: &Source, format: FormatId) -> Result<ImageInfo>;
 

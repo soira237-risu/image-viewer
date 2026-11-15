@@ -300,3 +300,28 @@ fn gif_decodes_exactly_when_the_palette_fits() {
     assert_eq!(d.info.format, FormatId::Gif);
     assert_eq!(d.info.frame_count, None, "GIF frame count needs a full scan");
 }
+
+/// Lossless JPEG XL written by `zune-jpegxl`, decoded by jxl-oxide.
+fn jxl_of(img: &RgbaImage) -> Vec<u8> {
+    use zune_core::bit_depth::BitDepth;
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::options::EncoderOptions;
+    let (w, h) = img.dimensions();
+    let opts = EncoderOptions::new(w as usize, h as usize, ColorSpace::RGBA, BitDepth::Eight);
+    let mut out = Vec::new();
+    zune_jpegxl::JxlSimpleEncoder::new(img.as_raw(), opts).encode(&mut out).expect("jxl encode");
+    out
+}
+
+#[test]
+fn jpeg_xl_lossless_round_trips_exactly() {
+    let expected = pattern(37, 23, true);
+    let bytes = jxl_of(&expected);
+    let reg = default_registry();
+    let src = Source::from_bytes("a.jxl", bytes);
+    assert_eq!(reg.identify(&src).unwrap().format, FormatId::Jxl);
+    let d = reg.decode(&src, &CancelToken::never()).unwrap();
+    assert_eq!(d.info.codec, "jxl-oxide");
+    assert!(d.info.has_alpha);
+    assert_exact(&d, &expected);
+}

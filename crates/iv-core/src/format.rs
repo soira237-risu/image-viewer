@@ -20,10 +20,12 @@ pub enum FormatId {
     Heif,
     Jxl,
     Svg,
+    /// Camera RAW (many vendor formats; most are TIFF-based).
+    Raw,
 }
 
 impl FormatId {
-    pub const ALL: [FormatId; 17] = [
+    pub const ALL: [FormatId; 18] = [
         FormatId::Jpeg,
         FormatId::Png,
         FormatId::Webp,
@@ -41,6 +43,7 @@ impl FormatId {
         FormatId::Heif,
         FormatId::Jxl,
         FormatId::Svg,
+        FormatId::Raw,
     ];
 
     /// Short human-readable name.
@@ -63,6 +66,7 @@ impl FormatId {
             FormatId::Heif => "HEIF",
             FormatId::Jxl => "JPEG XL",
             FormatId::Svg => "SVG",
+            FormatId::Raw => "Camera RAW",
         }
     }
 
@@ -86,6 +90,11 @@ impl FormatId {
             FormatId::Heif => &["heic", "heif", "hif"],
             FormatId::Jxl => &["jxl"],
             FormatId::Svg => &["svg", "svgz"],
+            FormatId::Raw => &[
+                "dng", "3fr", "ari", "arw", "bay", "cap", "cr2", "cr3", "crw", "dcr", "dcs", "drf", "eip", "erf",
+                "fff", "gpr", "iiq", "k25", "kdc", "mdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "pef", "ptx",
+                "pxn", "r3d", "raf", "raw", "rw2", "rwl", "rwz", "sr2", "srf", "srw", "x3f",
+            ],
         }
     }
 

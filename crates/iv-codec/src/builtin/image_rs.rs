@@ -67,7 +67,7 @@ fn err(e: image::ImageError) -> Error {
     }
 }
 
-fn limits() -> Limits {
+pub(crate) fn limits() -> Limits {
     let mut l = Limits::default();
     // the default 512 MiB allocation cap would refuse ordinary 16-bit panoramas
     l.max_alloc = Some(MAX_BUFFER_BYTES);
@@ -79,7 +79,7 @@ fn orientation(o: image::metadata::Orientation) -> Orientation {
 }
 
 /// Bits per channel and alpha for the stored data.
-fn color_traits(c: ColorType) -> (u8, bool) {
+pub(crate) fn color_traits(c: ColorType) -> (u8, bool) {
     let bits = (c.bytes_per_pixel() / c.channel_count()) * 8;
     (bits, c.has_alpha())
 }
@@ -124,7 +124,7 @@ fn open(src: &Source, format: FormatId) -> Result<impl ImageDecoder> {
 }
 
 /// Converts to the pipeline's RGBA layouts, keeping 16-bit and float precision.
-fn to_image_buf(img: DynamicImage) -> Result<ImageBuf> {
+pub(crate) fn to_image_buf(img: DynamicImage) -> Result<ImageBuf> {
     let (w, h) = (img.width(), img.height());
     match img.color() {
         ColorType::Rgb16 | ColorType::Rgba16 | ColorType::L16 | ColorType::La16 => {
