@@ -2,9 +2,11 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
+use iv_core::{CancelToken, FormatId, ImageInfo, Source};
 use iv_pipeline::{Pipeline, PipelineConfig, PipelineEvent};
 
 const SIDE: u32 = 64;
@@ -260,5 +262,215 @@ fn failures_say_what_kind_they_are() {
                 _ => {}
             }
         }
+    }
+}
+
+/// Holds every decode of files whose name starts with `prefix` until `open` is set (ignoring
+/// cancellation, like a decoder in the middle of a long pixel decode), then fails so the next
+/// decoder (image-rs) decodes the file for real.
+struct Gate {
+    info: iv_codec::DecoderInfo,
+    prefix: &'static str,
+    open: Arc<AtomicBool>,
+    /// Decodes waiting at the gate.
+    waiting: Arc<AtomicUsize>,
+}
+
+impl iv_codec::Decoder for Gate {
+    fn info(&self) -> &iv_codec::DecoderInfo {
+        &self.info
+    }
+    fn claims(&self, src: &Source, _: FormatId) -> iv_core::Result<bool> {
+        Ok(src.display_name().starts_with(self.prefix))
+    }
+    fn probe(&self, _: &Source, _: FormatId) -> iv_core::Result<ImageInfo> {
+        Err(iv_core::Error::decode("gate", "probe by the next decoder"))
+    }
+    fn decode(&self, _: &Source, _: FormatId, _: &CancelToken) -> iv_core::Result<iv_codec::Decoded> {
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        while !self.open.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.waiting.fetch_sub(1, Ordering::AcqRel);
+        Err(iv_core::Error::decode("gate", "opened"))
+    }
+}
+
+fn gated_pipeline(prefix: &'static str, budget: u64, workers: usize) -> (Pipeline, Receiver<PipelineEvent>, Gated) {
+    let gated = Gated::default();
+    let mut reg = iv_codec::default_registry();
+    reg.register(Arc::new(Gate {
+        info: iv_codec::DecoderInfo { id: "gate", name: "gate", formats: &[FormatId::Png], priority: 1000 },
+        prefix,
+        open: gated.open.clone(),
+        waiting: gated.waiting.clone(),
+    }));
+    let (p, rx) = pipeline_with(reg, budget, workers, |_| {});
+    (p, rx, gated)
+}
+
+fn pipeline_with(
+    reg: iv_codec::Registry,
+    budget: u64,
+    workers: usize,
+    also: impl Fn(&PipelineEvent) + Send + Sync + 'static,
+) -> (Pipeline, Receiver<PipelineEvent>) {
+    let (tx, rx) = channel();
+    let tx = std::sync::Mutex::new(tx);
+    let p =
+        Pipeline::new(Arc::new(reg), PipelineConfig { prefetch_workers: workers, budget_bytes: budget }, move |e| {
+            also(&e);
+            let _ = tx.lock().unwrap().send(e);
+        });
+    (p, rx)
+}
+
+fn failed_for(rx: &Receiver<PipelineEvent>, path: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("an event") {
+            PipelineEvent::Failed { path: p, error, .. } if p == path => return error,
+            PipelineEvent::Ready { path: p, .. } if p == path => panic!("{} decoded", p.display()),
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn a_crashing_decoder_fails_one_image_and_the_workers_carry_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = write_pngs(dir.path(), 3);
+    // a decoder panicking deep inside a third-party crate (here: in the probe, through the sink)
+    let boom = files[0].clone();
+    let (p, rx) = pipeline_with(iv_codec::default_registry(), u64::MAX, 1, move |e| {
+        if let PipelineEvent::Probed { path, .. } = e {
+            assert!(*path != boom, "index out of bounds");
+        }
+    });
+    for _ in 0..3 {
+        // more crashes than there are workers: each one would have killed its thread
+        p.request(&files[0], &[]);
+        let error = failed_for(&rx, &files[0]);
+        assert!(error.contains("crashed") && error.contains("index out of bounds"), "{error}");
+        settle(&p);
+    }
+    p.request(&files[1], &[]);
+    ready_for(&rx, &files[1]);
+    p.request(&files[2], &[]);
+    ready_for(&rx, &files[2]);
+    assert_eq!(p.stats().in_flight, 0, "no bookkeeping left behind by the crashes");
+}
+
+#[test]
+fn a_new_image_does_not_wait_for_an_abandoned_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = write_pngs(dir.path(), 1);
+    let stuck = dir.path().join("hold.png");
+    std::fs::copy(&files[0], &stuck).unwrap();
+    let (p, rx, gate) = gated_pipeline("hold", u64::MAX, 1);
+
+    p.request(&stuck, &[]);
+    gate.wait_for(1);
+    // Home/End or opening another file: the target is neither cached nor being prefetched
+    p.request(&files[0], &[]);
+    ready_for(&rx, &files[0]);
+    gate.open();
+    settle(&p);
+}
+
+#[test]
+fn going_back_to_an_image_whose_decode_was_cancelled_loads_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = write_pngs(dir.path(), 1);
+    let back = dir.path().join("back.png");
+    std::fs::copy(&files[0], &back).unwrap();
+    let (p, rx, gate) = gated_pipeline("back", u64::MAX, 1);
+
+    p.request(&back, &[]);
+    gate.wait_for(1);
+    p.request(&files[0], &[]); // cancels `back`, which keeps decoding
+    ready_for(&rx, &files[0]);
+    p.request(&back, &[]); // and back again before the cancelled decode has ended
+    gate.open();
+    ready_for(&rx, &back);
+}
+
+#[test]
+fn prefetching_stays_within_the_budget_while_decoding() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = write_pngs(dir.path(), 1);
+    let gated: Vec<PathBuf> = (0..3)
+        .map(|i| {
+            let p = dir.path().join(format!("slow{i}.png"));
+            std::fs::copy(&files[0], &p).unwrap();
+            p
+        })
+        .collect();
+    // room for two neighbours being decoded at once, not three
+    let budget = IMAGE_BYTES * 5 / 2;
+    let (p, rx, gate) = gated_pipeline("slow", budget, 3);
+    p.request(&files[0], &gated);
+    ready_for(&rx, &files[0]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while p.stats().reserved_bytes != 2 * IMAGE_BYTES {
+        assert!(Instant::now() < deadline, "{:?}", p.stats());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(p.stats().reserved_bytes, 2 * IMAGE_BYTES, "the third waits for room");
+    gate.open();
+    settle(&p);
+    assert_eq!(p.stats().reserved_bytes, 0);
+    // the waiting one ran too (settled), and the cache kept what its budget allows, nearest first
+    assert!(p.cached(&gated[0]).is_some());
+    assert!(p.stats().used_bytes <= budget, "{:?}", p.stats());
+}
+
+#[test]
+fn images_too_large_to_prefetch_wait_until_they_are_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = write_pngs(dir.path(), 2);
+    let big = dir.path().join("big.png");
+    image::RgbaImage::new(SIDE * 2, SIDE * 2).save(&big).unwrap();
+    // a neighbour of four images' worth is over half of this budget, a small one is not
+    let (p, rx) = pipeline(IMAGE_BYTES * 6, 2);
+    p.request(&files[0], &[big.clone(), files[1].clone()]);
+    ready_for(&rx, &files[0]);
+    settle(&p);
+    assert!(p.cached(&files[1]).is_some());
+    assert!(p.cached(&big).is_none(), "not decoded in the background");
+    // asked for again with the same neighbours: not retried
+    p.request(&files[0], &[big.clone(), files[1].clone()]);
+    assert_eq!(p.stats().queued, 0, "{:?}", p.stats());
+    // opening it decodes it
+    p.request(&big, &[]);
+    ready_for(&rx, &big);
+}
+
+#[derive(Default)]
+struct Gated {
+    open: Arc<AtomicBool>,
+    waiting: Arc<AtomicUsize>,
+}
+
+impl Gated {
+    fn open(&self) {
+        self.open.store(true, Ordering::Release);
+    }
+
+    /// Waits until `n` decodes are held at the gate.
+    fn wait_for(&self, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.waiting.load(Ordering::Acquire) < n {
+            assert!(Instant::now() < deadline, "{n} decodes never reached the gate");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// A failing test still lets the held decodes finish, so dropping the pipeline does not hang.
+impl Drop for Gated {
+    fn drop(&mut self) {
+        self.open();
     }
 }

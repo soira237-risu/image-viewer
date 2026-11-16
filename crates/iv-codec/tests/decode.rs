@@ -92,6 +92,42 @@ fn sixteen_bit_png_keeps_precision() {
     assert_eq!(got, img.as_raw().as_slice());
 }
 
+/// Every stored colour layout comes out as the same RGBA the `image` crate's own conversion gives.
+#[test]
+fn every_colour_type_widens_to_rgba() {
+    let base = DynamicImage::ImageRgba16(image::ImageBuffer::from_fn(7, 5, |x, y| {
+        Rgba([x as u16 * 9000 + 11, y as u16 * 13000 + 5, (x * y) as u16 * 2000, 20000 + x as u16 * 6000])
+    }));
+    let cases = [
+        base.to_luma8().into(),
+        base.to_luma_alpha8().into(),
+        base.to_rgb8().into(),
+        base.to_rgba8().into(),
+        base.to_luma16().into(),
+        base.to_luma_alpha16().into(),
+        base.to_rgb16().into(),
+        DynamicImage::ImageRgba16(base.to_rgba16()),
+    ];
+    for img in cases {
+        let color = img.color();
+        let d = decode("c.png", encode(&img, ImageFormat::Png));
+        if color.bytes_per_pixel() / color.channel_count() == 1 {
+            assert_eq!(d.image.format(), PixelFormat::Rgba8, "{color:?}");
+            assert_eq!(d.image.data(), img.to_rgba8().as_raw().as_slice(), "{color:?}");
+        } else {
+            assert_eq!(d.image.format(), PixelFormat::Rgba16, "{color:?}");
+            let got: &[u16] = bytemuck::cast_slice(d.image.data());
+            assert_eq!(got, img.to_rgba16().as_raw().as_slice(), "{color:?}");
+        }
+    }
+    for img in [DynamicImage::ImageRgb32F(base.to_rgb32f()), DynamicImage::ImageRgba32F(base.to_rgba32f())] {
+        let d = decode("f.exr", encode(&img, ImageFormat::OpenExr));
+        assert_eq!(d.image.format(), PixelFormat::RgbaF32);
+        let got: &[f32] = bytemuck::cast_slice(d.image.data());
+        assert_eq!(got, img.to_rgba32f().as_raw().as_slice(), "{:?}", img.color());
+    }
+}
+
 #[test]
 fn content_wins_over_wrong_extension() {
     let png = encode(&DynamicImage::ImageRgba8(pattern(8, 8, true)), ImageFormat::Png);
@@ -204,6 +240,47 @@ fn failing_decoder_falls_through_to_next_priority() {
     let png = encode(&DynamicImage::ImageRgba8(pattern(4, 4, true)), ImageFormat::Png);
     match only_broken.decode(&Source::from_bytes("a.png", png), &CancelToken::never()) {
         Err(Error::NoDecoder { reason, .. }) => assert!(reason.contains("always fails"), "{reason}"),
+        other => panic!("expected NoDecoder, got {other:?}"),
+    }
+}
+
+/// Panics in every entry point, like a third-party decoder hitting a malformed file.
+struct Panicking(DecoderInfo);
+
+impl Decoder for Panicking {
+    fn info(&self) -> &DecoderInfo {
+        &self.0
+    }
+    fn probe(&self, _: &Source, _: FormatId) -> Result<ImageInfo> {
+        panic!("index out of bounds in probe")
+    }
+    fn preview(&self, _: &Source, _: FormatId, _: u32, _: &CancelToken) -> Result<Option<ImageBuf>> {
+        panic!("index out of bounds in preview")
+    }
+    fn decode(&self, _: &Source, _: FormatId, _: &CancelToken) -> Result<Decoded> {
+        panic!("index out of bounds in decode")
+    }
+}
+
+#[test]
+fn panicking_decoder_is_an_error_and_falls_through() {
+    let info = |priority| DecoderInfo { id: "panics", name: "panics", formats: &[FormatId::Png], priority };
+    let png = encode(&DynamicImage::ImageRgba8(pattern(4, 4, true)), ImageFormat::Png);
+    let src = Source::from_bytes("a.png", png);
+
+    let mut reg = default_registry();
+    reg.register(Arc::new(Panicking(info(1000))));
+    let d = reg.decode(&src, &CancelToken::never()).unwrap();
+    assert_eq!(d.info.codec, "image-rs", "the next decoder took over");
+    assert_eq!(reg.probe(&src).unwrap().codec, "image-rs");
+    assert!(reg.preview(&src, 64, &CancelToken::never()).is_ok(), "a crashing preview is no preview");
+
+    let mut only = Registry::new();
+    only.register(Arc::new(Panicking(info(0))));
+    match only.decode(&src, &CancelToken::never()) {
+        Err(Error::NoDecoder { reason, .. }) => {
+            assert!(reason.contains("panics crashed: index out of bounds in decode"), "{reason}")
+        }
         other => panic!("expected NoDecoder, got {other:?}"),
     }
 }

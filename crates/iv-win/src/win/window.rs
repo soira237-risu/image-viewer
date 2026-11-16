@@ -246,6 +246,7 @@ pub fn run(opts: Options) -> i32 {
     controls::init_common_controls();
 
     let saved_place = opts.settings_path.as_deref().and_then(|p| WindowPlacement::load(&WindowPlacement::path_for(p)));
+    let language = opts.settings.language;
     let mut app = App::new(opts.keymap, opts.trace, opts.settings, opts.settings_path, opts.no_activate);
     // without a console these would go unseen: the title bar says them until the first command
     app.startup_warnings(opts.settings_warning, &opts.keymap_warnings);
@@ -291,7 +292,11 @@ pub fn run(opts: Options) -> i32 {
         ) {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("cannot create the window: {e}");
+                // no window to put it in the title of: say it in a box, or nothing would show
+                let t = language.strings();
+                let message = crate::i18n::fill(t.window_failed, &[("error", &e.to_string())]);
+                crate::diag::log(&message);
+                super::dialogs::show_fatal("image-viewer", &message);
                 return 1;
             }
         }

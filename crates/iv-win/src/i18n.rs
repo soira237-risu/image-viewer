@@ -107,6 +107,8 @@ strings! {
     archive_page_rename,
     // startup: settings and keymap files that could not be used
     settings_unreadable, keymap_warning, settings_backed_up,
+    // failures without a console to report them: the folder listing, the window, a crash
+    folder_list_failed, window_failed, crash_title, crash_message,
 }
 
 impl Strings {
@@ -259,6 +261,10 @@ pub static KO: Strings = Strings {
     settings_unreadable: "설정 파일을 읽지 못해 기본값을 씁니다 ({error})",
     keymap_warning: "키맵: {error}",
     settings_backed_up: "설정을 저장했습니다. 읽지 못한 예전 파일은 {name}(으)로 보관했습니다",
+    folder_list_failed: "{name}이(가) 있는 폴더를 읽지 못해 이전·다음 이미지로 넘길 수 없습니다 ({error})",
+    window_failed: "창을 만들지 못했습니다: {error}",
+    crash_title: "이미지 뷰어 오류",
+    crash_message: "문제가 생겨 이미지 뷰어를 닫습니다.\n\n자세한 내용을 다음 파일에 남겼습니다:\n{path}",
 };
 
 pub static EN: Strings = Strings {
@@ -363,6 +369,10 @@ pub static EN: Strings = Strings {
     settings_unreadable: "the settings file could not be read; using defaults ({error})",
     keymap_warning: "keymap: {error}",
     settings_backed_up: "settings saved; the unreadable old file was kept as {name}",
+    folder_list_failed: "cannot list the folder of {name}, so there is no previous or next image ({error})",
+    window_failed: "cannot create the window: {error}",
+    crash_title: "image-viewer error",
+    crash_message: "image-viewer ran into a problem and has to close.\n\nThe details were written to:\n{path}",
 };
 
 #[cfg(test)]

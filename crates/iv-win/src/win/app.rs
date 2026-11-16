@@ -27,6 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use super::dialogs::{self, Answer, Filter};
 use super::{UiEvent, help, keys, menu, panel, settings_window, wake, wide};
 use crate::commands::Command;
+use crate::diag;
 use crate::edit::{
     InPlace, extension_mismatch, frames, in_place, save_request, save_request_as, selection_on_screen, selection_rect,
 };
@@ -243,6 +244,17 @@ fn file_name(p: &Path) -> String {
     p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
+/// The images around `path`: its folder, or the archive it is or is in. Listing an archive
+/// parses it, so a reader crashing on a malformed one is an error here like any other.
+fn list_folder(path: &Path) -> Result<FolderList, String> {
+    iv_core::panic::catch("archive reader", || FolderList::for_file(path).map_err(iv_core::Error::Io)).map_err(|e| {
+        match e {
+            iv_core::Error::Io(io) => io.to_string(),
+            other => other.to_string(),
+        }
+    })
+}
+
 /// Two pages scaled to a common height: the combined size, and the share of its width taken by
 /// the first page.
 pub fn spread_layout(main: (u32, u32), second: (u32, u32)) -> ((u32, u32), f64) {
@@ -400,12 +412,16 @@ impl App {
 
         // an archive or a folder: browse its images from the first
         let listing = if iv_pipeline::archive::is_archive(&path) && path.is_file() {
-            Some(FolderList::for_file(&path))
+            Some(list_folder(&path))
         } else if path.is_dir() {
-            Some(FolderList::scan(&path))
+            Some(FolderList::scan(&path).map_err(|e| e.to_string()))
         } else {
             None
         };
+        // encoded pages kept for quick page turns belong to the archive being left
+        if iv_pipeline::archive::split(&path).is_none() && !iv_pipeline::archive::is_archive(&path) {
+            iv_pipeline::archive::release_cache();
+        }
         if let Some(listing) = listing {
             let name = file_name(&path);
             match listing {
@@ -417,9 +433,7 @@ impl App {
                     self.request(first);
                 }
                 Ok(_) => self.show_open_error(fill(self.t().no_images_inside, &[("name", &name)])),
-                Err(e) => {
-                    self.show_open_error(fill(self.t().cannot_open, &[("name", &name), ("error", &e.to_string())]))
-                }
+                Err(e) => self.show_open_error(fill(self.t().cannot_open, &[("name", &name), ("error", &e)])),
             }
             return;
         }
@@ -434,7 +448,8 @@ impl App {
         std::thread::Builder::new()
             .name("folder-scan".into())
             .spawn(move || {
-                let result = FolderList::for_file(&path).map_err(|e| e.to_string());
+                // listing an archive parses it: a reader crashing on a malformed one fails the listing
+                let result = list_folder(&path);
                 send(&tx, AppEvent::Folder { for_path: path, result });
             })
             .expect("spawn folder scan");
@@ -813,7 +828,7 @@ impl App {
                 cur.full = Some(decoded);
             }
             PipelineEvent::Failed { path, error, kind } if is_current(&path, &self.current) => {
-                eprintln!("{}: {error}", path.display());
+                diag::log(&format!("{}: {error}", path.display()));
                 self.error = Some(self.t().open_failed(&file_name(&path), kind, &error));
                 // nothing truthful to show for this file: not even its embedded preview, which
                 // would look like a healthy (blurry) image
@@ -842,7 +857,12 @@ impl App {
                 self.folder = Some(folder);
                 self.request(for_path);
             }
-            Err(e) => eprintln!("cannot list folder of {}: {e}", for_path.display()),
+            Err(e) => {
+                // the image is shown, but without its folder there is no previous or next one
+                diag::log(&format!("cannot list folder of {}: {e}", for_path.display()));
+                let name = file_name(&for_path);
+                self.set_notice(fill(self.t().folder_list_failed, &[("name", &name), ("error", &e)]));
+            }
         }
     }
 
@@ -943,7 +963,7 @@ impl App {
             WindowPlacement { x: r.left, y: r.top, width: r.right - r.left, height: r.bottom - r.top, maximized };
         match saved.save(&WindowPlacement::path_for(path)) {
             Ok(()) => self.trace.mark(&format!("window placement saved: {saved:?}")),
-            Err(e) => eprintln!("window placement not saved: {e}"),
+            Err(e) => diag::log(&format!("window placement not saved: {e}")),
         }
     }
 
@@ -1363,7 +1383,9 @@ impl App {
         let thread = std::thread::Builder::new()
             .name("save".into())
             .spawn(move || {
-                let result = export(&iv_codec::default_registry(), &encoders, &req).map_err(|e| e.to_string());
+                // an encoder crashing must still report back, or the viewer would wait for this save forever
+                let result = iv_core::panic::catch("save", || export(&iv_codec::default_registry(), &encoders, &req))
+                    .map_err(|e| e.to_string());
                 send(&tx, AppEvent::Saved { source: req.source, dest: req.dest, result });
             })
             .expect("spawn save thread");
@@ -1428,7 +1450,7 @@ impl App {
             }
             Err(e) => {
                 // what was waiting for the save does not happen: the edits are still unsaved
-                eprintln!("save failed: {e}");
+                diag::log(&format!("save failed: {e}"));
                 let message = fill(self.t().save_failed, &[("error", &e)]);
                 self.set_notice(message.clone());
                 if let Some(h) = self.hwnd {

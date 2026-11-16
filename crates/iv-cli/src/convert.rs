@@ -155,18 +155,23 @@ pub fn convert(args: &[String]) -> ExitCode {
             return;
         }
         let t = Instant::now();
-        let result = ops_for(path, &a).and_then(|ops| {
-            let req = ExportRequest {
-                source: path.clone(),
-                ops,
-                format: a.format,
-                options: options.clone(),
-                dest: dest.clone(),
-                background: [255, 255, 255],
-                keep_metadata: a.keep_metadata,
-            };
-            export(&default_registry(), &encoders, &req).map_err(|e| e.to_string())
-        });
+        // a codec crashing on one malformed file fails that file, not the whole batch
+        let result = iv_core::panic::catch("conversion", || Ok(ops_for(path, &a)))
+            .map_err(|e| e.to_string())
+            .and_then(|ops| ops)
+            .and_then(|ops| {
+                let req = ExportRequest {
+                    source: path.clone(),
+                    ops,
+                    format: a.format,
+                    options: options.clone(),
+                    dest: dest.clone(),
+                    background: [255, 255, 255],
+                    keep_metadata: a.keep_metadata,
+                };
+                iv_core::panic::catch("conversion", || export(&default_registry(), &encoders, &req))
+                    .map_err(|e| e.to_string())
+            });
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         match result {
             Ok(ExportOutcome::LosslessOrientation) => {

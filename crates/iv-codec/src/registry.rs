@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use iv_core::panic::catch;
 use iv_core::{CancelToken, Error, FormatId, ImageBuf, ImageInfo, Result, Source};
 
 use crate::decoder::{Decoded, Decoder};
@@ -26,7 +27,9 @@ impl Identified {
 ///
 /// Selection: identify the format (content first, extension as fallback), then try every
 /// decoder claiming that format in descending priority (registration order breaks ties). A
-/// decoder that errors falls through to the next; cancellation stops the chain at once.
+/// decoder that errors falls through to the next; cancellation stops the chain at once. A
+/// decoder that panics on a malformed file counts as one that errored ([`Error::Panicked`]), so
+/// the thread calling the registry survives it.
 #[derive(Default)]
 pub struct Registry {
     decoders: Vec<Arc<dyn Decoder>>,
@@ -100,7 +103,7 @@ impl Registry {
         let id = self.identify(src)?;
         let mut decoded = self.try_each(src, id.format, |d| d.decode(src, id.format, cancel))?;
         cancel.check()?;
-        decoded.color_managed = crate::color::to_srgb(&mut decoded).is_ok();
+        decoded.color_managed = catch("colour management", || Ok(crate::color::to_srgb(&mut decoded).is_ok()))?;
         Ok(decoded)
     }
 
@@ -109,10 +112,11 @@ impl Registry {
         let id = self.identify(src)?;
         for d in self.decoders_for(id.format) {
             cancel.check()?;
-            if !d.claims(src, id.format).unwrap_or(false) {
+            let codec = d.info().id;
+            if !catch(codec, || d.claims(src, id.format)).unwrap_or(false) {
                 continue;
             }
-            match d.preview(src, id.format, target_side, cancel) {
+            match catch(codec, || d.preview(src, id.format, target_side, cancel)) {
                 Ok(Some(img)) => return Ok(Some(img)),
                 Ok(None) => {}
                 Err(Error::Cancelled) => return Err(Error::Cancelled),
@@ -126,7 +130,8 @@ impl Registry {
     fn try_each<T>(&self, src: &Source, format: FormatId, mut f: impl FnMut(&dyn Decoder) -> Result<T>) -> Result<T> {
         let mut failures = Vec::new();
         for d in self.decoders_for(format) {
-            match d.claims(src, format) {
+            let codec = d.info().id;
+            match catch(codec, || d.claims(src, format)) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
@@ -134,7 +139,7 @@ impl Registry {
                     continue;
                 }
             }
-            match f(d.as_ref()) {
+            match catch(codec, || f(d.as_ref())) {
                 Ok(v) => return Ok(v),
                 Err(Error::Cancelled) => return Err(Error::Cancelled),
                 Err(e) => failures.push(format!("{}: {e}", d.info().id)),

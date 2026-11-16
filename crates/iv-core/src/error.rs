@@ -25,6 +25,10 @@ pub enum Error {
     /// The operation was cancelled through a [`crate::CancelToken`].
     #[error("operation cancelled")]
     Cancelled,
+
+    /// Third-party code panicked (see [`crate::panic::catch`]); the panic was contained.
+    #[error("{what} crashed: {message}")]
+    Panicked { what: &'static str, message: String },
 }
 
 impl Error {

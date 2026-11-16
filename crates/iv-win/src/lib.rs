@@ -3,6 +3,7 @@
 //! editing helpers, help contents and wheel handling.
 
 pub mod commands;
+pub mod diag;
 pub mod edit;
 pub mod help;
 pub mod i18n;

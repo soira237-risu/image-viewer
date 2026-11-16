@@ -98,12 +98,22 @@ struct State {
     plan: Vec<PathBuf>,
     foreground: VecDeque<Job>,
     background: VecDeque<Job>,
+    /// Decodes running, with the token of the newest job per path. A cancelled job keeps running
+    /// until its decoder next checks the token; asking for its path again starts a new job.
     in_flight: HashMap<PathBuf, CancelToken>,
     failed: HashSet<PathBuf>,
+    /// Images whose decoded size is too large to prefetch (more than half the budget): they are
+    /// decoded only when the user opens them.
+    too_big_to_prefetch: HashSet<PathBuf>,
+    /// Pixel bytes the running decodes are expected to produce (from their headers). Prefetch
+    /// decodes wait while starting one would take this over the budget, so neighbours cannot
+    /// pile up gigabytes of decoding at once.
+    reserved_bytes: u64,
     tick: u64,
     shutdown: bool,
-    /// Path the foreground worker is decoding right now.
-    foreground_running: Option<PathBuf>,
+    /// Foreground decodes running, oldest first. A cancelled one may still be finishing on one
+    /// worker while the newest runs on another.
+    foreground_running: Vec<PathBuf>,
     /// Quick browsing: the running foreground decode is allowed to finish and is announced even
     /// if the user has already moved past it, so held keys show images as fast as they decode.
     quick: bool,
@@ -116,6 +126,8 @@ pub struct Stats {
     pub used_bytes: u64,
     pub queued: usize,
     pub in_flight: usize,
+    /// Pixel bytes the running decodes are expected to produce.
+    pub reserved_bytes: u64,
 }
 
 type Sink = Box<dyn Fn(PipelineEvent) + Send + Sync>;
@@ -170,6 +182,7 @@ impl State {
             used_bytes: self.used_bytes,
             queued: self.foreground.len() + self.background.len(),
             in_flight: self.in_flight.len(),
+            reserved_bytes: self.reserved_bytes,
         }
     }
 }
@@ -186,15 +199,17 @@ impl Shared {
             if st.shutdown {
                 return None;
             }
+            // a prefetch worker takes the image on screen first: the foreground worker may still
+            // be finishing a decode the user has already left (decoders only stop between stages)
             let job = match kind {
                 Kind::Foreground => st.foreground.pop_front(),
-                Kind::Prefetch => st.background.pop_front(),
+                Kind::Prefetch => st.foreground.pop_front().or_else(|| st.background.pop_front()),
             };
             if let Some(job) = job {
                 let token = CancelToken::new();
                 st.in_flight.insert(job.path.clone(), token.clone());
                 if job.kind == Kind::Foreground {
-                    st.foreground_running = Some(job.path.clone());
+                    st.foreground_running.push(job.path.clone());
                 }
                 return Some((job, token));
             }
@@ -202,32 +217,70 @@ impl Shared {
         }
     }
 
+    /// Counts `bytes` as being decoded. A prefetch first waits until the other running decodes
+    /// leave room for it in the budget (one always may run); the image on screen never waits.
+    fn reserve(&self, bytes: u64, kind: Kind, cancel: &CancelToken) -> Result<u64, Error> {
+        let mut st = self.lock();
+        while kind == Kind::Prefetch
+            && st.reserved_bytes > 0
+            && st.reserved_bytes.saturating_add(bytes) > self.config.budget_bytes
+        {
+            if cancel.is_cancelled() || st.shutdown {
+                return Err(Error::Cancelled);
+            }
+            // cancellation does not signal the condvar; look again now and then
+            st = self.wake.wait_timeout(st, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        st.reserved_bytes += bytes;
+        Ok(bytes)
+    }
+
     fn run(&self, job: Job, cancel: CancelToken) {
         let started = Instant::now();
-        let result = (|| {
+        let mut reserved = 0;
+        // Decoders and archive readers run on untrusted files: a panic in one of them fails this
+        // image, and the worker, its bookkeeping below and every later image carry on.
+        let result = iv_core::panic::catch("image reader", || {
             let src = crate::archive::source_for(&job.path)?;
+            let info = self.registry.probe(&src)?;
+            let bytes = expected_bytes(&info);
             if job.kind == Kind::Foreground {
-                let info = self.registry.probe(&src)?;
                 (self.sink)(PipelineEvent::Probed { path: job.path.clone(), info });
-                cancel.check()?;
+            } else if bytes > self.config.budget_bytes / 2 {
+                return Ok(None);
+            }
+            reserved = self.reserve(bytes, job.kind, &cancel)?;
+            cancel.check()?;
+            if job.kind == Kind::Foreground {
                 // a broken or missing preview is not an error: the decode follows
                 if let Ok(Some(image)) = self.registry.preview(&src, PREVIEW_TARGET, &cancel) {
                     (self.sink)(PipelineEvent::Preview { path: job.path.clone(), image });
                 }
             }
-            self.registry.decode(&src, &cancel)
-        })();
+            self.registry.decode(&src, &cancel).map(Some)
+        });
 
         let event = {
             let mut st = self.lock();
-            st.in_flight.remove(&job.path);
+            st.reserved_bytes -= reserved;
+            // a newer job for the same path (asked for again after this one was cancelled) keeps
+            // its entry
+            if st.in_flight.get(&job.path).is_some_and(|t| t.same(&cancel)) {
+                st.in_flight.remove(&job.path);
+            }
             if job.kind == Kind::Foreground {
-                st.foreground_running = None;
+                if let Some(i) = st.foreground_running.iter().position(|p| *p == job.path) {
+                    st.foreground_running.remove(i);
+                }
             }
             // a quick-browse frame the user has already passed is still worth showing
             let quick_frame = job.kind == Kind::Foreground && st.quick;
             match result {
-                Ok(decoded) => {
+                Ok(None) => {
+                    st.too_big_to_prefetch.insert(job.path);
+                    None
+                }
+                Ok(Some(decoded)) => {
                     let decoded = Arc::new(decoded);
                     let bytes = decoded.memory_size() as u64;
                     let is_current = st.plan.first() == Some(&job.path);
@@ -257,10 +310,25 @@ impl Shared {
                 }
             }
         };
+        if reserved > 0 {
+            self.wake.notify_all();
+        }
         if let Some(e) = event {
             (self.sink)(e);
         }
     }
+}
+
+/// Pixel memory a decode of `info` is expected to take: RGBA at the precision the pipeline keeps
+/// (8, 16 or 32-bit float channels), every frame of a known animation counted.
+fn expected_bytes(info: &ImageInfo) -> u64 {
+    let pixel = match info.bits_per_channel {
+        0..=8 => 4,
+        9..=16 => 8,
+        _ => 16,
+    };
+    let frames = info.frame_count.unwrap_or(1).max(1) as u64;
+    (info.width as u64).saturating_mul(info.height as u64).saturating_mul(pixel).saturating_mul(frames)
 }
 
 impl Pipeline {
@@ -320,7 +388,8 @@ impl Pipeline {
         st.plan.push(current.to_path_buf());
         st.plan.extend(prefetch.iter().filter(|p| p.as_path() != current).cloned());
 
-        let keep_running = if quick { st.foreground_running.clone() } else { None };
+        // the newest foreground decode is the one quick browsing keeps
+        let keep_running = if quick { st.foreground_running.last().cloned() } else { None };
         for (path, token) in &st.in_flight {
             if !st.plan.contains(path) && Some(path) != keep_running.as_ref() {
                 token.cancel();
@@ -335,14 +404,21 @@ impl Pipeline {
             e.last_used = tick;
             e.decoded.clone()
         });
-        if hit.is_none() && !st.in_flight.contains_key(current) {
+        // a decode of this image that was cancelled when the user left it will not be announced
+        let running = |st: &State, p: &Path| st.in_flight.get(p).is_some_and(|t| !t.is_cancelled());
+        if hit.is_none() && !running(&st, current) {
             // an explicit request retries a file that failed before
             st.failed.remove(current);
             st.foreground.push_back(Job { path: current.to_path_buf(), kind: Kind::Foreground });
         }
         let todo: Vec<PathBuf> = st.plan[1..]
             .iter()
-            .filter(|p| !st.cache.contains_key(*p) && !st.in_flight.contains_key(*p) && !st.failed.contains(*p))
+            .filter(|p| {
+                !st.cache.contains_key(*p)
+                    && !running(&st, p)
+                    && !st.failed.contains(*p)
+                    && !st.too_big_to_prefetch.contains(*p)
+            })
             .cloned()
             .collect();
         st.background.extend(todo.into_iter().map(|path| Job { path, kind: Kind::Prefetch }));
@@ -359,6 +435,7 @@ impl Pipeline {
             st.used_bytes -= e.bytes;
         }
         st.failed.remove(path);
+        st.too_big_to_prefetch.remove(path);
     }
 
     pub fn cached(&self, path: &Path) -> Option<Arc<Decoded>> {

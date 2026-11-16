@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use iv_win::diag;
 use iv_win::keymap::Keymap;
 use iv_win::settings::Settings;
 use iv_win::trace::Trace;
@@ -17,6 +18,8 @@ fn config_dir() -> Option<PathBuf> {
 
 fn main() {
     let start = Instant::now();
+    // log times count from here; the file is only created by the first message
+    diag::init(diag::default_dir());
     let mut trace_enabled = false;
     let mut no_activate = false;
     let mut keymap_path: Option<PathBuf> = None;
@@ -44,7 +47,7 @@ fn main() {
         None => (Keymap::defaults(), Vec::new()),
     };
     for w in &keymap_warnings {
-        eprintln!("keymap: {w}");
+        diag::log(&format!("keymap: {w}"));
     }
     let settings_path = settings_path.or_else(|| config_dir().map(|d| d.join("settings.toml")));
     let (settings, warning) = match &settings_path {
@@ -52,8 +55,10 @@ fn main() {
         None => (Settings::default(), None),
     };
     if let Some(w) = &warning {
-        eprintln!("settings: {w}");
+        diag::log(&format!("settings: {w}"));
     }
+    // from here on a crash of the window's thread (this one) leaves crash.log and says so
+    diag::install_panic_hook(settings.language, iv_win::win::dialogs::show_fatal);
     std::process::exit(run(Options {
         file,
         keymap,

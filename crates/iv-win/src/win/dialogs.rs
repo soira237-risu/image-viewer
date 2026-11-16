@@ -118,6 +118,19 @@ pub fn show_error(owner: HWND, text: &str) {
     message_box(owner, text, MB_OK | MB_ICONERROR);
 }
 
+/// An error box with no owner window, shown from a thread of its own and waited for: the
+/// calling thread's message loop is not run meanwhile. For a crash, where the window's state is
+/// mid-panic and must not see another message, and for failures before there is a window.
+pub fn show_fatal(title: &str, text: &str) {
+    let (t, c) = (wide(text), wide(title));
+    let shown = std::thread::Builder::new().name("error-box".into()).spawn(move || unsafe {
+        MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), MB_OK | MB_ICONERROR);
+    });
+    if let Ok(thread) = shown {
+        let _ = thread.join();
+    }
+}
+
 thread_local! {
     static CUSTOM_COLOURS: RefCell<[COLORREF; 16]> = const { RefCell::new([COLORREF(0x00ff_ffff); 16]) };
 }

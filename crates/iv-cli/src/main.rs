@@ -50,7 +50,8 @@ fn probe(inputs: &[String]) -> ExitCode {
     let paths = files::collect(inputs);
     let mut failed = 0;
     for path in &paths {
-        let line = iv_pipeline::archive::source_for(path)
+        // decoder panics are contained by the registry; an archive reader's here
+        let line = iv_core::panic::catch("archive reader", || iv_pipeline::archive::source_for(path))
             .and_then(|src| reg.identify(&src).and_then(|id| reg.probe(&src).map(|info| (id, info))));
         match line {
             Ok((id, info)) => {
