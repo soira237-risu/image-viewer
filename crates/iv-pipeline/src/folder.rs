@@ -77,10 +77,12 @@ impl FolderList {
         &self.files
     }
 
-    /// `old` was renamed to `new` on disk: the list follows, keeping its natural order. Returns
-    /// the new entry's index, or `None` when `old` is not in the list.
+    /// `old` was renamed to `new` on disk: the list follows, keeping its natural order. `old` is
+    /// found the way [`Self::position`] finds it (so `x.jpg` matches the scanned `.\x.jpg`, and
+    /// letter case need not match on Windows). Returns the new entry's index, or `None` when
+    /// `old` is not in the list.
     pub fn rename(&mut self, old: &Path, new: &Path) -> Option<usize> {
-        let i = self.files.iter().position(|f| f == old)?;
+        let i = self.position(old)?;
         self.files[i] = new.to_path_buf();
         self.files.sort_by(|a, b| natural_cmp(&name_of(a), &name_of(b)));
         self.files.iter().position(|f| f == new)
@@ -178,6 +180,29 @@ mod tests {
         assert_eq!(names, ["b.webp", "c.png", "z.png"]);
         assert_eq!(list.rename(&dir.path().join("gone.jpg"), &dir.path().join("x.jpg")), None);
         assert_eq!(list.len(), 3);
+    }
+
+    #[test]
+    fn a_rename_finds_the_entry_the_way_position_does() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.jpg", "b.jpg", "c.png"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let mut list = FolderList::scan(dir.path()).unwrap();
+        // the viewer's path for a file may be spelled unlike the scanned one (`x.jpg` given on
+        // the command line, `.\x.jpg` listed); it still names the same entry
+        let other_spelling = dir.path().join("sub").join("..").join("b.jpg");
+        assert_ne!(other_spelling, list.files()[1]);
+        assert_eq!(list.position(&other_spelling), Some(1));
+        assert_eq!(list.rename(&other_spelling, &dir.path().join("b.webp")), Some(1));
+        let names: Vec<_> = list.files().iter().map(|p| name_of(p)).collect();
+        assert_eq!(names, ["a.jpg", "b.webp", "c.png"], "replaced, not added beside the old name");
+        if cfg!(windows) {
+            // Windows file names ignore letter case
+            assert_eq!(list.rename(&dir.path().join("A.JPG"), &dir.path().join("a.png")), Some(0));
+            let names: Vec<_> = list.files().iter().map(|p| name_of(p)).collect();
+            assert_eq!(names, ["a.png", "b.webp", "c.png"]);
+        }
     }
 
     #[test]

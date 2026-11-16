@@ -28,7 +28,7 @@ use super::dialogs::{self, Answer, Filter};
 use super::{UiEvent, help, keys, menu, panel, settings_window, wake, wide};
 use crate::commands::Command;
 use crate::edit::{
-    InPlace, extension_mismatch, in_place, save_request, save_request_as, selection_on_screen, selection_rect,
+    InPlace, extension_mismatch, frames, in_place, save_request, save_request_as, selection_on_screen, selection_rect,
 };
 use crate::i18n::{Strings, fill};
 use crate::keymap::{Chord, Keymap};
@@ -424,7 +424,12 @@ impl App {
             return;
         }
         self.request(path.clone());
+        self.scan_folder(path);
+    }
 
+    /// Lists the folder of `path` in the background; [`Self::handle_folder`] takes the result if
+    /// `path` is still the current image by then.
+    fn scan_folder(&self, path: PathBuf) {
         let tx = self.tx.clone();
         std::thread::Builder::new()
             .name("folder-scan".into())
@@ -1277,8 +1282,10 @@ impl App {
 
     /// Saves the edits over the current file in the format of its content (a WebP named `.jpg`
     /// stays WebP). An animation, a page inside an archive or a format nothing can write goes
-    /// to Save As instead, with the reason in the title bar. `then` runs once the save has
-    /// succeeded.
+    /// to Save As instead, with the reason in the title bar. While only the header has been
+    /// read and it cannot tell a still image from an animation, nothing is saved and nothing
+    /// waiting on the save (`then`) happens; the title bar says to try again. `then` runs once
+    /// the save has succeeded.
     fn save_in_place(&mut self, then: Option<AfterSave>) {
         if self.busy_saving() {
             return;
@@ -1288,11 +1295,10 @@ impl App {
         if self.edits.is_empty() {
             return;
         }
-        let animated =
-            info.frame_count.is_some_and(|n| n > 1) || cur.full.as_ref().is_some_and(|d| d.animation.is_some());
-        let target = in_place(&self.encoders, &cur.path, info.format, animated);
+        let target = in_place(&self.encoders, &cur.path, info.format, frames(info, cur.full.as_deref()));
         self.trace.mark(&format!("save in place: {target:?}"));
         match target {
+            InPlace::NotLoaded => self.set_notice(self.t().save_not_loaded.into()),
             InPlace::Write(format) => {
                 let req = save_request_as(
                     &self.encoders,
@@ -1494,11 +1500,15 @@ impl App {
     /// The current file is now called `new`: everything that knew it by `old` follows.
     fn renamed(&mut self, old: &Path, new: &Path) {
         self.pipeline.invalidate(old);
-        if let Some(folder) = self.folder.as_mut() {
-            if let Some(i) = folder.rename(old, new) {
-                self.index = Some(i);
-            }
+        let followed = self.folder.as_mut().and_then(|folder| folder.rename(old, new));
+        // without a list that followed (the folder scan, for the old name, has not come back
+        // yet and will be dropped as stale, or the list does not know the file), list the
+        // folder again under the new name rather than keep an entry for a file that is gone
+        let rescan = followed.is_none();
+        if rescan {
+            self.folder = None;
         }
+        self.index = followed;
         if let Some(d) = self.display.as_mut().filter(|d| d.path == old) {
             d.path = new.to_path_buf();
         }
@@ -1507,6 +1517,9 @@ impl App {
         if cur.full.is_none() {
             // still loading under the old name: ask again under the new one (edits stay)
             self.request(new.to_path_buf());
+        }
+        if rescan {
+            self.scan_folder(new.to_path_buf());
         }
         self.update_title();
     }

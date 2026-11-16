@@ -101,7 +101,7 @@ strings! {
     panel_error, settings_window_error, help_window_error, cannot_open, unsupported_format, too_large,
     file_not_found, unknown_file_type, cannot_write_format,
     // saving safely
-    archive_page_save_as, animated_save_as, first_frame_only, save_busy, continue_after_save,
+    archive_page_save_as, animated_save_as, save_not_loaded, first_frame_only, save_busy, continue_after_save,
     // fixing a wrong extension
     extension_mismatch, extension_fixed, extension_ok, extension_exists, extension_fix_failed,
     archive_page_rename,
@@ -246,6 +246,7 @@ pub static KO: Strings = Strings {
     cannot_write_format: "{format} 형식으로는 저장할 수 없습니다",
     archive_page_save_as: "압축파일 안의 페이지는 그 자리에 저장할 수 없어 다른 이름으로 저장합니다",
     animated_save_as: "움직이는 이미지는 첫 프레임만 저장되므로 원본을 지키려고 다른 이름으로 저장합니다",
+    save_not_loaded: "아직 이미지를 다 읽지 않아 몇 프레임인지 모릅니다. 다 읽은 뒤에 다시 저장하세요",
     first_frame_only: "첫 프레임만 저장했습니다 (나머지 {count}프레임은 저장하지 않음)",
     save_busy: "저장하는 중입니다. 끝난 뒤에 다시 하세요",
     continue_after_save: "저장이 끝나면 이어서 진행합니다",
@@ -349,6 +350,7 @@ pub static EN: Strings = Strings {
     cannot_write_format: "{format} files cannot be written",
     archive_page_save_as: "pages inside an archive cannot be saved in place; choose a new file",
     animated_save_as: "saving an animation keeps only its first frame; choose a new file to keep the original",
+    save_not_loaded: "the image is still loading, so its frame count is not known yet; save again once it has loaded",
     first_frame_only: "saved the first frame only ({count} more frames not saved)",
     save_busy: "a save is in progress; try again when it finishes",
     continue_after_save: "will continue when the save finishes",

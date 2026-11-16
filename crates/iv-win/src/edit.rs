@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 use crate::i18n::{Strings, fill};
 use crate::view::{ScreenRect, ViewState};
+use iv_codec::Decoded;
 use iv_codec::encode::{EncodeOptions, Encoders};
-use iv_core::FormatId;
+use iv_core::{FormatId, ImageInfo};
 use iv_ops::{Op, Rect};
 use iv_pipeline::export::ExportRequest;
 
@@ -77,6 +78,10 @@ pub enum InPlace {
     ArchivePage,
     /// More than one frame: saving keeps only the first, which would destroy the animation.
     Animated,
+    /// Only the header has been read and it does not give the frame count (GIF, animated WebP,
+    /// APNG): saving now could overwrite an animation with its first frame, so nothing is
+    /// saved until the full decode says how many frames there are.
+    NotLoaded,
     /// Nothing can write the format (HEIC, RAW, …).
     NotWritable,
 }
@@ -88,20 +93,50 @@ impl InPlace {
             InPlace::Write(_) => None,
             InPlace::ArchivePage => Some(t.archive_page_save_as),
             InPlace::Animated => Some(t.animated_save_as),
+            InPlace::NotLoaded => Some(t.save_not_loaded),
             InPlace::NotWritable => Some(t.format_not_writable),
         }
     }
 }
 
+/// How many frames an image has, as far as is known so far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Frames {
+    One,
+    Many,
+    /// Only the header has been read, and it does not say (GIF, animated WebP, APNG, …).
+    Unknown,
+}
+
+/// What `info` (from the header probe, or from the decode once it is in) and the full decode,
+/// if it has arrived, say about the frame count. Only a count of exactly one is a still image:
+/// before the decode is in, a count the probe could not give may hide an animation; after it,
+/// a count the decode did not give either means an animation too large to play was decoded as
+/// its first frame (or a format that does not count frames), so it counts as more than one.
+pub fn frames(info: &ImageInfo, full: Option<&Decoded>) -> Frames {
+    let count = full.and_then(|d| d.info.frame_count).or(info.frame_count);
+    match (count, full) {
+        (_, Some(d)) if d.animation.is_some() => Frames::Many,
+        (Some(n), _) if n > 1 => Frames::Many,
+        (Some(1), _) => Frames::One,
+        (_, Some(_)) => Frames::Many,
+        (_, None) => Frames::Unknown,
+    }
+}
+
 /// How the image at `path` can be saved in place. `format` is the format its content was
-/// identified as (not the extension's), `animated` whether it has more than one frame.
-pub fn in_place(encoders: &Encoders, path: &Path, format: FormatId, animated: bool) -> InPlace {
+/// identified as (not the extension's), `frames` what is known of its frame count (see
+/// [`frames`]).
+pub fn in_place(encoders: &Encoders, path: &Path, format: FormatId, frames: Frames) -> InPlace {
     if iv_pipeline::archive::split(path).is_some() {
-        InPlace::ArchivePage
-    } else if animated {
-        InPlace::Animated
-    } else {
-        in_place_format(encoders, format).map_or(InPlace::NotWritable, InPlace::Write)
+        return InPlace::ArchivePage;
+    }
+    // whatever the frame count is, nothing could write the format
+    let Some(format) = in_place_format(encoders, format) else { return InPlace::NotWritable };
+    match frames {
+        Frames::Many => InPlace::Animated,
+        Frames::Unknown => InPlace::NotLoaded,
+        Frames::One => InPlace::Write(format),
     }
 }
 
@@ -273,19 +308,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // WebP bytes named .jpg: written back as WebP (alpha and lossless pixels survive)
         let webp_as_jpg = dir.path().join("x.jpg");
-        let InPlace::Write(format) = in_place(&enc, &webp_as_jpg, FormatId::Webp, false) else { panic!() };
+        let InPlace::Write(format) = in_place(&enc, &webp_as_jpg, FormatId::Webp, Frames::One) else { panic!() };
         let r = save_request_as(&enc, &webp_as_jpg, &[Op::rotate_cw()], webp_as_jpg.clone(), format, 80).unwrap();
         assert_eq!((r.format, r.dest.as_path()), (FormatId::Webp, webp_as_jpg.as_path()));
         // a PNG with an unknown extension still saves (the extension is never consulted)
         let odd = dir.path().join("x.dat");
-        assert_eq!(in_place(&enc, &odd, FormatId::Png, false), InPlace::Write(FormatId::Png));
+        assert_eq!(in_place(&enc, &odd, FormatId::Png, Frames::One), InPlace::Write(FormatId::Png));
         assert_eq!(save_request_as(&enc, &odd, &[], odd.clone(), FormatId::Png, 80).unwrap().format, FormatId::Png);
         assert!(extension_mismatch(&webp_as_jpg, FormatId::Webp));
         assert!(!extension_mismatch(Path::new("a.JPEG"), FormatId::Jpeg));
         assert!(!extension_mismatch(&odd, FormatId::Png), "an unknown extension is not a mismatch");
         // a JPEG named .heic is writable: its content is JPEG
-        assert_eq!(in_place(&enc, &dir.path().join("x.heic"), FormatId::Jpeg, false), InPlace::Write(FormatId::Jpeg));
-        assert_eq!(in_place(&enc, &dir.path().join("x.heic"), FormatId::Heif, false), InPlace::NotWritable);
+        assert_eq!(
+            in_place(&enc, &dir.path().join("x.heic"), FormatId::Jpeg, Frames::One),
+            InPlace::Write(FormatId::Jpeg)
+        );
+        assert_eq!(in_place(&enc, &dir.path().join("x.heic"), FormatId::Heif, Frames::One), InPlace::NotWritable);
     }
 
     #[test]
@@ -295,18 +333,81 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // GIF, WebP and PNG can all be written, but only as one frame
         for f in [FormatId::Gif, FormatId::Webp, FormatId::Png] {
-            assert_eq!(in_place(&enc, &dir.path().join("a.gif"), f, true), InPlace::Animated);
+            assert_eq!(in_place(&enc, &dir.path().join("a.gif"), f, Frames::Many), InPlace::Animated);
         }
         // a page inside a real archive has no file of its own
         let cbz = dir.path().join("book.cbz");
         std::fs::write(&cbz, b"PK").unwrap();
         let page = iv_pipeline::archive::entry_path(&cbz, "p/001.png");
-        assert_eq!(in_place(&enc, &page, FormatId::Png, false), InPlace::ArchivePage);
-        assert_eq!(in_place(&enc, &page, FormatId::Gif, true), InPlace::ArchivePage);
+        assert_eq!(in_place(&enc, &page, FormatId::Png, Frames::One), InPlace::ArchivePage);
+        assert_eq!(in_place(&enc, &page, FormatId::Gif, Frames::Many), InPlace::ArchivePage);
         // every refusal says why, in both languages
-        for kind in [InPlace::ArchivePage, InPlace::Animated, InPlace::NotWritable] {
+        for kind in [InPlace::ArchivePage, InPlace::Animated, InPlace::NotWritable, InPlace::NotLoaded] {
             assert!(kind.reason(&KO).is_some_and(|s| !s.is_empty()) && kind.reason(&EN).is_some());
         }
         assert_eq!(InPlace::Write(FormatId::Png).reason(&EN), None);
+    }
+
+    /// A 1x1 GIF with `frames` identical frames, 100 ms each.
+    fn gif(frames: usize) -> Vec<u8> {
+        // header, 1x1 screen with a two-colour global palette
+        let mut b = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00".to_vec();
+        for _ in 0..frames {
+            b.extend_from_slice(b"\x21\xf9\x04\x00\x0a\x00\x00\x00"); // graphic control: 100 ms
+            b.extend_from_slice(b"\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00"); // image descriptor
+            b.extend_from_slice(b"\x02\x02\x44\x01\x00"); // LZW: one pixel of colour 0
+        }
+        b.push(0x3b);
+        b
+    }
+
+    #[test]
+    fn a_frame_count_the_probe_cannot_give_is_never_saved_over() {
+        use iv_core::{CancelToken, Orientation, Source};
+        let enc = Encoders::default();
+        let registry = iv_codec::default_registry();
+        let path = tempfile::tempdir().unwrap().path().join("a.gif");
+        for (count, after_decode) in [(1, InPlace::Write(FormatId::Gif)), (3, InPlace::Animated)] {
+            let src = Source::from_bytes("a.gif", gif(count));
+            // what the viewer has between the probe and the full decode
+            let probed = registry.probe(&src).unwrap();
+            assert_eq!(frames(&probed, None), Frames::Unknown, "{count} frames");
+            assert_eq!(in_place(&enc, &path, probed.format, frames(&probed, None)), InPlace::NotLoaded);
+            // once the decode is in, the viewer's info is the decoded one
+            let decoded = registry.decode(&src, &CancelToken::never()).unwrap();
+            let known = frames(&decoded.info, Some(&decoded));
+            assert_eq!(in_place(&enc, &path, decoded.info.format, known), after_decode, "{count} frames");
+        }
+        // animated WebP and APNG probe without a count too; a probed count is trusted
+        let info = |format, frame_count| ImageInfo {
+            format,
+            codec: "test",
+            width: 1,
+            height: 1,
+            frame_count,
+            has_alpha: false,
+            bits_per_channel: 8,
+            orientation: Orientation::Normal,
+            icc_profile: None,
+            exif: None,
+        };
+        for f in [FormatId::Gif, FormatId::Webp, FormatId::Png] {
+            assert_eq!(in_place(&enc, &path, f, frames(&info(f, None), None)), InPlace::NotLoaded);
+            assert_eq!(in_place(&enc, &path, f, frames(&info(f, Some(2)), None)), InPlace::Animated);
+            assert_eq!(in_place(&enc, &path, f, frames(&info(f, Some(1)), None)), InPlace::Write(f));
+        }
+        // a format nothing can write says so, whatever its frame count
+        for f in [Frames::Unknown, Frames::Many, Frames::One] {
+            assert_eq!(in_place(&enc, &path, FormatId::Heif, f), InPlace::NotWritable);
+        }
+        // an animation over the size limit is decoded as its first frame without a count: the
+        // file still holds every frame, so it is not written over
+        let pixel = || iv_core::ImageBuf::new(1, 1, iv_core::PixelFormat::Rgba8, vec![0; 4]).unwrap();
+        let first_frame_only = Decoded::still(info(FormatId::Gif, None), pixel());
+        let known = frames(&first_frame_only.info, Some(&first_frame_only));
+        assert_eq!(in_place(&enc, &path, FormatId::Gif, known), InPlace::Animated);
+        // a decoded still with a count of one is written in place
+        let still = Decoded::still(info(FormatId::Png, Some(1)), pixel());
+        assert_eq!(frames(&still.info, Some(&still)), Frames::One);
     }
 }
