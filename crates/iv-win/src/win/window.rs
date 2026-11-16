@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BeginPaint, DIB_RGB_COLORS, EndPaint, GetMonitorInfoW, MONITOR_DEFAULTTONULL,
@@ -25,7 +25,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::Ime::{HIMC, ImmAssociateContextEx};
 use windows::Win32::UI::Shell::DragAcceptFiles;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::w;
+use windows::core::{PCWSTR, w};
 
 use super::app::App;
 use super::controls::scale;
@@ -236,6 +236,19 @@ fn visible_placement(p: WindowPlacement) -> Option<RECT> {
     }
 }
 
+/// The program's icon (resource 1, embedded by `build.rs`) at the size of the system metrics
+/// `cx` and `cy`, picked from the sizes in the file so it is sharp; Windows' generic program
+/// icon when the executable has none (a test binary).
+fn app_icon(instance: HINSTANCE, cx: SYSTEM_METRICS_INDEX, cy: SYSTEM_METRICS_INDEX) -> HICON {
+    unsafe {
+        let (w, h) = (GetSystemMetrics(cx), GetSystemMetrics(cy));
+        match LoadImageW(Some(instance), PCWSTR(1 as _), IMAGE_ICON, w, h, LR_DEFAULTCOLOR) {
+            Ok(icon) => HICON(icon.0),
+            Err(_) => LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+        }
+    }
+}
+
 /// Opens the window and runs until it closes. Returns the process exit code.
 pub fn run(opts: Options) -> i32 {
     unsafe {
@@ -267,7 +280,8 @@ pub fn run(opts: Options) -> i32 {
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+            hIcon: app_icon(instance.into(), SM_CXICON, SM_CYICON),
+            hIconSm: app_icon(instance.into(), SM_CXSMICON, SM_CYSMICON),
             lpszClassName: w!("iv-viewer"),
             ..Default::default()
         };

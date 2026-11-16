@@ -131,6 +131,11 @@ const DEFAULTS: &[(&str, Command)] = &[
     ("Ctrl+S", Command::FileSave),
     ("Ctrl+Shift+S", Command::FileSaveAs),
     ("Ctrl+E", Command::FileFixExtension),
+    ("Delete", Command::FileDelete),
+    ("Ctrl+C", Command::EditCopyImage),
+    ("Ctrl+Alt+C", Command::FileCopyFile),
+    ("Ctrl+Shift+C", Command::FileCopyPath),
+    ("Ctrl+Shift+E", Command::FileShowInFolder),
     ("R", Command::EditRotateCw),
     ("Ctrl+R", Command::EditRotateCw),
     ("L", Command::EditRotateCcw),
@@ -169,6 +174,7 @@ const DEFAULTS: &[(&str, Command)] = &[
     ("Alt+Enter", Command::ViewToggleFullscreen),
     ("F2", Command::AppSettings),
     ("F1", Command::AppHelp),
+    ("Shift+F1", Command::AppAbout),
     ("Esc", Command::Escape),
     ("Ctrl+W", Command::AppQuit),
     ("Ctrl+Q", Command::AppQuit),
@@ -328,6 +334,24 @@ mod chord_for_tests {
         assert_eq!(map.chord_for(Command::NavNext).unwrap().to_string(), "Right");
         let all: Vec<String> = map.chords_for(Command::NavNext).iter().map(Chord::to_string).collect();
         assert_eq!(all, ["Right", "Space", "Mouse5", "PageDown"]);
+    }
+
+    #[test]
+    fn file_and_clipboard_commands_have_the_usual_windows_keys() {
+        let map = Keymap::defaults();
+        let cmd = |chord: &str| map.lookup(&Chord::parse(chord).unwrap());
+        assert_eq!(cmd("Delete"), Some(Command::FileDelete));
+        assert_eq!(cmd("Del"), Some(Command::FileDelete));
+        assert_eq!(cmd("Ctrl+C"), Some(Command::EditCopyImage));
+        // Explorer's "Copy as path" key
+        assert_eq!(cmd("Ctrl+Shift+C"), Some(Command::FileCopyPath));
+        assert_eq!(cmd("Ctrl+Alt+C"), Some(Command::FileCopyFile));
+        assert_eq!(cmd("Ctrl+Shift+E"), Some(Command::FileShowInFolder));
+        assert_eq!(cmd("Shift+F1"), Some(Command::AppAbout));
+        // the keys they sit beside keep their meaning
+        assert_eq!(cmd("C"), Some(Command::EditCrop));
+        assert_eq!(cmd("Ctrl+E"), Some(Command::FileFixExtension));
+        assert_eq!(cmd("F1"), Some(Command::AppHelp));
     }
 
     #[test]

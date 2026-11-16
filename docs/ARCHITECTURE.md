@@ -245,8 +245,9 @@ export(source, edits, target_codec, options, dest):
 | 색 관리 | `moxcms` 0.9 (순수 Rust, `image`도 내부 사용) vs `lcms2` 6.2 (C 빌드) — M3에서 결정 |
 | 폴더 감시 | `notify` 8.2 |
 | 파일 대화상자 | `IFileDialog` 직접 호출 (M5까지 `rfd`) |
-| 휴지통 | `trash` 5.3 |
-| 클립보드 | `arboard` 3.7 |
+| 휴지통 | Win32 직접 (`SHFileOperationW`, `FOF_ALLOWUNDO`) — `trash` 크레이트는 쓰지 않음 |
+| 클립보드 | Win32 직접 (`CF_DIB`·`CF_DIBV5`·PNG·`CF_HDROP`·`CF_UNICODETEXT`) — `arboard`는 쓰지 않음 |
+| 아이콘·버전 리소스 | `build.rs`가 `.res`를 직접 씀 (`rc.exe`·`embed-resource` 없음) |
 | 압축파일 | `zip` 9.5, `sevenz-rust2` 0.25, `unrar` 0.5 (unRAR 라이선스 확인 필요) |
 
 ## 6. 개발 단계 (각 단계마다 측정·테스트로 완료 판정)
@@ -517,3 +518,11 @@ GPU를 쓰는 순간 드라이버(AMD `amdxc64.dll` 등)가 100 MB대 바닥을 
 - JPEG 디코더: `zune-jpeg` vs libjpeg-turbo — M0 벤치마크로 결정
 - RAR 지원 여부: unRAR 라이선스 조건 검토 후 결정
 - 런타임 플러그인 필요 여부: M5 이후 실제 수요로 판단
+
+### 출시 전 점검: 빠진 기본 기능 (2026-11-17)
+
+- 휴지통으로 옮기기(Delete, `file.delete`): `SHFileOperationW`(`FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING`). 묻기는 뷰어가 직접(설정 "휴지통으로 옮기기 전에 묻기", 기본 켬; 저장하지 않은 편집이 있으면 설정과 관계없이 묻음). 휴지통에 넣을 수 없는 파일(네트워크 드라이브 등)은 셸이 "영구 삭제" 경고를 띄움. 성공 판정은 반환값이 아니라 파일이 실제로 없어졌는지. 그 뒤 `FolderList::remove`로 목록에서 빼고 캐시를 비운 뒤 다음 이미지(마지막이었으면 새 마지막)를 보여 줌, 폴더가 비면 빈 창. 폴더 목록이 아직 안 왔으면 그 자리에서 폴더를 읽고 `index_after`로 다음 이미지를 찾음. 압축파일 안의 페이지·저장 중에는 하지 않음
+- 클립보드: 이미지 복사(Ctrl+C, `edit.copy_image`)는 화면 그대로(편집 적용, 애니메이션은 지금 프레임) `iv_ops::apply::render` → 24비트 `CF_DIB`(투명 부분은 흰색과 합성). 투명한 이미지는 알파가 있는 `CF_DIBV5`(sRGB, straight alpha)와 `PNG` 형식도 함께. 파일 복사(Ctrl+Alt+C, `file.copy_file`)는 `CF_HDROP` + `Preferred DropEffect = 복사`(탐색기에 붙여 넣으면 복사, 채팅에는 첨부), 경로 복사(Ctrl+Shift+C, `file.copy_path`)는 텍스트(압축파일 페이지는 뷰어가 여는 가상 경로). 바이트 만들기는 `iv_win::clipboard`(창 없이 테스트)
+- 폴더에서 보기(Ctrl+Shift+E, `file.show_in_folder`): `SHOpenFolderAndSelectItems`로 탐색기에서 파일 선택(압축파일 페이지는 압축파일). `explorer /select,` 명령줄은 쉼표·공백 따옴표 문제로 쓰지 않음
+- 아이콘·버전: 아이콘은 코드로 그림(`src/app_icon.rs`, 16~256 px 8가지, 8×8 슈퍼샘플링, PNG 이미지로 15 KB)이고 `res/app.ico`가 그 그림과 픽셀 단위로 같은지 테스트가 확인(`IV_WRITE_ICON=1`로 다시 씀). `build.rs`가 `res/winres.rs`로 아이콘 그룹 + `VERSIONINFO`(Cargo.toml 버전, FileDescription·ProductName 등)를 담은 `.res`를 직접 써서 링커에 넘김 → 탐색기·작업 표시줄·"연결 프로그램"·속성 > 자세히에 이름·버전·아이콘. 창 클래스는 `LoadImageW`로 큰·작은 아이콘을 시스템 크기에 맞게. 정보(Shift+F1, `app.about`): 버전·설정 폴더·기록 폴더. `--version`(`-V`)은 두 실행 파일 모두, 콘솔 없는 릴리스 빌드는 실행한 콘솔에 붙어서 출력
+- "연결 프로그램" 등록: 설정 창의 등록/등록 해제 버튼 또는 `--register`/`--unregister`. `HKEY_CURRENT_USER`만(관리자 권한 없음): `Software\Classes\Applications\image-viewer.exe`(FriendlyAppName, SupportedTypes, open 명령), ProgID `ImageViewer.Image`·`ImageViewer.Archive`(형식 이름, 아이콘, open 명령), 확장자마다 `.<ext>\OpenWithProgids`, `Software\image-viewer\Capabilities` + `RegisteredApplications`(기본 앱 목록). 확장자 목록은 코덱 레지스트리(`FormatId`)와 압축파일 읽기에서. 해제는 등록한 것만 지움: 뷰어 전용 키는 통째로, 다른 프로그램과 함께 쓰는 키(`.jpg\OpenWithProgids` 등)는 뷰어 값만 지우고 비었을 때만 키 삭제. `UserChoice`(사용자가 고른 기본 앱)는 건드리지 않음 — Windows 10/11에서는 프로그램이 스스로 기본 앱이 될 수 없으므로 "기본 앱 설정…" 버튼으로 설정 > 기본 앱을 엶. 쓸 값·지울 값 계획은 `iv_win::assoc`(플랫폼 독립 테스트), 실제 레지스트리 왕복은 `HKCU\Software\image-viewer-test-*` 임시 키에서 테스트

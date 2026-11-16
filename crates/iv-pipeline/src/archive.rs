@@ -33,6 +33,11 @@ fn kind(path: &Path) -> Option<Kind> {
     }
 }
 
+/// Every archive extension this module opens (lowercase, without the dot).
+pub fn extensions() -> impl Iterator<Item = &'static str> {
+    ZIP.iter().chain(SEVEN_Z).copied()
+}
+
 /// Whether `path` names an archive this module can open (by extension).
 pub fn is_archive(path: &Path) -> bool {
     kind(path).is_some()

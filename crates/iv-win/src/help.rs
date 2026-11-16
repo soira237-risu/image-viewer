@@ -7,11 +7,16 @@ use crate::keymap::{Chord, Keymap};
 use crate::wheel::{WheelUse, wheel_use};
 
 /// Commands in the order the help lists them: files, browsing, view, editing, windows.
-const ORDER: [Command; 27] = [
+const ORDER: [Command; 33] = [
     Command::FileOpen,
     Command::FileSave,
     Command::FileSaveAs,
     Command::FileFixExtension,
+    Command::FileDelete,
+    Command::EditCopyImage,
+    Command::FileCopyFile,
+    Command::FileCopyPath,
+    Command::FileShowInFolder,
     Command::NavNext,
     Command::NavPrev,
     Command::NavFirst,
@@ -33,6 +38,7 @@ const ORDER: [Command; 27] = [
     Command::ViewToggleEditPanel,
     Command::AppSettings,
     Command::AppHelp,
+    Command::AppAbout,
     Command::Escape,
     Command::AppQuit,
 ];

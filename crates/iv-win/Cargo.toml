@@ -26,3 +26,5 @@ windows.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 bytemuck.workspace = true
+# the app icon's generator and its check (src/app_icon.rs)
+png.workspace = true

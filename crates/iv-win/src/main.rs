@@ -1,4 +1,8 @@
 //! image-viewer: `image-viewer [--trace] [--no-activate] [--keymap <file.toml>] [--settings <file.toml>] [file]`
+//!
+//! Also `image-viewer --version` (prints the version) and `image-viewer --register` /
+//! `--unregister` (lists the viewer in Windows' "Open with" and Default apps for the current
+//! user, or removes it; the settings window has the same buttons).
 
 // no console window for release builds launched from Explorer
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -10,7 +14,29 @@ use iv_win::diag;
 use iv_win::keymap::Keymap;
 use iv_win::settings::Settings;
 use iv_win::trace::Trace;
+use iv_win::win::shell;
 use iv_win::win::window::{Options, run};
+use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+
+/// A flag that does its job and exits instead of opening the window.
+#[derive(Clone, Copy)]
+enum Action {
+    Version,
+    /// `true`: register for "Open with"; `false`: remove that registration.
+    Register(bool),
+}
+
+/// Prints a line for a command-line flag. A release build has no console of its own, so it
+/// borrows the one it was started from, if any; output redirected to a file or pipe needs none.
+fn console_line(text: &str) {
+    use std::io::Write;
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{text}");
+    let _ = out.flush();
+}
 
 fn config_dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("image-viewer"))
@@ -25,6 +51,7 @@ fn main() {
     let mut keymap_path: Option<PathBuf> = None;
     let mut settings_path: Option<PathBuf> = None;
     let mut file = None;
+    let mut action: Option<Action> = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--keymap" {
@@ -35,9 +62,19 @@ fn main() {
             trace_enabled = true;
         } else if arg == "--no-activate" {
             no_activate = true;
+        } else if arg == "--version" || arg == "-V" {
+            action = Some(Action::Version);
+        } else if arg == "--register" {
+            action = Some(Action::Register(true));
+        } else if arg == "--unregister" {
+            action = Some(Action::Register(false));
         } else {
             file = Some(PathBuf::from(arg));
         }
+    }
+    if let Some(Action::Version) = action {
+        console_line(&format!("image-viewer {}", env!("CARGO_PKG_VERSION")));
+        return;
     }
     let trace = Trace::new(start, trace_enabled);
 
@@ -54,6 +91,13 @@ fn main() {
         Some(p) => Settings::load(p),
         None => (Settings::default(), None),
     };
+    if let Some(Action::Register(on)) = action {
+        let result = if on { shell::register(settings.language.strings()) } else { shell::unregister() };
+        if let Err(e) = &result {
+            console_line(&format!("image-viewer: {e}"));
+        }
+        std::process::exit(i32::from(result.is_err()));
+    }
     if let Some(w) = &warning {
         diag::log(&format!("settings: {w}"));
     }

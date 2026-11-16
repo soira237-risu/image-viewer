@@ -19,6 +19,12 @@ const ITEMS: &[Option<Command>] = &[
     Some(Command::FileSaveAs),
     Some(Command::FileFixExtension),
     None,
+    Some(Command::EditCopyImage),
+    Some(Command::FileCopyFile),
+    Some(Command::FileCopyPath),
+    Some(Command::FileShowInFolder),
+    Some(Command::FileDelete),
+    None,
     Some(Command::NavNext),
     Some(Command::NavPrev),
     Some(Command::NavFirst),
@@ -43,6 +49,7 @@ const ITEMS: &[Option<Command>] = &[
     Some(Command::ViewToggleEditPanel),
     Some(Command::AppSettings),
     Some(Command::AppHelp),
+    Some(Command::AppAbout),
     None,
     Some(Command::AppQuit),
 ];
@@ -60,6 +67,13 @@ pub struct MenuState {
     pub has_selection: bool,
     /// A folder or archive with more than one image is open.
     pub can_navigate: bool,
+    /// An image is current (its path can be copied or shown in Explorer).
+    pub has_path: bool,
+    /// The current image is a file of its own on disk, not a page inside an archive (it can be
+    /// deleted or copied as a file).
+    pub on_disk: bool,
+    /// The current image is fully decoded (it can be copied as pixels).
+    pub loaded: bool,
 }
 
 /// Menu id of a command (ids start at 1; 0 means "nothing chosen").
@@ -93,6 +107,9 @@ fn flags_for(cmd: Command, s: &MenuState) -> MENU_ITEM_FLAGS {
         Command::EditRedo => s.can_redo,
         Command::ViewToggleDirection => s.spread.is_some(),
         Command::NavNext | Command::NavPrev | Command::NavFirst | Command::NavLast => s.can_navigate,
+        Command::FileCopyPath | Command::FileShowInFolder => s.has_path,
+        Command::FileDelete | Command::FileCopyFile => s.on_disk,
+        Command::EditCopyImage => s.loaded,
         _ => true,
     };
     let mut f = MF_STRING;

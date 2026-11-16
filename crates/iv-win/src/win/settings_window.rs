@@ -27,13 +27,22 @@ const ID_SAVE: i32 = 107;
 const ID_DEFAULTS: i32 = 108;
 const ID_LANGUAGE: i32 = 109;
 const ID_WHEEL: i32 = 110;
+const ID_CONFIRM_DELETE: i32 = 111;
+const ID_REGISTER: i32 = 112;
+const ID_UNREGISTER: i32 = 113;
+const ID_DEFAULT_APPS: i32 = 114;
 const ID_CANCEL: i32 = 2;
 
 const WIDTH: i32 = 360;
-const HEIGHT: i32 = 360;
+const HEIGHT: i32 = 446;
 
 /// A label in the current language, so controls can be relabelled when it changes.
 type Text = fn(&Strings) -> &'static str;
+
+/// The program's version (from Cargo.toml).
+fn version_text(s: &Strings) -> String {
+    crate::i18n::fill(s.version, &[("version", env!("CARGO_PKG_VERSION"))])
+}
 
 struct Window {
     hwnd: HWND,
@@ -43,9 +52,11 @@ struct Window {
     wrap: HWND,
     rtl: HWND,
     wheel: HWND,
+    confirm_delete: HWND,
     nearest: HWND,
     quality: HWND,
     swatch: HWND,
+    version: HWND,
     /// Controls showing translated text.
     texts: Vec<(HWND, Text)>,
     /// Every control, for laying the window out again on a DPI change.
@@ -136,19 +147,41 @@ fn create(owner: HWND, s: &Strings) -> windows::core::Result<Window> {
         let wrap = check(|s| s.wrap, 104, ID_WRAP)?;
         let rtl = check(|s| s.spread_rtl, 130, ID_RTL)?;
         let wheel = check(|s| s.wheel_navigates, 156, ID_WHEEL)?;
-        label(|s| s.sharp_pixels, 184)?;
-        let nearest = field(184, ID_NEAREST, false)?;
-        label(|s| s.save_quality_range, 214)?;
-        let quality = field(214, ID_QUALITY, true)?;
-        label(|s| s.background, 246)?;
-        let swatch = b.add(w!("STATIC"), "", SS_SUNKEN.0, 240, 244, 40, 24, 0)?;
-        button(|s| s.choose, 286, 243, 62, ID_COLOUR)?;
-        keep(b.add(w!("STATIC"), s.cache_note, 0, 12, 282, 336, 18, 0)?, |s| s.cache_note);
-        button(|s| s.save, 156, 318, 92, ID_SAVE)?;
-        button(|s| s.defaults, 256, 318, 92, ID_DEFAULTS)?;
+        let confirm_delete = check(|s| s.confirm_delete, 182, ID_CONFIRM_DELETE)?;
+        label(|s| s.sharp_pixels, 210)?;
+        let nearest = field(210, ID_NEAREST, false)?;
+        label(|s| s.save_quality_range, 240)?;
+        let quality = field(240, ID_QUALITY, true)?;
+        label(|s| s.background, 272)?;
+        let swatch = b.add(w!("STATIC"), "", SS_SUNKEN.0, 240, 270, 40, 24, 0)?;
+        button(|s| s.choose, 286, 269, 62, ID_COLOUR)?;
+        keep(b.add(w!("STATIC"), s.cache_note, 0, 12, 308, 336, 18, 0)?, |s| s.cache_note);
+        // registration acts at once (it is not a setting kept in the file)
+        keep(b.add(w!("STATIC"), s.open_with, 0, 12, 338, 336, 18, 0)?, |s| s.open_with);
+        button(|s| s.register, 12, 360, 100, ID_REGISTER)?;
+        button(|s| s.unregister, 118, 360, 100, ID_UNREGISTER)?;
+        button(|s| s.default_apps, 224, 360, 124, ID_DEFAULT_APPS)?;
+        let version = b.add(w!("STATIC"), &version_text(s), 0, 12, 409, 140, 18, 0)?;
+        button(|s| s.save, 156, 404, 92, ID_SAVE)?;
+        button(|s| s.defaults, 256, 404, 92, ID_DEFAULTS)?;
         let texts = texts.into_inner();
         let layout = b.finish();
-        Ok(Window { hwnd, language, prefetch, cache, wrap, rtl, wheel, nearest, quality, swatch, texts, layout })
+        Ok(Window {
+            hwnd,
+            language,
+            prefetch,
+            cache,
+            wrap,
+            rtl,
+            wheel,
+            confirm_delete,
+            nearest,
+            quality,
+            swatch,
+            version,
+            texts,
+            layout,
+        })
     }
 }
 
@@ -181,6 +214,7 @@ fn fill(s: &Settings) {
         controls::set_checked(w.wrap, s.wrap);
         controls::set_checked(w.rtl, s.spread_right_to_left);
         controls::set_checked(w.wheel, s.wheel_navigates);
+        controls::set_checked(w.confirm_delete, s.confirm_delete);
         controls::set_text(w.nearest, &format!("{}", s.nearest_above_zoom));
         controls::set_text(w.quality, &s.save_quality.to_string());
         let index = Language::ALL.iter().position(|l| *l == s.language).unwrap_or(0);
@@ -219,6 +253,7 @@ pub fn set_language(s: &Strings) {
         for (h, text) in &w.texts {
             controls::set_text(*h, text(s));
         }
+        controls::set_text(w.version, &version_text(s));
     });
 }
 
@@ -252,6 +287,7 @@ fn read(prev: &Settings) -> Settings {
         s.wrap = controls::checked(w.wrap);
         s.spread_right_to_left = controls::checked(w.rtl);
         s.wheel_navigates = controls::checked(w.wheel);
+        s.confirm_delete = controls::checked(w.confirm_delete);
         let index = unsafe { SendMessageW(w.language, CB_GETCURSEL, None, None).0 };
         if let Some(l) = usize::try_from(index).ok().and_then(|i| Language::ALL.get(i)) {
             s.language = *l;
@@ -303,7 +339,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             let current = VALUE.with(|v| v.borrow().clone());
             match (id, code) {
                 (ID_PREFETCH | ID_CACHE | ID_NEAREST | ID_QUALITY, EN_CHANGE)
-                | (ID_WRAP | ID_RTL | ID_WHEEL, BN_CLICKED)
+                | (ID_WRAP | ID_RTL | ID_WHEEL | ID_CONFIRM_DELETE, BN_CLICKED)
                 | (ID_LANGUAGE, CBN_SELCHANGE) => {
                     changed(read(&current));
                 }
@@ -324,6 +360,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     fill(&current);
                     post_ui(UiEvent::SettingsSave);
                 }
+                (ID_REGISTER, BN_CLICKED) => post_ui(UiEvent::Register(true)),
+                (ID_UNREGISTER, BN_CLICKED) => post_ui(UiEvent::Register(false)),
+                (ID_DEFAULT_APPS, BN_CLICKED) => post_ui(UiEvent::OpenDefaultApps),
                 (ID_CANCEL, _) => post_ui(UiEvent::SettingsClosed),
                 _ => {}
             }

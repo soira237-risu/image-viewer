@@ -9,6 +9,16 @@ pub enum Command {
     FileSaveAs,
     /// Rename the file so its extension matches its content (a WebP named `.jpg`).
     FileFixExtension,
+    /// Move the current file to the Recycle Bin (asking first) and show the next image.
+    FileDelete,
+    /// Put the file itself on the clipboard, for pasting in Explorer or a chat.
+    FileCopyFile,
+    /// Put the full path of the current file on the clipboard as text.
+    FileCopyPath,
+    /// Open the folder holding the current file in Explorer, with the file selected.
+    FileShowInFolder,
+    /// Put the image as shown (with its edits) on the clipboard.
+    EditCopyImage,
     EditRotateCw,
     EditRotateCcw,
     EditFlipH,
@@ -36,17 +46,24 @@ pub enum Command {
     AppSettings,
     /// The keyboard and mouse help window.
     AppHelp,
+    /// Name, version and where the settings and logs are.
+    AppAbout,
     /// Clear the selection; else leave full screen; else quit.
     Escape,
     AppQuit,
 }
 
 impl Command {
-    pub const ALL: [Command; 27] = [
+    pub const ALL: [Command; 33] = [
         Command::FileOpen,
         Command::FileSave,
         Command::FileSaveAs,
         Command::FileFixExtension,
+        Command::FileDelete,
+        Command::FileCopyFile,
+        Command::FileCopyPath,
+        Command::FileShowInFolder,
+        Command::EditCopyImage,
         Command::EditRotateCw,
         Command::EditRotateCcw,
         Command::EditFlipH,
@@ -68,6 +85,7 @@ impl Command {
         Command::ViewToggleDirection,
         Command::AppSettings,
         Command::AppHelp,
+        Command::AppAbout,
         Command::Escape,
         Command::AppQuit,
     ];
@@ -78,6 +96,11 @@ impl Command {
             Command::FileSave => "file.save",
             Command::FileSaveAs => "file.save_as",
             Command::FileFixExtension => "file.fix_extension",
+            Command::FileDelete => "file.delete",
+            Command::FileCopyFile => "file.copy_file",
+            Command::FileCopyPath => "file.copy_path",
+            Command::FileShowInFolder => "file.show_in_folder",
+            Command::EditCopyImage => "edit.copy_image",
             Command::EditRotateCw => "edit.rotate_cw",
             Command::EditRotateCcw => "edit.rotate_ccw",
             Command::EditFlipH => "edit.flip_h",
@@ -99,6 +122,7 @@ impl Command {
             Command::ViewToggleDirection => "view.toggle_direction",
             Command::AppSettings => "app.settings",
             Command::AppHelp => "app.help",
+            Command::AppAbout => "app.about",
             Command::Escape => "app.escape",
             Command::AppQuit => "app.quit",
         }

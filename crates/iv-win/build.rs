@@ -1,13 +1,51 @@
-//! Embeds the application manifest in the viewer: version 6 of the common controls (themed
-//! buttons, trackbars and fields) and per-monitor DPI awareness.
+//! Windows resources of the viewer's executable:
+//! - the application manifest: version 6 of the common controls (themed buttons, trackbars and
+//!   fields) and per-monitor DPI awareness;
+//! - the icon (`res/app.ico`) and the version information (from Cargo.toml), written as a `.res`
+//!   file that the linker takes directly, so no resource compiler is needed.
+
+// the .ico writer in it is for the icon's generator (a test), not for the build
+#[allow(dead_code)]
+#[path = "res/winres.rs"]
+mod winres;
+
+use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
-        println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
-        println!(
-            "cargo:rustc-link-arg-bins=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' \
-             version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
-        );
+    println!("cargo:rerun-if-changed=res/app.ico");
+    println!("cargo:rerun-if-changed=res/winres.rs");
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+        return;
     }
+    println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+    println!(
+        "cargo:rustc-link-arg-bins=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' \
+         version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
+    );
+
+    let number = |key: &str| -> u16 {
+        let v = std::env::var(key).unwrap_or_default();
+        v.parse().unwrap_or_else(|_| panic!("{key} is not a number: {v:?}"))
+    };
+    let version =
+        [number("CARGO_PKG_VERSION_MAJOR"), number("CARGO_PKG_VERSION_MINOR"), number("CARGO_PKG_VERSION_PATCH"), 0];
+    let text = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
+    let info = winres::version_info(
+        version,
+        &[
+            ("FileDescription", "image-viewer"),
+            ("ProductName", "image-viewer"),
+            ("InternalName", "image-viewer"),
+            ("OriginalFilename", "image-viewer.exe"),
+            ("FileVersion", &text),
+            ("ProductVersion", &text),
+            ("Comments", "A small, fast image viewer for Windows"),
+        ],
+    );
+    let ico = std::fs::read("res/app.ico").expect("res/app.ico");
+    let res = winres::resource_file(&ico, &info).unwrap_or_else(|e| panic!("res/app.ico: {e}"));
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("image-viewer.res");
+    std::fs::write(&out, res).unwrap_or_else(|e| panic!("{}: {e}", out.display()));
+    println!("cargo:rustc-link-arg-bins={}", out.display());
 }

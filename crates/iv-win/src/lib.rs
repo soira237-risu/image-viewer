@@ -1,7 +1,12 @@
 //! The image viewer on plain Win32. Everything here except `win` is platform independent and
 //! tested without a window: the CPU renderer, view math, commands, key bindings, settings,
-//! editing helpers, help contents and wheel handling.
+//! editing helpers, help contents, wheel handling, clipboard data and the "Open with"
+//! registration plan.
 
+#[cfg(test)]
+mod app_icon;
+pub mod assoc;
+pub mod clipboard;
 pub mod commands;
 pub mod diag;
 pub mod edit;

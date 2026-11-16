@@ -796,6 +796,7 @@ dependencies = [
  "iv-core",
  "iv-ops",
  "iv-pipeline",
+ "png",
  "rayon",
  "serde",
  "tempfile",

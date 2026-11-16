@@ -1,5 +1,5 @@
-//! Windows' own dialogs: file open/save (`IFileDialog`), the yes/no/cancel question, and the
-//! colour picker.
+//! Windows' own dialogs: file open/save (`IFileDialog`), questions and messages, and the colour
+//! picker.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,8 @@ use windows::Win32::UI::Shell::{
     SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    IDNO, IDYES, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNOCANCEL, MESSAGEBOX_STYLE, MessageBoxW,
+    IDNO, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL, MESSAGEBOX_STYLE,
+    MessageBoxW,
 };
 use windows::core::PCWSTR;
 
@@ -114,8 +115,17 @@ pub fn ask_yes_no_cancel(owner: HWND, text: &str) -> Answer {
     }
 }
 
+/// A yes/no question with Yes as the default button; `true` for Yes.
+pub fn ask_yes_no(owner: HWND, text: &str) -> bool {
+    message_box(owner, text, MB_YESNO | MB_ICONWARNING) == IDYES
+}
+
 pub fn show_error(owner: HWND, text: &str) {
     message_box(owner, text, MB_OK | MB_ICONERROR);
+}
+
+pub fn show_info(owner: HWND, text: &str) {
+    message_box(owner, text, MB_OK | MB_ICONINFORMATION);
 }
 
 /// An error box with no owner window, shown from a thread of its own and waited for: the

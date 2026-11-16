@@ -25,7 +25,9 @@ use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::dialogs::{self, Answer, Filter};
+use super::shell::{self, Clip};
 use super::{UiEvent, help, keys, menu, panel, settings_window, wake, wide};
+use crate::clipboard;
 use crate::commands::Command;
 use crate::diag;
 use crate::edit::{
@@ -879,6 +881,12 @@ impl App {
             Command::FileSave => self.save_in_place(None),
             Command::FileSaveAs => self.save_as(None),
             Command::FileFixExtension => self.fix_extension(),
+            Command::FileDelete => self.delete_current(),
+            Command::FileCopyFile => self.copy_file(),
+            Command::FileCopyPath => self.copy_path(),
+            Command::FileShowInFolder => self.show_in_folder(),
+            Command::EditCopyImage => self.copy_image(),
+            Command::AppAbout => self.about(),
             Command::EditRotateCw => self.edit(Op::rotate_cw()),
             Command::EditRotateCcw => self.edit(Op::rotate_ccw()),
             Command::EditFlipH => self.edit(Op::flip_h()),
@@ -979,7 +987,7 @@ impl App {
         let Some(hwnd) = self.hwnd else { return };
         let mut patterns: Vec<String> =
             FormatId::ALL.iter().flat_map(|f| f.extensions().iter().map(|e| format!("*.{e}"))).collect();
-        patterns.extend(["*.zip", "*.cbz", "*.7z", "*.cb7"].map(String::from));
+        patterns.extend(iv_pipeline::archive::extensions().map(|e| format!("*.{e}")));
         let filters = [
             Filter { name: self.t().filter_images.into(), patterns: patterns.join(";") },
             Filter { name: self.t().filter_all.into(), patterns: "*.*".into() },
@@ -1110,6 +1118,25 @@ impl App {
             UiEvent::HelpClosed => {
                 self.help_open = false;
                 help::hide();
+            }
+            UiEvent::Register(on) => {
+                let t = self.t();
+                let result = if on { shell::register(t) } else { shell::unregister() };
+                self.trace
+                    .mark(&format!("open-with registration {}: {result:?}", if on { "added" } else { "removed" }));
+                match result {
+                    Ok(()) => self.set_notice(if on { t.registered } else { t.unregistered }.into()),
+                    Err(e) => {
+                        diag::log(&format!("open-with registration: {e}"));
+                        self.set_notice(fill(t.register_failed, &[("error", &e)]));
+                    }
+                }
+            }
+            UiEvent::OpenDefaultApps => {
+                let Some(hwnd) = self.hwnd else { return };
+                if let Err(e) = shell::open_uri(hwnd, shell::DEFAULT_APPS_URI) {
+                    self.set_notice(fill(self.t().default_apps_failed, &[("error", &e)]));
+                }
             }
         }
     }
@@ -1547,6 +1574,189 @@ impl App {
     }
 }
 
+/// The file in the shell: Recycle Bin, clipboard, Explorer, About.
+impl App {
+    /// The current file as a full path: the shell resolves relative paths against whatever its
+    /// current folder is, which need not be the one the path was given in.
+    fn current_file(&self) -> Option<PathBuf> {
+        let path = &self.current.as_ref()?.path;
+        Some(std::path::absolute(path).unwrap_or_else(|_| path.clone()))
+    }
+
+    /// Moves the current file to the Recycle Bin, asking first (always when it has unsaved
+    /// edits, else as the settings say), and shows the image that followed it in its folder.
+    fn delete_current(&mut self) {
+        if self.busy_saving() {
+            return;
+        }
+        let (Some(hwnd), Some(path)) = (self.hwnd, self.current_file()) else { return };
+        if iv_pipeline::archive::split(&path).is_some() {
+            return self.set_notice(self.t().archive_page_delete.into());
+        }
+        let t = self.t();
+        let name = file_name(&path);
+        let edited = !self.edits.is_empty();
+        if self.settings.confirm_delete || edited {
+            let mut question = fill(t.delete_confirm, &[("name", &name)]);
+            if edited {
+                question = format!("{question}\n\n{}", t.delete_unsaved);
+            }
+            if !dialogs::ask_yes_no(hwnd, &question) {
+                return;
+            }
+        }
+        match shell::recycle(hwnd, &path) {
+            Ok(()) => {
+                self.trace.mark(&format!("moved to the Recycle Bin: {}", path.display()));
+                self.deleted(&path);
+                self.set_notice(fill(t.deleted, &[("name", &name)]));
+            }
+            Err(e) => {
+                diag::log(&format!("{}: not deleted: {e}", path.display()));
+                self.set_notice(fill(t.delete_failed, &[("name", &name)]));
+            }
+        }
+    }
+
+    /// The current file is gone: it leaves the folder list and the cache, its edits are
+    /// dropped, and the image that followed it (or the new last one) becomes current. An emptied
+    /// folder leaves the window empty.
+    fn deleted(&mut self, path: &Path) {
+        let deleted = self.current.as_ref().map_or_else(|| path.to_path_buf(), |c| c.path.clone());
+        self.pipeline.invalidate(&deleted);
+        self.edits.clear();
+        self.selection = None;
+        let next = match self.folder.as_mut() {
+            Some(folder) => folder
+                .remove(&deleted)
+                .or_else(|| folder.index_after(&deleted))
+                .map(|i| i.min(folder.len().saturating_sub(1))),
+            None => {
+                // the folder listing has not come back yet (it was for the deleted file and
+                // will be dropped as stale): list the folder now
+                let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+                match FolderList::scan(dir) {
+                    Ok(list) => {
+                        let at = list.index_after(path);
+                        self.folder = Some(list);
+                        at
+                    }
+                    Err(e) => {
+                        diag::log(&format!("cannot list {} after deleting: {e}", dir.display()));
+                        None
+                    }
+                }
+            }
+        };
+        let next_path = next.and_then(|i| Some((i, self.folder.as_ref()?.get(i)?.to_path_buf())));
+        // whatever is shown now belongs to the deleted file
+        self.current = None;
+        match next_path {
+            Some((i, next)) => {
+                self.index = Some(i);
+                self.direction = 1;
+                self.request(next);
+            }
+            None => {
+                self.folder = None;
+                self.index = None;
+                self.display = None;
+                self.error = None;
+                self.after_image_change();
+                self.update_title();
+            }
+        }
+    }
+
+    /// The image as it is shown, with its edits (and the frame on screen, for an animation), on
+    /// the clipboard: as a plain bitmap for every program and, when it has transparency, as a
+    /// bitmap with alpha and as PNG for the programs that keep it.
+    fn copy_image(&mut self) {
+        let Some(hwnd) = self.hwnd else { return };
+        let Some(cur) = &self.current else { return };
+        let Some(full) = cur.full.clone() else { return self.set_notice(self.t().copy_not_loaded.into()) };
+        let frame = self
+            .display
+            .as_ref()
+            .filter(|d| d.path == cur.path)
+            .and_then(|d| d.playback.as_ref())
+            .and_then(|p| Some(&full.animation.as_ref()?.frames.get(p.frame)?.image));
+        let image = frame.unwrap_or(&full.image);
+        let g = Geometry::new((image.width(), image.height()), full.info.orientation, self.edits.active());
+        let result = iv_ops::apply::render(image, &g).map_err(|e| e.to_string()).and_then(|edited| {
+            let (w, h) = (edited.width(), edited.height());
+            let rgba = edited.to_rgba8();
+            let mut items = vec![Clip::Standard(clipboard::CF_DIB, clipboard::dib(&rgba, w, h, [255; 3]))];
+            if !edited.is_opaque() {
+                items.push(Clip::Standard(clipboard::CF_DIBV5, clipboard::dibv5(&rgba, w, h)));
+                if let Some(png) = self.encoders.for_format(FormatId::Png) {
+                    let prepared = iv_codec::encode::prepare(&edited, png.info(), [255; 3]);
+                    match png.encode(&prepared, &Default::default(), &Default::default()) {
+                        Ok(bytes) => items.push(Clip::Named(clipboard::PNG_FORMAT, bytes)),
+                        Err(e) => diag::log(&format!("clipboard PNG not made: {e}")),
+                    }
+                }
+            }
+            drop(rgba);
+            drop(edited);
+            shell::set_clipboard(hwnd, items).map(|()| (w, h))
+        });
+        let t = self.t();
+        match result {
+            Ok((w, h)) => {
+                self.trace.mark(&format!("copied the image {w}x{h}"));
+                self.set_notice(fill(t.copied_image, &[("width", &w.to_string()), ("height", &h.to_string())]));
+            }
+            Err(e) => self.set_notice(fill(t.clipboard_failed, &[("error", &e)])),
+        }
+    }
+
+    /// The current file itself on the clipboard (pasting in Explorer copies it).
+    fn copy_file(&mut self) {
+        let (Some(hwnd), Some(path)) = (self.hwnd, self.current_file()) else { return };
+        let t = self.t();
+        if iv_pipeline::archive::split(&path).is_some() {
+            return self.set_notice(t.archive_page_copy_file.into());
+        }
+        match shell::copy_file(hwnd, &path) {
+            Ok(()) => self.set_notice(t.copied_file.into()),
+            Err(e) => self.set_notice(fill(t.clipboard_failed, &[("error", &e)])),
+        }
+    }
+
+    /// The current file's full path as text. A page inside an archive has the path the viewer
+    /// itself opens: the archive's path followed by the page's name.
+    fn copy_path(&mut self) {
+        let (Some(hwnd), Some(path)) = (self.hwnd, self.current_file()) else { return };
+        let t = self.t();
+        match shell::copy_text(hwnd, &path.to_string_lossy()) {
+            Ok(()) => self.set_notice(t.copied_path.into()),
+            Err(e) => self.set_notice(fill(t.clipboard_failed, &[("error", &e)])),
+        }
+    }
+
+    /// Explorer, in the current file's folder with the file selected (for a page inside an
+    /// archive: the archive).
+    fn show_in_folder(&mut self) {
+        let Some(path) = self.current_file() else { return };
+        let target = iv_pipeline::archive::split(&path).map_or(path, |(archive, _)| archive);
+        if let Err(e) = shell::show_in_folder(&target) {
+            self.set_notice(fill(self.t().show_in_folder_failed, &[("error", &e)]));
+        }
+    }
+
+    /// Name, version, and where the settings and the diagnostic log are kept.
+    fn about(&mut self) {
+        let Some(hwnd) = self.hwnd else { return };
+        let folder = |d: Option<&Path>| d.map_or_else(|| "-".to_string(), |d| d.display().to_string());
+        let config = folder(self.settings_path.as_deref().and_then(Path::parent));
+        let logs = folder(diag::default_dir().as_deref());
+        let text =
+            fill(self.t().about_text, &[("version", env!("CARGO_PKG_VERSION")), ("config", &config), ("logs", &logs)]);
+        dialogs::show_info(hwnd, &text);
+    }
+}
+
 impl Drop for App {
     /// A save the user asked for always finishes, even when the window closed under it (the
     /// process would otherwise end and kill the save thread, leaving the file unsaved).
@@ -1716,6 +1926,9 @@ impl App {
             edited: !self.edits.is_empty(),
             has_selection: self.selection.is_some(),
             can_navigate: self.folder.as_ref().is_some_and(|f| f.len() > 1) && self.index.is_some(),
+            has_path: self.current.is_some(),
+            on_disk: self.current.as_ref().is_some_and(|c| iv_pipeline::archive::split(&c.path).is_none()),
+            loaded: self.current.as_ref().is_some_and(|c| c.full.is_some()),
         }
     }
 

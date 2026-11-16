@@ -31,6 +31,8 @@ pub struct Settings {
     /// The plain mouse wheel moves to the previous / next image (Ctrl+wheel zooms); off: the
     /// wheel zooms at the cursor.
     pub wheel_navigates: bool,
+    /// Ask before moving a file to the Recycle Bin (Delete). Unsaved edits are always asked about.
+    pub confirm_delete: bool,
 }
 
 /// The main window's restored (not maximised, not full-screen) rectangle in workspace
@@ -96,6 +98,7 @@ impl Default for Settings {
             save_quality: 90,
             language: Language::Korean,
             wheel_navigates: false,
+            confirm_delete: true,
         }
     }
 }
@@ -210,6 +213,9 @@ mod tests {
         assert!(warning.is_none());
         assert!(!partial.wrap);
         assert_eq!(partial.cache_mib, Settings::default().cache_mib, "missing keys take defaults");
+        assert!(partial.confirm_delete, "deleting asks first unless turned off");
+        std::fs::write(&path, "confirm_delete = false\n").unwrap();
+        assert!(!Settings::load(&path).0.confirm_delete);
 
         std::fs::write(&path, "cache_mib = 1\nsave_quality = 0\nnearest_above_zoom = 1000.0\n").unwrap();
         let (clamped, _) = Settings::load(&path);

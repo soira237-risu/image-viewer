@@ -8,6 +8,7 @@ pub mod keys;
 pub mod menu;
 pub mod panel;
 pub mod settings_window;
+pub mod shell;
 pub mod window;
 
 use std::cell::{Cell, RefCell};
@@ -51,6 +52,10 @@ pub enum UiEvent {
     SettingsSave,
     SettingsClosed,
     HelpClosed,
+    /// List the viewer in "Open with" (`true`) or remove it from there (`false`).
+    Register(bool),
+    /// Open Windows' Default apps settings.
+    OpenDefaultApps,
 }
 
 thread_local! {
