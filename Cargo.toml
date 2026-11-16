@@ -22,7 +22,10 @@ zune-jpeg = "0.5.15"
 zune-core = "0.5"
 kamadak-exif = "0.6.2"
 bytemuck = { version = "1", features = ["derive"] }
-fast_image_resize = "6.1"
+# Member crates take dependencies with exactly these features (no per-crate additions): a crate
+# built alone (`-p`) then resolves the same features as the whole workspace, so it reuses the same
+# compiled units instead of adding a second copy of large crates to target/.
+fast_image_resize = { version = "6.1", features = ["rayon"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.2"
 avif-decode = { version = "3.0.0", default-features = false }
@@ -36,7 +39,29 @@ rayon = "1.12"
 zip = { version = "9.5", default-features = false, features = ["deflate"] }
 sevenz-rust2 = { version = "0.25", default-features = false }
 zune-jpegxl = "0.5.2"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Imaging", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant"] }
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
 tempfile = "3"
 
 [profile.release]

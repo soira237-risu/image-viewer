@@ -238,17 +238,13 @@ mod tests {
 mod seven_z_tests {
     use super::*;
 
+    /// `testdata/archive/book.cb7` holds p10.png ("ten"), p2.png ("two") and readme.txt ("no"),
+    /// written by `sevenz_rust2::ArchiveWriter`. It is committed rather than written by the test so
+    /// the 7z writer (the crate's `compress` feature) stays out of every build: a test-only
+    /// feature would compile this crate and everything above it twice.
     #[test]
     fn seven_z_pages_list_and_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let cb7 = dir.path().join("book.cb7");
-        {
-            let mut w = sevenz_rust2::ArchiveWriter::create(&cb7).unwrap();
-            for (name, data) in [("p10.png", &b"ten"[..]), ("p2.png", b"two"), ("readme.txt", b"no")] {
-                w.push_archive_entry(sevenz_rust2::ArchiveEntry::new_file(name), Some(data)).unwrap();
-            }
-            w.finish().unwrap();
-        }
+        let cb7 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/archive/book.cb7");
         assert!(is_archive(&cb7));
         let pages = list_images(&cb7).unwrap();
         let names: Vec<_> = pages.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();

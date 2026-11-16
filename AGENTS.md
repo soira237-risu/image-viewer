@@ -24,28 +24,37 @@ cargo test --workspace --locked --no-fail-fast
 
 ## 디스크 사용 규칙 (중요)
 
-Cargo는 옛 빌드 결과물을 지우지 않는다. 코드·기능 조합·빌드 대상이 바뀔 때마다 새 결과물이 옆에 쌓여 `target/`은 계속 커진다. 이 저장소에서 `target/debug`가 51 GB까지 커져 C: 드라이브를 가득 채운 적이 있다. 드라이브는 하나뿐이므로 다음을 지킨다.
+Cargo는 옛 빌드 결과물을 지우지 않는다(rust-lang/cargo#13136). 의존성 버전·기능 조합·프로필·컴파일러가 바뀔 때마다 새 유닛 폴더(`target/<프로필>/build/<패키지>/<해시>/`)가 옆에 쌓인다. 이 저장소에서 `target/debug`가 51 GB까지 커져 C: 드라이브를 가득 채운 적이 있다. 드라이브는 하나뿐이므로 다음 구조로 막는다.
 
-1. **긴 작업의 시작과 끝에 용량 확인**
+1. **정리 스크립트 [scripts/cache.ps1](scripts/cache.ps1)** — 표준 명령(`build`·`clippy`·`check` `--workspace --all-targets`)이 지금 쓰는 유닛을 Cargo의 JSON 출력과 하드 링크로 정확히 찾아내고, 그 밖의 유닛만 지운다. 정리 직후 표준 명령은 아무것도 다시 컴파일하지 않는다. 최신 상태에서 4초 정도
 
    ```bash
-   pwsh -File scripts/cache-check.ps1          # 보고만 (target 20 GB 초과 또는 여유 30 GB 미만이면 종료 코드 1)
-   pwsh -File scripts/cache-check.ps1 -Clean   # 한도를 넘었으면 cargo clean
+   pwsh -File scripts/cache.ps1           # 오래된 결과물 정리 + 크기 보고
+   pwsh -File scripts/cache.ps1 -DryRun   # 지울 목록만 보기
+   pwsh -File scripts/cache.ps1 -Report   # 크기만 (cargo 실행 없음)
+   pwsh -File scripts/cache.ps1 -Clean    # target/ 통째 삭제 (디스크가 가득 차 빌드조차 안 될 때)
    ```
 
-   한도를 넘었으면 `-Clean`으로 정리하고 진행한다. 정리 후 첫 빌드는 몇 분 더 걸릴 뿐 결과는 같다.
+   - 자동 실행: `.claude/settings.json`의 SessionStart 훅이 세션마다 백그라운드로 `-Auto`를 돌린다 (target 15 GB 초과 또는 여유 30 GB 미만일 때만 정리)
+   - 에이전트는 **긴 작업(의존성·기능·프로필 변경, `-p` 빌드 여러 번)을 마치면 직접 한 번 실행**한다
+   - 다른 cargo/rustc가 돌고 있거나 명령이 실패하면 아무것도 지우지 않는다 (종료 코드 2)
+   - 릴리스 빌드는 7일 동안 안 쓰면 통째로 지운다. 계속 쓰는 중이면 `-IncludeRelease`로 같은 방식 정리
 
-2. **빌드 프로필의 디버그 정보를 늘리지 않는다.** `Cargo.toml`에서 의존성은 `debug = false`, 우리 크레이트는 `debug = "line-tables-only"`(패닉·백트레이스의 줄 번호는 남음). 디버거로 변수를 봐야 하면 로컬에서만 잠시 바꾸고 커밋하지 않는다.
+2. **의존성 기능은 워크스페이스에서만 정한다.** 멤버 크레이트의 `Cargo.toml`에서 `features = [...]`를 덧붙이지 않고 루트 `[workspace.dependencies]`에 합친다. 테스트 전용 기능도 만들지 않는다(테스트에서만 켜지는 기능은 그 크레이트와 위쪽 전부를 두 번 빌드하게 만든다 — 7z 테스트는 그래서 만들어 둔 픽스처 `testdata/archive/book.cb7`를 읽는다)
 
-3. **빌드 캐시를 늘리는 설정을 만들지 않는다.** `CARGO_TARGET_DIR` 변경, 다른 위치의 `target/`, 추가 git worktree는 캐시를 통째로 한 벌 더 만든다. 꼭 필요하면 작업이 끝난 뒤 그 캐시를 지운다.
+3. **빌드 범위는 `--workspace`가 기본.** `-p`로 일부만 빌드하면 다른 멤버가 켜던 간접 기능(예: zip → flate2 → png → image)이 빠져 큰 의존성이 한 벌 더 생긴다. 빠른 확인용으로는 괜찮지만 끝나면 위 스크립트로 정리
 
-4. **예제·벤치마크는 필요할 때만** `--example <이름>`으로 빌드한다 (`crates/iv-win/examples/`, `iv bench`).
+4. **빌드 프로필의 디버그 정보를 늘리지 않는다.** 의존성은 `debug = false`, 우리 크레이트는 `debug = "line-tables-only"`(패닉·백트레이스의 줄 번호는 남음). 디버거로 변수를 봐야 하면 로컬에서만 잠시 바꾸고 커밋하지 않는다
 
-5. **큰 테스트 파일은 저장소 밖이나 `testdata/local/`(git 제외)에.** 생성한 이미지·로그는 임시 폴더에 두고 끝나면 지운다. 커밋하는 테스트 데이터는 작고 합성된 것만.
+5. **빌드 캐시를 한 벌 더 만들지 않는다.** `CARGO_TARGET_DIR` 변경, 다른 위치의 `target/`, 추가 git worktree는 캐시를 통째로 복제한다. 꼭 필요하면 끝난 뒤 그 캐시를 지운다
 
-6. **증상으로 디스크 부족을 의심할 것:** `no space on device`, `os error 112`, rustc가 메시지 없이 종료 코드 101/0xC0000409로 실패 → 먼저 `pwsh -File scripts/cache-check.ps1` 실행.
+6. **예제·벤치마크는 필요할 때만** `--example <이름>`으로 빌드한다 (`crates/iv-win/examples/`, `iv bench`)
 
-7. **지워도 되는 것은 `target/`뿐.** `~/.cargo`(레지스트리 캐시는 Cargo가 스스로 정리), 사용자 파일, 다른 프로젝트는 건드리지 않는다.
+7. **큰 테스트 파일은 저장소 밖이나 `testdata/local/`(git 제외)에.** 생성한 이미지·로그는 임시 폴더에 두고 끝나면 지운다. 커밋하는 테스트 데이터는 작고 합성된 것만
+
+8. **증상으로 디스크 부족을 의심할 것:** `no space on device`, `os error 112`, rustc가 메시지 없이 종료 코드 101/0xC0000409로 실패 → `pwsh -File scripts/cache.ps1 -Report`로 확인, 가득 찼으면 `-Clean`
+
+9. **지워도 되는 것은 `target/`뿐.** `~/.cargo`(레지스트리 캐시는 Cargo가 스스로 정리), 사용자 파일, 다른 프로젝트는 건드리지 않는다
 
 ## 실제 창 테스트 규칙
 

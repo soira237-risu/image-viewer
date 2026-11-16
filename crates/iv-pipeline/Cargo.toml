@@ -16,6 +16,5 @@ sevenz-rust2.workspace = true
 [dev-dependencies]
 moxcms.workspace = true
 zip.workspace = true
-sevenz-rust2 = { workspace = true, features = ["compress"] }
 image.workspace = true
 tempfile.workspace = true
