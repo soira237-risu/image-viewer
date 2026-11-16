@@ -439,6 +439,8 @@ fn jpeg_xl_lossless_round_trips_exactly() {
     assert_eq!(reg.identify(&src).unwrap().format, FormatId::Jxl);
     let d = reg.decode(&src, &CancelToken::never()).unwrap();
     assert_eq!(d.info.codec, "jxl-oxide");
+    assert_eq!(d.info.frame_count, Some(1), "the header says it is not animated");
+    assert_eq!(reg.probe(&src).unwrap().frame_count, Some(1));
     assert!(d.info.has_alpha);
     assert_exact(&d, &expected);
 }

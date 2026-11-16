@@ -119,6 +119,76 @@ pub fn jpeg_with_orientation(jpeg: &[u8], value: u16) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// A JPEG with everything that is not needed to decode it removed, the compressed image data
+/// copied unchanged: EXIF (location, camera serial, thumbnail), XMP, ICC profile, IPTC and other
+/// application segments, comments, and anything after the end-of-image marker (appended preview
+/// or depth images, motion-photo video). Kept: the JFIF and Adobe segments (they say how the
+/// colour components are stored) and every table, frame and scan. `None` when the file is not
+/// a complete JPEG.
+pub fn jpeg_without_metadata(jpeg: &[u8]) -> Option<Vec<u8>> {
+    if !jpeg.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut out = vec![0xFF, 0xD8];
+    let mut pos = 2;
+    loop {
+        if pos + 2 > jpeg.len() || jpeg[pos] != 0xFF {
+            return None;
+        }
+        let marker = jpeg[pos + 1];
+        match marker {
+            // fill byte before a marker
+            0xFF => {
+                pos += 1;
+                continue;
+            }
+            0xD9 => {
+                out.extend_from_slice(&[0xFF, 0xD9]);
+                return Some(out);
+            }
+            // markers without a length
+            0x01 | 0xD0..=0xD7 => {
+                out.extend_from_slice(&jpeg[pos..pos + 2]);
+                pos += 2;
+                continue;
+            }
+            _ => {}
+        }
+        if pos + 4 > jpeg.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([jpeg[pos + 2], jpeg[pos + 3]]) as usize;
+        let end = pos + 2 + len;
+        if len < 2 || end > jpeg.len() {
+            return None;
+        }
+        let body = &jpeg[pos + 4..end];
+        let keep = match marker {
+            0xE0 => body.starts_with(b"JFIF\0"),
+            0xEE => body.starts_with(b"Adobe"),
+            // other application segments and comments
+            0xE1..=0xEF | 0xFE => false,
+            _ => true,
+        };
+        if keep {
+            out.extend_from_slice(&jpeg[pos..end]);
+        }
+        pos = end;
+        if marker == 0xDA {
+            // entropy-coded data runs to the next marker: a 0xFF that is not a stuffed zero, a
+            // restart marker or fill
+            let start = pos;
+            while pos + 1 < jpeg.len() && !(jpeg[pos] == 0xFF && !matches!(jpeg[pos + 1], 0x00 | 0xD0..=0xD7 | 0xFF)) {
+                pos += 1;
+            }
+            if pos + 1 >= jpeg.len() {
+                return None;
+            }
+            out.extend_from_slice(&jpeg[start..pos]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +196,63 @@ mod tests {
     fn read_orientation(raw: &[u8]) -> Option<u32> {
         let exif = exif::Reader::new().read_raw(raw.to_vec()).ok()?;
         exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)?.value.get_uint(0)
+    }
+
+    /// A marker segment: marker, length, body.
+    fn segment(marker: u8, body: &[u8]) -> Vec<u8> {
+        let mut s = vec![0xFF, marker];
+        s.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
+        s.extend_from_slice(body);
+        s
+    }
+
+    #[test]
+    fn stripping_keeps_only_what_decoding_needs() {
+        let jfif = segment(0xE0, b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
+        let adobe = segment(0xEE, b"Adobe\0\x64\0\0\0\0\x01");
+        let tables = segment(0xDB, &[0; 65]);
+        let frame = segment(0xC2, &[8, 0, 1, 0, 1, 1, 1, 0x11, 0]);
+        let scan = segment(0xDA, &[1, 1, 0, 0, 63, 0]);
+        // stuffed 0xFF, a restart marker and fill bytes inside the compressed data
+        let data: &[u8] = &[0x12, 0xFF, 0x00, 0x34, 0xFF, 0xD0, 0x56, 0xFF, 0xFF];
+        let mut jpeg = vec![0xFF, 0xD8];
+        for part in [
+            jfif.clone(),
+            segment(0xE1, b"Exif\0\0GPS secret"),
+            segment(0xE1, b"http://ns.adobe.com/xap/1.0/\0xmp secret"),
+            segment(0xE2, b"ICC_PROFILE\0\x01\x01icc"),
+            segment(0xED, b"Photoshop 3.0\0iptc secret"),
+            adobe.clone(),
+            tables.clone(),
+            frame.clone(),
+            scan.clone(),
+            data.to_vec(),
+            // a comment between two progressive scans
+            segment(0xFE, b"comment secret"),
+            scan.clone(),
+            data.to_vec(),
+            vec![0xFF, 0xD9],
+            b"appended secret image".to_vec(),
+        ] {
+            jpeg.extend(part);
+        }
+        let want: Vec<u8> = [
+            vec![0xFF, 0xD8],
+            jfif,
+            adobe,
+            tables,
+            frame,
+            scan.clone(),
+            data.to_vec(),
+            scan,
+            data.to_vec(),
+            vec![0xFF, 0xD9],
+        ]
+        .concat();
+        assert_eq!(jpeg_without_metadata(&jpeg), Some(want));
+        // a cut-off file, or none at all, is left to re-encoding
+        assert_eq!(jpeg_without_metadata(&jpeg[..jpeg.len() - 30]), None);
+        assert_eq!(jpeg_without_metadata(b"GIF89a"), None);
     }
 
     #[test]

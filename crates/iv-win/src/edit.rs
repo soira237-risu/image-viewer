@@ -410,4 +410,23 @@ mod tests {
         let still = Decoded::still(info(FormatId::Png, Some(1)), pixel());
         assert_eq!(frames(&still.info, Some(&still)), Frames::One);
     }
+
+    #[test]
+    fn a_still_jpeg_xl_is_saved_in_place() {
+        use iv_codec::encode::{EncodeOptions, Metadata, prepare};
+        use iv_core::{CancelToken, ImageBuf, PixelFormat, Source};
+        let enc = Encoders::default();
+        let jxl = enc.for_format(FormatId::Jxl).expect("a JPEG XL encoder");
+        let image = ImageBuf::new(3, 2, PixelFormat::Rgba8, (0..24).collect()).unwrap();
+        let bytes = jxl.encode(&prepare(&image, jxl.info(), [255; 3]), &EncodeOptions::default(), &Metadata::default());
+        let src = Source::from_bytes("a.jxl", bytes.unwrap());
+        let registry = iv_codec::default_registry();
+        let path = tempfile::tempdir().unwrap().path().join("a.jxl");
+        // the header says it is a still image: known as soon as it is probed
+        let probed = registry.probe(&src).unwrap();
+        assert_eq!(in_place(&enc, &path, probed.format, frames(&probed, None)), InPlace::Write(FormatId::Jxl));
+        let decoded = registry.decode(&src, &CancelToken::never()).unwrap();
+        let known = frames(&decoded.info, Some(&decoded));
+        assert_eq!(in_place(&enc, &path, decoded.info.format, known), InPlace::Write(FormatId::Jxl));
+    }
 }

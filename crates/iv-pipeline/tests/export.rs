@@ -75,6 +75,74 @@ fn rotating_a_jpeg_is_lossless() {
     assert_eq!(a.image.data(), b.image.data(), "same stored pixels, only the orientation differs");
 }
 
+/// `jpeg` with a location in its EXIF, XMP, an ICC profile, a comment and data after its end.
+fn with_private_metadata(jpeg: &[u8]) -> Vec<u8> {
+    let segment = |marker: u8, body: &[u8]| {
+        let mut s = vec![0xFF, marker];
+        s.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
+        s.extend_from_slice(body);
+        s
+    };
+    // little-endian TIFF: orientation 1 and a GPS IFD holding a map datum
+    let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+    tiff.extend_from_slice(&2u16.to_le_bytes());
+    tiff.extend_from_slice(&[0x12, 0x01, 3, 0, 1, 0, 0, 0, 1, 0, 0, 0]);
+    tiff.extend_from_slice(&[0x25, 0x88, 4, 0, 1, 0, 0, 0, 38, 0, 0, 0]);
+    tiff.extend_from_slice(&[0; 4]);
+    tiff.extend_from_slice(&1u16.to_le_bytes());
+    tiff.extend_from_slice(&[0x12, 0, 2, 0, 11, 0, 0, 0, 56, 0, 0, 0]);
+    tiff.extend_from_slice(&[0; 4]);
+    tiff.extend_from_slice(b"SECRET-GPS\0");
+    let exif = [b"Exif\0\0".as_slice(), &tiff].concat();
+    // after SOI and the encoder's JFIF segment
+    assert_eq!(jpeg[2..4], [0xFF, 0xE0]);
+    let at = 4 + u16::from_be_bytes([jpeg[4], jpeg[5]]) as usize;
+    [
+        &jpeg[..at],
+        &segment(0xE1, &exif),
+        &segment(0xE1, b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta>SECRET-XMP"),
+        &segment(0xE2, b"ICC_PROFILE\0\x01\x01SECRET-ICC"),
+        &segment(0xFE, b"SECRET-COMMENT"),
+        &jpeg[at..],
+        b"SECRET-APPENDED",
+    ]
+    .concat()
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+#[test]
+fn rotating_a_jpeg_without_metadata_strips_it_losslessly() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain =
+        encode(&RgbaImage::from_fn(64, 32, |x, y| Rgba([x as u8 * 4, y as u8 * 8, 77, 255])), ImageFormat::Jpeg);
+    let original = with_private_metadata(&plain);
+    let src = write(dir.path(), "located.jpg", &original);
+    let info = default_registry().probe(&Source::from_path(&src)).unwrap();
+    assert!(contains(info.exif.as_deref().unwrap(), b"SECRET-GPS"), "the test file has a location");
+
+    // `iv convert --to jpg --no-metadata`, with and without a rotation
+    for (ops, orientation) in [(vec![Op::rotate_cw()], Orientation::Rotate90), (vec![], Orientation::Normal)] {
+        let dest = dir.path().join("shared.jpg");
+        let mut req = request(&src, &dest, FormatId::Jpeg, ops);
+        req.keep_metadata = false;
+        assert_eq!(run(&req), ExportOutcome::LosslessOrientation);
+        let out = std::fs::read(&dest).unwrap();
+        assert!(!contains(&out, b"SECRET"), "metadata left in the output");
+        assert_eq!(scan_data(&out), scan_data(&plain), "compressed data copied byte for byte");
+        let info = default_registry().probe(&Source::from_path(&dest)).unwrap();
+        assert_eq!(info.orientation, orientation);
+        assert!(info.icc_profile.is_none());
+    }
+
+    // keeping metadata keeps it
+    let dest = dir.path().join("kept.jpg");
+    assert_eq!(run(&request(&src, &dest, FormatId::Jpeg, vec![Op::rotate_cw()])), ExportOutcome::LosslessOrientation);
+    assert!(contains(&std::fs::read(&dest).unwrap(), b"SECRET-GPS"));
+}
+
 #[test]
 fn rotation_composes_with_existing_exif_orientation() {
     let dir = tempfile::tempdir().unwrap();

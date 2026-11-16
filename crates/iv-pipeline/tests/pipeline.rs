@@ -1,9 +1,9 @@
 //! The decoding service against real files.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iv_core::{CancelToken, FormatId, ImageInfo, Source};
@@ -265,15 +265,29 @@ fn failures_say_what_kind_they_are() {
     }
 }
 
-/// Holds every decode of files whose name starts with `prefix` until `open` is set (ignoring
-/// cancellation, like a decoder in the middle of a long pixel decode), then fails so the next
-/// decoder (image-rs) decodes the file for real.
+/// Holds every decode (or, with `in_probe`, every header probe) of files whose name starts with
+/// `prefix` until `open` is set (ignoring cancellation, like a decoder in the middle of a long
+/// pixel decode), then fails so the next decoder (image-rs) reads the file for real.
 struct Gate {
     info: iv_codec::DecoderInfo,
     prefix: &'static str,
     open: Arc<AtomicBool>,
     /// Decodes waiting at the gate.
     waiting: Arc<AtomicUsize>,
+    /// Names of the files that reached the gate.
+    held: Arc<Mutex<Vec<String>>>,
+    in_probe: bool,
+}
+
+impl Gate {
+    fn hold(&self, src: &Source) {
+        self.held.lock().unwrap().push(src.display_name().to_string());
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        while !self.open.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.waiting.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl iv_codec::Decoder for Gate {
@@ -283,20 +297,31 @@ impl iv_codec::Decoder for Gate {
     fn claims(&self, src: &Source, _: FormatId) -> iv_core::Result<bool> {
         Ok(src.display_name().starts_with(self.prefix))
     }
-    fn probe(&self, _: &Source, _: FormatId) -> iv_core::Result<ImageInfo> {
+    fn probe(&self, src: &Source, _: FormatId) -> iv_core::Result<ImageInfo> {
+        if self.in_probe {
+            self.hold(src);
+        }
         Err(iv_core::Error::decode("gate", "probe by the next decoder"))
     }
-    fn decode(&self, _: &Source, _: FormatId, _: &CancelToken) -> iv_core::Result<iv_codec::Decoded> {
-        self.waiting.fetch_add(1, Ordering::AcqRel);
-        while !self.open.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(1));
+    fn decode(&self, src: &Source, _: FormatId, _: &CancelToken) -> iv_core::Result<iv_codec::Decoded> {
+        if !self.in_probe {
+            self.hold(src);
         }
-        self.waiting.fetch_sub(1, Ordering::AcqRel);
         Err(iv_core::Error::decode("gate", "opened"))
     }
 }
 
 fn gated_pipeline(prefix: &'static str, budget: u64, workers: usize) -> (Pipeline, Receiver<PipelineEvent>, Gated) {
+    gated_pipeline_at(prefix, false, budget, workers)
+}
+
+/// [`gated_pipeline`] holding the header probe instead of the decode when `in_probe` is set.
+fn gated_pipeline_at(
+    prefix: &'static str,
+    in_probe: bool,
+    budget: u64,
+    workers: usize,
+) -> (Pipeline, Receiver<PipelineEvent>, Gated) {
     let gated = Gated::default();
     let mut reg = iv_codec::default_registry();
     reg.register(Arc::new(Gate {
@@ -304,6 +329,8 @@ fn gated_pipeline(prefix: &'static str, budget: u64, workers: usize) -> (Pipelin
         prefix,
         open: gated.open.clone(),
         waiting: gated.waiting.clone(),
+        held: gated.held.clone(),
+        in_probe,
     }));
     let (p, rx) = pipeline_with(reg, budget, workers, |_| {});
     (p, rx, gated)
@@ -505,6 +532,7 @@ fn images_too_large_to_prefetch_wait_until_they_are_opened() {
 struct Gated {
     open: Arc<AtomicBool>,
     waiting: Arc<AtomicUsize>,
+    held: Arc<Mutex<Vec<String>>>,
 }
 
 impl Gated {
@@ -699,4 +727,136 @@ fn the_cache_keeps_display_pixels_and_real_transparency() {
     assert!(!ready_for(&rx, &opaque_rgba).info.has_alpha, "an RGBA file without transparency");
     p.request(&see_through, &[]);
     assert!(ready_for(&rx, &see_through).info.has_alpha);
+}
+
+/// Waits for the `Probed` event of `path`, failing on its `Ready` or `Failed` first.
+fn probed_for(rx: &Receiver<PipelineEvent>, path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("an event") {
+            PipelineEvent::Probed { path: p, .. } if p == path => return,
+            PipelineEvent::Ready { path: p, .. } | PipelineEvent::Failed { path: p, .. } if p == path => {
+                panic!("{} finished without being probed", p.display())
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn an_image_too_big_to_prefetch_loads_when_the_user_moves_onto_it_while_it_is_prefetched() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = write_pngs(dir.path(), 1);
+    let big = dir.path().join("held-big.png");
+    image::RgbaImage::new(SIDE * 2, SIDE * 2).save(&big).unwrap();
+    // four images' worth: over half of this budget, so not kept as a neighbour
+    let (p, rx, gate) = gated_pipeline_at("held", true, IMAGE_BYTES * 6, 1);
+
+    p.request(&files[0], std::slice::from_ref(&big));
+    ready_for(&rx, &files[0]);
+    // its prefetch is still reading the header (an archive page being inflated, say) when the
+    // user steps onto it: no second job starts for it
+    gate.wait_for(1);
+    p.request(&big, std::slice::from_ref(&files[0]));
+    gate.open();
+    probed_for(&rx, &big);
+    let d = ready_for(&rx, &big);
+    assert_eq!(d.image.width(), SIDE * 2);
+    assert!(p.cached(&big).is_some(), "kept as the image on screen");
+}
+
+#[test]
+fn an_image_waiting_for_room_to_prefetch_loads_at_once_when_the_user_moves_onto_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = write_pngs(dir.path(), 1);
+    let slow: Vec<PathBuf> = (0..3)
+        .map(|i| {
+            let p = dir.path().join(format!("slow{i}.png"));
+            std::fs::copy(&files[0], &p).unwrap();
+            p
+        })
+        .collect();
+    // room for two neighbours being decoded at once, not three
+    let budget = IMAGE_BYTES * 5 / 2;
+    let (p, rx, gate) = gated_pipeline("slow", budget, 3);
+    p.request(&files[0], &slow);
+    ready_for(&rx, &files[0]);
+    gate.wait_for(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while p.stats()
+        != (iv_pipeline::Stats {
+            cached: 1,
+            used_bytes: IMAGE_BYTES,
+            queued: 0,
+            in_flight: 3,
+            reserved_bytes: 2 * IMAGE_BYTES,
+        })
+    {
+        assert!(Instant::now() < deadline, "{:?}", p.stats());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // the third neighbour waits for room in the budget; the user steps onto it
+    let held = gate.held.lock().unwrap().clone();
+    let waiting = slow.iter().find(|s| !held.contains(&s.file_name().unwrap().to_string_lossy().into_owned())).unwrap();
+    let others: Vec<PathBuf> = slow.iter().filter(|s| *s != waiting).cloned().collect();
+    p.request(waiting, &others);
+    // it is announced and decoded now, beside the two neighbours still decoding
+    probed_for(&rx, waiting);
+    gate.wait_for(3);
+    gate.open();
+    ready_for(&rx, waiting);
+    settle(&p);
+}
+
+/// CRC-32 (IEEE) of `bytes`, for hand-made PNG chunks.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+/// A PNG whose header declares `width` x `height`, with an empty image data chunk.
+fn png_header_only(width: u32, height: u32) -> Vec<u8> {
+    let chunk = |kind: &[u8], data: &[u8]| {
+        let mut c = (data.len() as u32).to_be_bytes().to_vec();
+        c.extend_from_slice(kind);
+        c.extend_from_slice(data);
+        c.extend_from_slice(&crc32(&c[4..]).to_be_bytes());
+        c
+    };
+    let mut ihdr = width.to_be_bytes().to_vec();
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend(chunk(b"IHDR", &ihdr));
+    // an empty zlib stream
+    png.extend(chunk(b"IDAT", &[0x78, 0x9C, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]));
+    png.extend(chunk(b"IEND", &[]));
+    png
+}
+
+#[test]
+fn an_image_too_large_to_open_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    // 6.4 GB of RGBA: more than one image buffer may take
+    let huge = dir.path().join("huge.png");
+    std::fs::write(&huge, png_header_only(40_000, 40_000)).unwrap();
+    let (p, rx) = pipeline(u64::MAX, 1);
+    p.request(&huge, &[]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("an event") {
+            PipelineEvent::Failed { path, kind, error } if path == huge => {
+                assert_eq!(kind, iv_pipeline::FailureKind::TooLarge { width: 40_000, height: 40_000 }, "{error}");
+                break;
+            }
+            PipelineEvent::Ready { .. } => panic!("decoded"),
+            _ => {}
+        }
+    }
 }

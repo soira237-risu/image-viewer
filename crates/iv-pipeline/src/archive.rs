@@ -208,6 +208,35 @@ pub fn release_cache() {
     *seven_z_cache() = SevenZCache::default();
 }
 
+/// Largest 7z header (the file list), in KiB, read and decompressed. The header is the archive's
+/// own claim and a few kilobytes of LZMA can expand to gigabytes before it is parsed, so it is
+/// held to this. Parsing it then needs at most about 100 bytes per header byte (the crate bounds
+/// every count by the header's length), so a hostile header costs some 1.6 GB at worst, briefly;
+/// real ones take 50 to 100 bytes per file, so this still lists 150 000 files or more. It also
+/// bounds the dictionary used to decompress the header (16 MiB; 7-Zip uses 1 MiB, the
+/// `sevenz-rust2` writer 8 MiB).
+const SEVEN_Z_HEADER_KIB: usize = 16 * 1024;
+
+/// Largest dictionary, in KiB, a 7z block may ask for: as large as the largest entry read
+/// ([`MAX_ENTRY_BYTES`]) plus the decoder's own state. A block declaring more is refused before
+/// anything is decompressed (7-Zip's ultra preset uses 64 MiB).
+const SEVEN_Z_DICTIONARY_KIB: usize = (MAX_ENTRY_BYTES / 1024) as usize + 1024;
+
+/// A 7z error as text, the memory limits worded for people.
+fn seven_z_error(e: sevenz_rust2::Error) -> String {
+    match e {
+        sevenz_rust2::Error::MaxMemLimited { max_kb, actaul_kb } => {
+            format!("needs {actaul_kb} KiB of memory, over the {max_kb} KiB limit")
+        }
+        e => e.to_string(),
+    }
+}
+
+/// The index (header) of a 7z archive, read within [`SEVEN_Z_HEADER_KIB`].
+fn seven_z_index(file: &mut BufReader<File>) -> std::result::Result<sevenz_rust2::Archive, sevenz_rust2::Error> {
+    sevenz_rust2::Archive::read_with_memory_limit(file, &sevenz_rust2::Password::empty(), SEVEN_Z_HEADER_KIB)
+}
+
 fn cached_7z(id: &ArchiveId, entry: &str) -> Option<Arc<[u8]>> {
     let mut cache = seven_z_cache();
     cache.select(id);
@@ -229,10 +258,10 @@ fn seven_z_read(archive: &Path, entry: &str, limit: u64, cancel: &CancelToken) -
         return Ok(hit);
     }
     cancel.check()?;
-    let fail = |e: sevenz_rust2::Error| Error::decode("7z", format!("{entry}: {e}"));
+    let fail = |e: sevenz_rust2::Error| Error::decode("7z", format!("{entry}: {}", seven_z_error(e)));
     let password = sevenz_rust2::Password::empty();
     let mut file = BufReader::new(File::open(archive)?);
-    let index = sevenz_rust2::Archive::read(&mut file, &password).map_err(fail)?;
+    let index = seven_z_index(&mut file).map_err(fail)?;
     let missing = || Error::decode("7z", format!("{entry}: not in the archive"));
     let target = index
         .files
@@ -245,8 +274,11 @@ fn seven_z_read(archive: &Path, entry: &str, limit: u64, cancel: &CancelToken) -
     let mut found = None;
     let mut after_target = 0;
     let mut cancelled = false;
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
-    sevenz_rust2::BlockDecoder::new(threads, block, &index, &password, &mut file)
+    // One thread: the multithreaded LZMA2 reader decompresses each run of chunks between
+    // dictionary resets whole into memory, on several threads at once and ahead of what is read,
+    // which no entry limit bounds (one run can be the whole block). Read on one thread, memory
+    // stays at the dictionary, which is held to SEVEN_Z_DICTIONARY_KIB.
+    sevenz_rust2::BlockDecoder::new_with_memory_limit(1, SEVEN_Z_DICTIONARY_KIB, block, &index, &password, &mut file)
         .for_each_entries(&mut |e, data| {
             if cancel.is_cancelled() {
                 cancelled = true;
@@ -294,15 +326,9 @@ fn seven_z_read(archive: &Path, entry: &str, limit: u64, cancel: &CancelToken) -
 
 /// Entry names of a 7z archive with `/` separators, unsafe names left out. Directories skipped.
 fn seven_z_names(archive: &Path) -> Result<Vec<String>> {
-    let reader = sevenz_rust2::ArchiveReader::open(archive, sevenz_rust2::Password::empty())
-        .map_err(|e| Error::decode("7z", e))?;
-    Ok(reader
-        .archive()
-        .files
-        .iter()
-        .filter(|f| !f.is_directory() && f.has_stream)
-        .filter_map(|f| clean_name(f.name()))
-        .collect())
+    let index =
+        seven_z_index(&mut BufReader::new(File::open(archive)?)).map_err(|e| Error::decode("7z", seven_z_error(e)))?;
+    Ok(index.files.iter().filter(|f| !f.is_directory() && f.has_stream).filter_map(|f| clean_name(f.name())).collect())
 }
 
 /// One entry of a ZIP archive by its cleaned name (see [`clean_name`]).
@@ -588,6 +614,43 @@ mod seven_z_tests {
         let err = source_for_cancellable(&page(&cb7, 9), &cancel).expect_err("cancelled");
         assert!(matches!(err, Error::Cancelled), "{err}");
         assert!(cached_names().is_empty(), "nothing decompressed");
+    }
+
+    /// `header-bomb.cb7`: 9.6 KB whose LZMA-compressed header (the stream of 64 MiB of zeros
+    /// made by 7-Zip, `-m0=LZMA:d=1m`) declares and really decompresses to 64 MiB. Built by hand:
+    /// start header, that packed stream, and an encoded header naming one LZMA folder of
+    /// 64 MiB. Unbounded, opening it would decompress all of that before parsing a byte.
+    #[test]
+    fn a_7z_header_that_decompresses_past_the_limit_is_refused() {
+        let _turn = exclusive();
+        let cb7 = fixture("header-bomb.cb7");
+        let err = list_images(&cb7).expect_err("over the header limit").to_string();
+        assert!(err.contains(&format!("over the {SEVEN_Z_HEADER_KIB} KiB limit")), "{err}");
+        let err = source_for(&cb7.join("p.png")).expect_err("over the header limit").to_string();
+        assert!(err.contains("limit"), "{err}");
+    }
+
+    /// `huge-dictionary.cb7`: two pages (7-Zip, LZMA2, `-mhc=off`) whose LZMA2 dictionary
+    /// property was raised to 4 GiB, with the header checksums fixed. The data still decodes
+    /// with a small dictionary, so only the limit can refuse it.
+    #[test]
+    fn a_7z_block_asking_for_a_dictionary_past_the_limit_is_refused() {
+        let _turn = exclusive();
+        let cb7 = fixture("huge-dictionary.cb7");
+        assert_eq!(page_names(&cb7), ["p1.png", "p2.png"], "the header itself is fine");
+        let err = source_for(&cb7.join("p1.png")).expect_err("over the dictionary limit").to_string();
+        assert!(err.contains(&format!("over the {SEVEN_Z_DICTIONARY_KIB} KiB limit")), "{err}");
+    }
+
+    #[test]
+    fn a_7z_header_at_the_limit_parses_into_a_bounded_index() {
+        // every file of the index costs one entry per header byte at worst
+        let worst = SEVEN_Z_HEADER_KIB as u64 * 1024 * std::mem::size_of::<sevenz_rust2::ArchiveEntry>() as u64;
+        assert!(worst <= 1700 * 1000 * 1000, "{worst} bytes");
+    }
+
+    fn page_names(archive: &Path) -> Vec<String> {
+        list_images(archive).unwrap().iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect()
     }
 
     #[test]

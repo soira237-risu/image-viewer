@@ -275,11 +275,19 @@ impl Shared {
         }
     }
 
+    /// Whether `path` is the image on screen now.
+    fn is_current(&self, path: &Path) -> bool {
+        self.lock().plan.first().is_some_and(|p| p == path)
+    }
+
     /// Counts `bytes` as being decoded. A prefetch first waits until the other running decodes
-    /// leave room for it in the budget (one always may run); the image on screen never waits.
-    fn reserve(&self, bytes: u64, kind: Kind, cancel: &CancelToken) -> Result<u64, Error> {
+    /// leave room for it in the budget (one always may run); the image on screen never waits,
+    /// including a prefetch of an image the user has moved onto while it waited (the pipeline
+    /// starts no second job for it, see [`Pipeline::request`]).
+    fn reserve(&self, bytes: u64, job: &Job, cancel: &CancelToken) -> Result<u64, Error> {
         let mut st = self.lock();
-        while kind == Kind::Prefetch
+        while job.kind == Kind::Prefetch
+            && st.plan.first() != Some(&job.path)
             && st.reserved_bytes > 0
             && st.reserved_bytes.saturating_add(bytes) > self.config.budget_bytes
         {
@@ -305,14 +313,24 @@ impl Shared {
             let bytes = expected_bytes(&info);
             // a header read just before the file was written over is not announced
             cancel.check()?;
-            if job.kind == Kind::Foreground {
-                (self.sink)(PipelineEvent::Probed { path: job.path.clone(), info });
+            // A prefetch of the image the user has meanwhile moved onto is that image's load:
+            // asking for it started no second job. It is announced like a foreground load and
+            // decoded whatever its size.
+            let shown = |job: &Job| job.kind == Kind::Foreground || self.is_current(&job.path);
+            let mut probed = false;
+            if shown(&job) {
+                (self.sink)(PipelineEvent::Probed { path: job.path.clone(), info: info.clone() });
+                probed = true;
             } else if cached_bytes(&info) > self.config.budget_bytes / 2 {
                 return Ok(None);
             }
-            reserved = self.reserve(bytes, job.kind, &cancel)?;
+            reserved = self.reserve(bytes, &job, &cancel)?;
             cancel.check()?;
-            if job.kind == Kind::Foreground {
+            if shown(&job) {
+                // it became the image on screen while waiting for room in the budget
+                if !probed {
+                    (self.sink)(PipelineEvent::Probed { path: job.path.clone(), info });
+                }
                 // a broken or missing preview is not an error: the decode follows
                 if let Ok(Some(image)) = self.registry.preview(&src, PREVIEW_TARGET, &cancel) {
                     (self.sink)(PipelineEvent::Preview { path: job.path.clone(), image: to_display(image) });
@@ -324,6 +342,7 @@ impl Shared {
             Ok(Some(display_ready(decoded)))
         });
 
+        let mut requeued = false;
         let event = {
             let mut st = self.lock();
             st.reserved_bytes -= reserved;
@@ -347,20 +366,28 @@ impl Shared {
             };
             // a quick-browse frame the user has already passed is still worth showing
             let quick_frame = job.kind == Kind::Foreground && st.quick;
+            let is_current = st.plan.first() == Some(&job.path);
             match result {
                 Ok(None) => {
+                    // The user moved onto it after the size check: this job was its load (asking
+                    // for it started none while this one ran), so it is loaded as the image on
+                    // screen now.
+                    if is_current && !st.foreground.iter().any(|j| j.path == job.path) {
+                        st.foreground.push_back(Job { path: job.path.clone(), kind: Kind::Foreground });
+                        requeued = true;
+                    }
                     st.too_big_to_prefetch.insert(job.path);
                     None
                 }
                 Ok(Some(decoded)) => {
                     let decoded = Arc::new(decoded);
                     let bytes = decoded.memory_size() as u64;
-                    let is_current = st.plan.first() == Some(&job.path);
                     st.sizes.insert(job.path.clone(), bytes);
                     st.typical_bytes = bytes;
                     let keep = match job.kind {
                         Kind::Foreground => st.plan.contains(&job.path) || quick_frame,
-                        Kind::Prefetch => st.has_room_for(&job.path, bytes, self.config.budget_bytes),
+                        // a prefetch of the image on screen is kept like a foreground load
+                        Kind::Prefetch => is_current || st.has_room_for(&job.path, bytes, self.config.budget_bytes),
                     };
                     if keep {
                         st.tick += 1;
@@ -389,8 +416,8 @@ impl Shared {
             }
         };
         // freed budget lets a waiting prefetch start; a finished foreground decode lets the next
-        // quick-browse image start
-        if reserved > 0 || kind == Kind::Foreground {
+        // quick-browse image start; a load queued above needs a worker
+        if reserved > 0 || kind == Kind::Foreground || requeued {
             self.wake.notify_all();
         }
         if let Some(e) = event {
@@ -501,8 +528,10 @@ impl Pipeline {
     /// Makes `current` the image on screen and `prefetch` (nearest first) its neighbours.
     ///
     /// Returns the decoded image immediately on a cache hit; otherwise a foreground load starts
-    /// (unless one is already running for that path) and its result arrives as an event. Work
-    /// for images no longer in the plan is cancelled.
+    /// (unless a decode of that path is already running) and its result arrives as an event. A
+    /// prefetch of `current` that is already running becomes its load: it stops waiting for room
+    /// in the budget, sends `Probed` and `Preview` if it has not passed them yet, and ignores the
+    /// size limit for prefetching. Work for images no longer in the plan is cancelled.
     pub fn request(&self, current: &Path, prefetch: &[PathBuf]) -> Option<Arc<Decoded>> {
         self.request_inner(current, prefetch, false)
     }

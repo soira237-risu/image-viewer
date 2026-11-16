@@ -1,6 +1,7 @@
 //! Saving edits and converting formats: one path for the viewer's Save / Save As, batch
 //! conversion and `iv convert`.
 
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,9 @@ pub struct ExportRequest {
     pub dest: PathBuf,
     /// Colour behind transparent pixels for formats without alpha.
     pub background: [u8; 3],
-    /// Copy ICC and EXIF into the output where the format allows.
+    /// Copy ICC and EXIF into the output where the format allows. When off, nothing of the
+    /// source's metadata is written, on the lossless JPEG rotation too (only the orientation
+    /// tag it needs).
     pub keep_metadata: bool,
 }
 
@@ -90,7 +93,15 @@ pub fn export(registry: &Registry, encoders: &Encoders, req: &ExportRequest) -> 
         let g = Geometry::new((info.width, info.height), info.orientation, &req.ops);
         if g.is_orientation_only() {
             let bytes = src.read_all()?;
-            if let Some(out) = exif_edit::jpeg_with_orientation(&bytes, g.orientation.to_exif()) {
+            // without metadata, everything but the image data goes and the orientation is written
+            // into a new EXIF segment holding nothing else; a file that cannot be taken apart is
+            // re-encoded below, which writes no metadata either
+            let base = if req.keep_metadata {
+                Some(Cow::Borrowed(&bytes[..]))
+            } else {
+                exif_edit::jpeg_without_metadata(&bytes).map(Cow::Owned)
+            };
+            if let Some(out) = base.and_then(|b| exif_edit::jpeg_with_orientation(&b, g.orientation.to_exif())) {
                 write_atomic(&req.dest, |f| f.write_all(&out))?;
                 return Ok(ExportOutcome::LosslessOrientation);
             }
