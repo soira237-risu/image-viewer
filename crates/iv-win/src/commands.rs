@@ -136,6 +136,14 @@ impl Command {
     pub fn is_navigation(self) -> bool {
         matches!(self, Command::NavNext | Command::NavPrev | Command::NavFirst | Command::NavLast)
     }
+
+    /// Whether a held key repeats the command. Only stepping commands do: navigation, zoom,
+    /// undo and redo. Everything else runs once per press, so holding Delete cannot recycle file
+    /// after file, Esc cannot go on to quit, and a toggle does not flicker.
+    pub fn repeats(self) -> bool {
+        self.is_navigation()
+            || matches!(self, Command::ViewZoomIn | Command::ViewZoomOut | Command::EditUndo | Command::EditRedo)
+    }
 }
 
 #[cfg(test)]
@@ -150,5 +158,23 @@ mod tests {
             assert_eq!(Command::from_id(c.id()), Some(c));
         }
         assert_eq!(Command::from_id("nope"), None);
+    }
+
+    #[test]
+    fn only_stepping_commands_repeat_while_a_key_is_held() {
+        for c in [Command::NavNext, Command::NavLast, Command::ViewZoomIn, Command::ViewZoomOut, Command::EditUndo] {
+            assert!(c.repeats(), "{c:?}");
+        }
+        for c in [
+            Command::FileDelete,
+            Command::FileSave,
+            Command::FileFixExtension,
+            Command::Escape,
+            Command::AppQuit,
+            Command::ViewToggleFullscreen,
+            Command::EditCrop,
+        ] {
+            assert!(!c.repeats(), "{c:?}");
+        }
     }
 }

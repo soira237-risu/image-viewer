@@ -6,7 +6,6 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use iv_codec::Decoded;
@@ -26,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::dialogs::{self, Answer, Filter};
 use super::shell::{self, Clip};
-use super::{UiEvent, help, keys, menu, panel, settings_window, wake, wide};
+use super::{UiEvent, help, keys, menu, panel, session, settings_window, wake, wide};
 use crate::clipboard;
 use crate::commands::Command;
 use crate::diag;
@@ -37,7 +36,7 @@ use crate::i18n::{Strings, fill};
 use crate::keymap::{Chord, Keymap};
 use crate::panel::{PanelAction, PanelContext, PanelState, typed_resize};
 use crate::raster::{self, Frame, Page, Picture, Style};
-use crate::settings::{Settings, WindowPlacement};
+use crate::settings::Settings;
 use crate::trace::Trace;
 use crate::view::{ScreenRect, ViewState, ZoomMode};
 use crate::wheel::{WheelSteps, WheelUse, wheel_use};
@@ -170,7 +169,6 @@ struct SaveJob {
     /// The edits being written; they leave the edit stack only if it still holds exactly these
     /// when the save succeeds.
     ops: Vec<Op>,
-    thread: Option<JoinHandle<()>>,
 }
 
 /// What the user asked for while a save was running (or by answering Yes to "save changes?"):
@@ -286,6 +284,7 @@ impl App {
             send(&sink, AppEvent::Pipeline(e));
         });
         let style = Style { background: settings.background, nearest_above_zoom: settings.nearest_above_zoom as f64 };
+        session::set_placement_file(settings_path.clone());
         Self {
             tx,
             rx,
@@ -545,6 +544,7 @@ impl App {
             self.error = None;
             self.edits.clear();
             self.selection = None;
+            self.select_from = None;
             self.after_image_change();
         }
         if let (Some(cur), Some(decoded)) = (self.current.as_mut(), hit)
@@ -642,6 +642,9 @@ impl App {
                 }
             }
             _ => {
+                // a selection drawn on the image that was up is in that image's pixels
+                self.selection = None;
+                self.select_from = None;
                 self.display = Some(Display {
                     path: cur.path.clone(),
                     kind,
@@ -725,10 +728,12 @@ impl App {
     /// Shows an image that is no longer current (quick browsing), unless the current one is
     /// already on screen.
     fn show_passing(&mut self, path: PathBuf, decoded: &Decoded) {
-        let current_shown = matches!((&self.current, &self.display), (Some(c), Some(d)) if d.path == c.path);
-        if current_shown {
+        if self.current_shown() {
             return;
         }
+        // a selection belongs to the image it was drawn on
+        self.selection = None;
+        self.select_from = None;
         self.trace.mark(&format!("passing image shown: {}", file_name(&path)));
         let info = &decoded.info;
         self.display = Some(Display {
@@ -743,6 +748,12 @@ impl App {
             saved_edits: None,
         });
         self.invalidate();
+    }
+
+    /// Whether the screen shows the current image. It does not while the next image loads: the
+    /// previous one stays up until the new one has something to show.
+    fn current_shown(&self) -> bool {
+        matches!((&self.current, &self.display), (Some(c), Some(d)) if d.path == c.path)
     }
 
     fn update_title(&self) {
@@ -940,9 +951,10 @@ impl App {
 
     /// Closes the window unless unsaved edits make the user change their mind.
     pub fn quit(&mut self) {
-        if self.confirm_discard(AfterSave::Quit)
-            && let Some(h) = self.hwnd
-        {
+        let go = self.confirm_discard(AfterSave::Quit);
+        // a close asked for again while that question was up has had its answer
+        session::take_deferred_close();
+        if go && let Some(h) = self.hwnd {
             self.remember_placement(h);
             unsafe {
                 let _ = DestroyWindow(h);
@@ -950,31 +962,31 @@ impl App {
         }
     }
 
-    /// Writes where the window is (its restored rectangle and whether it is maximised) to the
-    /// window state file next to the settings file (never the settings file itself), so the
-    /// next start opens it there. Full screen is not remembered: the
-    /// placement from before it is.
+    /// Writes where the window is to the window state file next to the settings file (never
+    /// the settings file itself), so the next start opens it there: see
+    /// [`session::save_placement`].
     fn remember_placement(&self, hwnd: HWND) {
-        let Some(path) = &self.settings_path else { return };
-        let placement = match &self.fullscreen {
-            Some(r) => r.placement,
-            None => {
-                let mut p = WINDOWPLACEMENT { length: size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
-                if unsafe { GetWindowPlacement(hwnd, &mut p) }.is_err() {
-                    return;
-                }
-                p
-            }
-        };
-        let r = placement.rcNormalPosition;
-        let maximized = placement.showCmd == SW_SHOWMAXIMIZED.0 as u32
-            || placement.showCmd == SW_SHOWMINIMIZED.0 as u32 && placement.flags.contains(WPF_RESTORETOMAXIMIZED);
-        let saved =
-            WindowPlacement { x: r.left, y: r.top, width: r.right - r.left, height: r.bottom - r.top, maximized };
-        match saved.save(&WindowPlacement::path_for(path)) {
-            Ok(()) => self.trace.mark(&format!("window placement saved: {saved:?}")),
-            Err(e) => diag::log(&format!("window placement not saved: {e}")),
+        match session::save_placement(hwnd) {
+            Some(Ok(saved)) => self.trace.mark(&format!("window placement saved: {saved:?}")),
+            Some(Err(e)) => diag::log(&format!("window placement not saved: {e}")),
+            None => {}
         }
+    }
+
+    /// Tells Windows what ending the session now would lose (see [`session`]): a running save,
+    /// which logoff waits for, or unsaved edits, which hold an ordinary logoff or shutdown so the
+    /// user can go back and save them.
+    pub fn publish_session(&self) {
+        let Some(hwnd) = self.hwnd else { return };
+        let t = self.t();
+        let (stake, reason) = match (&self.saving, &self.current) {
+            (Some(job), _) => (session::Stake::Saving, fill(t.shutdown_saving, &[("name", &file_name(&job.source))])),
+            (None, Some(cur)) if !self.edits.is_empty() => {
+                (session::Stake::Unsaved, fill(t.shutdown_unsaved, &[("name", &file_name(&cur.path))]))
+            }
+            _ => (session::Stake::Nothing, String::new()),
+        };
+        session::publish(hwnd, stake, reason);
     }
 
     fn with_view(&mut self, f: impl FnOnce(&mut ViewState)) {
@@ -1004,6 +1016,7 @@ impl App {
         unsafe {
             match self.fullscreen.take() {
                 Some(r) => {
+                    session::set_fullscreen_placement(None);
                     SetWindowLongPtrW(hwnd, GWL_STYLE, r.style);
                     let _ = SetWindowPlacement(hwnd, &r.placement);
                     let _ = SetWindowPos(
@@ -1041,6 +1054,7 @@ impl App {
                         r.bottom - r.top,
                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
                     );
+                    session::set_fullscreen_placement(Some(placement));
                     self.fullscreen = Some(Restore { style, placement });
                 }
             }
@@ -1210,6 +1224,8 @@ impl App {
             PanelAction::Quality(q) => {
                 self.panel.quality = q;
                 self.settings.save_quality = q;
+                // the settings window edits a copy of the settings: keep its quality in step
+                settings_window::set_quality(q);
             }
             PanelAction::ResizeWidth(w) => {
                 self.panel.resize = typed_resize(self.panel.resize, self.panel.keep_aspect, size, true, w);
@@ -1314,7 +1330,8 @@ impl App {
     }
 
     fn crop_to_selection(&mut self) {
-        if let Some(r) = self.selection {
+        // the selection is in the pixels of the image on screen, which must be the current one
+        if let Some(r) = self.selection.filter(|_| self.current_shown()) {
             self.edit(Op::Crop(r));
         }
     }
@@ -1418,18 +1435,18 @@ impl App {
             })
             .expect("spawn save thread");
         self.trace.mark(&format!("saving {}", source.display()));
-        self.saving = Some(SaveJob { source, ops, thread: Some(thread) });
+        // kept where logoff can wait for it, even while a dialog has the app (see `session`)
+        session::set_save_thread(thread);
+        self.saving = Some(SaveJob { source, ops });
         self.after_save = then;
         self.sync_panel();
         self.update_title();
     }
 
     fn handle_saved(&mut self, source: PathBuf, dest: PathBuf, result: Result<ExportOutcome, String>) {
-        let Some(mut job) = self.saving.take() else { return };
+        let Some(job) = self.saving.take() else { return };
         // the thread has sent its last word: this returns at once
-        if let Some(thread) = job.thread.take() {
-            let _ = thread.join();
-        }
+        session::finish_save();
         let then = self.after_save.take();
         match result {
             Ok(outcome) => {
@@ -1600,6 +1617,13 @@ impl App {
         }
         let t = self.t();
         let name = file_name(&path);
+        // only the file the user is looking at: while the next image loads, the previous one
+        // stays on screen (and after a delete, the deleted one does). A file that cannot be shown
+        // at all is named in the title bar and may go.
+        let unreadable = self.error.is_some() && self.display.is_none();
+        if !self.current_shown() && !unreadable {
+            return self.set_notice(fill(t.delete_not_shown, &[("name", &name)]));
+        }
         let edited = !self.edits.is_empty();
         if self.settings.confirm_delete || edited {
             let mut question = fill(t.delete_confirm, &[("name", &name)]);
@@ -1768,10 +1792,11 @@ impl App {
 
 impl Drop for App {
     /// A save the user asked for always finishes, even when the window closed under it (the
-    /// process would otherwise end and kill the save thread, leaving the file unsaved).
+    /// process would otherwise end and kill the save thread, leaving the file unsaved). Logoff
+    /// and shutdown end the process without this: `WM_ENDSESSION` waits for the save instead.
     fn drop(&mut self) {
-        if let Some(thread) = self.saving.as_mut().and_then(|job| job.thread.take()) {
-            let _ = thread.join();
+        if self.saving.is_some() {
+            session::finish_save();
         }
     }
 }
@@ -1914,7 +1939,11 @@ impl App {
         let Some(cmd) = self.keymap.lookup(&chord) else { return false };
         // bit 30: the key was already down (auto-repeat)
         let repeat = lp.0 & (1 << 30) != 0;
-        self.run_command(cmd, repeat);
+        // a held key runs a one-shot command (Delete, Esc, a toggle) once, but the key is
+        // still bound: swallowed, not passed on to Windows
+        if !repeat || cmd.repeats() {
+            self.run_command(cmd, repeat);
+        }
         true
     }
 
@@ -2005,7 +2034,10 @@ impl App {
                     SetCapture(hwnd);
                 }
                 if wp.0 as u32 & MK_SHIFT.0 != 0 {
-                    self.select_from = self.display.as_ref().map(|d| d.view.screen_to_image(p));
+                    // only on the current image: one still loading would be cropped to a
+                    // rectangle drawn on the image before it
+                    self.select_from =
+                        self.display.as_ref().filter(|_| self.current_shown()).map(|d| d.view.screen_to_image(p));
                     self.selection = None;
                     self.invalidate();
                 } else {
@@ -2020,7 +2052,9 @@ impl App {
             }
             WM_MOUSEMOVE => {
                 let p = point();
-                if let (Some(from), Some(d)) = (self.select_from, &self.display) {
+                if let (Some(from), Some(d)) =
+                    (self.select_from, self.display.as_ref().filter(|_| self.current_shown()))
+                {
                     let to = d.view.screen_to_image(p);
                     let (w, h) = d.view.image_size();
                     let selection = selection_rect(from, to, (w, h));
@@ -2107,17 +2141,8 @@ impl App {
                 self.clear_notice();
                 Some(LRESULT(0))
             }
-            WM_CLOSE => {
-                self.quit();
-                Some(LRESULT(0))
-            }
-            // logoff or shutdown ends the process without WM_CLOSE: keep the placement anyway
-            WM_ENDSESSION if wp.0 != 0 => {
-                if let Some(h) = self.hwnd {
-                    self.remember_placement(h);
-                }
-                Some(LRESULT(0))
-            }
+            // WM_CLOSE, WM_QUERYENDSESSION and WM_ENDSESSION are handled by the window procedure
+            // (see `session`): they must be answered while a modal dialog has the app too
             super::WM_APP_WAKE => Some(LRESULT(0)), // the caller drains the queues
             _ => None,
         }

@@ -116,6 +116,10 @@ struct State {
     /// Decodes running, with the token of the newest job per path. A cancelled job keeps running
     /// until its decoder next checks the token; asking for its path again starts a new job.
     in_flight: HashMap<PathBuf, CancelToken>,
+    /// Running decodes of files written since they started (see [`Pipeline::invalidate`]): they
+    /// may have read the old bytes, so whatever they produce is dropped, never cached or
+    /// announced.
+    stale: Vec<CancelToken>,
     failed: HashSet<PathBuf>,
     /// Images whose decoded size is too large to prefetch (more than half the budget): they are
     /// decoded only when the user opens them.
@@ -299,6 +303,8 @@ impl Shared {
             let src = crate::archive::source_for_cancellable(&job.path, &cancel)?;
             let info = self.registry.probe(&src)?;
             let bytes = expected_bytes(&info);
+            // a header read just before the file was written over is not announced
+            cancel.check()?;
             if job.kind == Kind::Foreground {
                 (self.sink)(PipelineEvent::Probed { path: job.path.clone(), info });
             } else if cached_bytes(&info) > self.config.budget_bytes / 2 {
@@ -331,6 +337,14 @@ impl Shared {
             {
                 st.foreground_running.remove(i);
             }
+            // the file was written while this decode ran: its pixels may be the old ones
+            let result = match st.stale.iter().position(|t| t.same(&cancel)) {
+                Some(i) => {
+                    st.stale.swap_remove(i);
+                    Err(Error::Cancelled)
+                }
+                None => result,
+            };
             // a quick-browse frame the user has already passed is still worth showing
             let quick_frame = job.kind == Kind::Foreground && st.quick;
             match result {
@@ -560,14 +574,21 @@ impl Pipeline {
         hit
     }
 
-    /// Forgets a cached decode, e.g. after the file was saved over.
+    /// Forgets everything known about `path`, e.g. after the file was saved over: its cached
+    /// decode, and a decode of it still running (which may have read the old bytes) is cancelled
+    /// and its result dropped, so the next request decodes the file anew.
     pub fn invalidate(&self, path: &Path) {
         let mut st = self.shared.lock();
         if let Some(e) = st.cache.remove(path) {
             st.used_bytes -= e.bytes;
         }
+        if let Some(token) = st.in_flight.remove(path) {
+            token.cancel();
+            st.stale.push(token);
+        }
         st.failed.remove(path);
         st.too_big_to_prefetch.remove(path);
+        st.sizes.remove(path);
     }
 
     pub fn cached(&self, path: &Path) -> Option<Arc<Decoded>> {

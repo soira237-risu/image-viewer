@@ -244,6 +244,20 @@ pub fn show(owner: HWND, s: &Settings, activate: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The save quality was changed elsewhere (the edit panel's slider): the window's copy and its
+/// field follow, without reporting it back, so its next change or Save does not bring back the
+/// old quality.
+pub fn set_quality(quality: u8) {
+    VALUE.with(|v| v.borrow_mut().save_quality = quality);
+    WINDOW.with(|w| {
+        let w = w.borrow();
+        let Some(w) = w.as_ref() else { return };
+        SYNCING.with(|c| c.set(true));
+        controls::set_text(w.quality, &quality.to_string());
+        SYNCING.with(|c| c.set(false));
+    });
+}
+
 /// Relabels the window (if it exists) in another language.
 pub fn set_language(s: &Strings) {
     WINDOW.with(|w| {

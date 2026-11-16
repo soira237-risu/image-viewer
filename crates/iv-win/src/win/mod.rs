@@ -7,6 +7,7 @@ pub mod help;
 pub mod keys;
 pub mod menu;
 pub mod panel;
+pub mod session;
 pub mod settings_window;
 pub mod shell;
 pub mod window;

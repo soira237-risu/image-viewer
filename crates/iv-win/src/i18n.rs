@@ -111,13 +111,16 @@ strings! {
     // startup: settings and keymap files that could not be used
     settings_unreadable, keymap_warning, settings_backed_up,
     // deleting, the clipboard and Explorer
-    delete_confirm, delete_unsaved, deleted, delete_failed, archive_page_delete, copied_image, copied_file,
+    delete_confirm, delete_unsaved, deleted, delete_failed, archive_page_delete, delete_not_shown, copied_image,
+    copied_file,
     copied_path, copy_not_loaded, clipboard_failed, archive_page_copy_file, show_in_folder_failed,
     // "Open with" registration and the About box
     registered, unregistered, register_failed, default_apps_failed, image_type_name, archive_type_name,
     app_description, about_text,
     // failures without a console to report them: the folder listing, the window, a crash
     folder_list_failed, window_failed, crash_title, crash_message,
+    // what logoff or shutdown would lose (shown by Windows)
+    shutdown_saving, shutdown_unsaved,
 }
 
 impl Strings {
@@ -298,6 +301,7 @@ pub static KO: Strings = Strings {
     deleted: "{name}을(를) 휴지통으로 옮겼습니다",
     delete_failed: "{name}을(를) 휴지통으로 옮기지 못했습니다",
     archive_page_delete: "압축파일 안의 페이지는 지울 수 없습니다",
+    delete_not_shown: "{name}이(가) 아직 화면에 나오지 않아 휴지통으로 옮기지 않았습니다",
     copied_image: "이미지를 복사했습니다 ({width}×{height})",
     copied_file: "파일을 복사했습니다",
     copied_path: "경로를 복사했습니다",
@@ -320,6 +324,8 @@ pub static KO: Strings = Strings {
     window_failed: "창을 만들지 못했습니다: {error}",
     crash_title: "이미지 뷰어 오류",
     crash_message: "문제가 생겨 이미지 뷰어를 닫습니다.\n\n자세한 내용을 다음 파일에 남겼습니다:\n{path}",
+    shutdown_saving: "{name} 저장 중",
+    shutdown_unsaved: "{name}에 저장하지 않은 편집이 있습니다",
 };
 
 pub static EN: Strings = Strings {
@@ -441,6 +447,7 @@ pub static EN: Strings = Strings {
     deleted: "moved {name} to the Recycle Bin",
     delete_failed: "{name} was not moved to the Recycle Bin",
     archive_page_delete: "pages inside an archive cannot be deleted",
+    delete_not_shown: "{name} is not on screen yet, so it was not moved to the Recycle Bin",
     copied_image: "copied the image ({width}×{height})",
     copied_file: "copied the file",
     copied_path: "copied the path",
@@ -463,6 +470,8 @@ pub static EN: Strings = Strings {
     window_failed: "cannot create the window: {error}",
     crash_title: "image-viewer error",
     crash_message: "image-viewer ran into a problem and has to close.\n\nThe details were written to:\n{path}",
+    shutdown_saving: "saving {name}",
+    shutdown_unsaved: "{name} has unsaved edits",
 };
 
 #[cfg(test)]

@@ -3,9 +3,11 @@
 //! The app lives in a thread-local cell. Modal dialogs it opens (file pickers, message boxes)
 //! run nested message loops that call back into the window procedure while the app is
 //! borrowed; those messages are answered without it (paint blits the last frame, a new client
-//! size waits for the app's next drain, the rest go to Windows or wait in the queues the app
-//! drains afterwards). Painting renders without draining and drains only after the frame is
-//! released and the window validated, so a dialog opened while draining can paint safely.
+//! size waits for the app's next drain, a close waits until the app is free, logoff and shutdown
+//! are answered from what the app published (`session`), the rest go to Windows or wait in the
+//! queues the app drains afterwards). Painting renders without draining and drains only after
+//! the frame is released and the window validated, so a dialog opened while draining can paint
+//! safely.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -29,7 +31,7 @@ use windows::core::{PCWSTR, w};
 
 use super::app::App;
 use super::controls::scale;
-use super::{controls, help, panel, settings_window};
+use super::{controls, help, panel, session, settings_window};
 use crate::keymap::Keymap;
 use crate::raster::Frame;
 use crate::settings::{Settings, WindowPlacement};
@@ -62,6 +64,12 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
         let app = guard.as_mut()?;
         let r = f(app);
         app.drain();
+        // a close asked for while a modal dialog had the app, now that it is free
+        if session::take_deferred_close() {
+            app.quit();
+            app.drain();
+        }
+        app.publish_session();
         Some(r)
     })
 }
@@ -145,6 +153,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         WM_ERASEBKGND => LRESULT(1),
         WM_DESTROY => {
             unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        // never left to DefWindowProc, which would destroy the window without asking about
+        // unsaved edits or keeping the placement: while the app is busy in a modal dialog
+        // (another program closing the window), the close waits until it is free
+        WM_CLOSE => {
+            if with_app(App::quit).is_none() {
+                session::defer_close();
+            }
+            LRESULT(0)
+        }
+        // answered without the app, which may be busy in a modal dialog: see `session`
+        WM_QUERYENDSESSION => LRESULT(isize::from(session::query_end(lp.0 as u32))),
+        WM_ENDSESSION => {
+            if wp.0 != 0 {
+                session::end(hwnd);
+            }
             LRESULT(0)
         }
         WM_DPICHANGED => {

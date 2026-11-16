@@ -529,6 +529,96 @@ impl Drop for Gated {
     }
 }
 
+/// Reads the whole file of names starting with `prefix` first, then holds the decode until
+/// `open` is set, then decodes the bytes it read: like a decoder that has the old bytes in
+/// memory while the file is written over.
+struct Snapshot {
+    info: iv_codec::DecoderInfo,
+    prefix: &'static str,
+    open: Arc<AtomicBool>,
+    waiting: Arc<AtomicUsize>,
+}
+
+impl iv_codec::Decoder for Snapshot {
+    fn info(&self) -> &iv_codec::DecoderInfo {
+        &self.info
+    }
+    fn claims(&self, src: &Source, _: FormatId) -> iv_core::Result<bool> {
+        Ok(src.display_name().starts_with(self.prefix))
+    }
+    fn probe(&self, _: &Source, _: FormatId) -> iv_core::Result<ImageInfo> {
+        Err(iv_core::Error::decode("snapshot", "probe by the next decoder"))
+    }
+    fn decode(&self, src: &Source, _: FormatId, _: &CancelToken) -> iv_core::Result<iv_codec::Decoded> {
+        let bytes = src.read_all()?;
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        while !self.open.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.waiting.fetch_sub(1, Ordering::AcqRel);
+        let rgba = image::load_from_memory(&bytes).map_err(|e| iv_core::Error::decode("snapshot", e))?.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let info = ImageInfo {
+            format: FormatId::Png,
+            codec: "snapshot",
+            width,
+            height,
+            frame_count: Some(1),
+            has_alpha: false,
+            bits_per_channel: 8,
+            orientation: iv_core::Orientation::Normal,
+            icc_profile: None,
+            exif: None,
+        };
+        let image = iv_core::ImageBuf::new(width, height, iv_core::PixelFormat::Rgba8, rgba.into_raw())?;
+        Ok(iv_codec::Decoded::still(info, image))
+    }
+}
+
+#[test]
+fn a_file_saved_over_while_it_decodes_is_decoded_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("edited.png");
+    let old = image::Rgba([10, 0, 0, 255]);
+    let new = image::Rgba([200, 0, 0, 255]);
+    image::RgbaImage::from_pixel(SIDE, SIDE, old).save(&file).unwrap();
+    let gate = Gated::default();
+    let mut reg = iv_codec::default_registry();
+    reg.register(Arc::new(Snapshot {
+        info: iv_codec::DecoderInfo { id: "snapshot", name: "snapshot", formats: &[FormatId::Png], priority: 1000 },
+        prefix: "edited",
+        open: gate.open.clone(),
+        waiting: gate.waiting.clone(),
+    }));
+    let (p, rx) = pipeline_with(reg, u64::MAX, 1, |_| {});
+    // declared after the pipeline, so a failing assertion opens the gate before the pipeline
+    // waits for its workers
+    let gate = gate;
+
+    // the decode has the old bytes in hand when a save in place writes the file
+    p.request(&file, &[]);
+    gate.wait_for(1);
+    image::RgbaImage::from_pixel(SIDE, SIDE, new).save(&file).unwrap();
+    p.invalidate(&file);
+    // the viewer asks for the saved file again: a fresh decode starts beside the stale one
+    p.request(&file, &[]);
+    gate.wait_for(2);
+    gate.open();
+    let shown = ready_for(&rx, &file);
+    assert_eq!(&shown.image.data()[..4], &new.0, "the saved pixels are announced, not the old ones");
+    settle(&p);
+    // the stale decode is done once it has given back its reservation
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while p.stats().reserved_bytes != 0 {
+        assert!(Instant::now() < deadline, "{:?}", p.stats());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(readies(&rx).is_empty(), "the stale decode is not announced afterwards either");
+    let cached = p.cached(&file).expect("the new decode is cached");
+    assert_eq!(&cached.image.data()[..4], &new.0, "the cache holds the saved pixels");
+}
+
 /// Counts the decodes of files whose name starts with `prefix`, then lets the next decoder
 /// (image-rs) decode them for real.
 struct Counter {

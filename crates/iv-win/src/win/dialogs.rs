@@ -163,3 +163,24 @@ pub fn choose_color(owner: HWND, initial: [u8; 3]) -> Option<[u8; 3]> {
         ok.then_some([c as u8, (c >> 8) as u8, (c >> 16) as u8])
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+    use windows::Win32::UI::Shell::FOS_NOCHANGEDIR;
+
+    /// Relative paths (a file named on the command line) stay valid after a file dialog: unlike
+    /// the old `GetOpenFileName`, the item dialogs keep the current folder unless told otherwise.
+    #[test]
+    fn file_dialogs_never_change_the_current_folder() {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let open: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).unwrap();
+            let save: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).unwrap();
+            for dlg in [&*open, &*save] {
+                assert!(dlg.GetOptions().unwrap().contains(FOS_NOCHANGEDIR));
+            }
+        }
+    }
+}
