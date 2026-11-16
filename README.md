@@ -73,7 +73,7 @@ cargo build --release
 
 - 저장소 최상위에 `LICENSE` 파일이 있는지 (**아직 라이선스가 정해지지 않아 지금은 여기서 실패함**. 소유자가 라이선스를 고르고 `LICENSE`와 `Cargo.toml`의 `license`를 추가해야 릴리스 가능)
 - 태그와 `Cargo.toml` 버전이 같은지, `CHANGELOG.md`에 그 버전 절이 있는지, `rust-version`이 잠긴 의존성들의 최소 Rust 버전 이상인지
-- 깨끗한 릴리스 빌드(`target/package-build`, 끝나면 지움): 빌드한 컴퓨터의 경로(사용자 폴더·Cargo 폴더·저장소 위치)를 `--remap-path-prefix`로 지움 (.pdb는 rustc가 원래 파일 이름만 넣음)
+- 깨끗한 릴리스 빌드(`target/package-build`, 성공·실패·Ctrl+C 어느 쪽으로 끝나도 지움. `-KeepBuild`면 남김): 빌드한 컴퓨터의 경로(사용자 폴더·Cargo 폴더·저장소 위치)를 `--remap-path-prefix`로 지움 (.pdb는 rustc가 원래 파일 이름만 넣음)
 - 두 실행 파일이 C 런타임 DLL(`VCRUNTIME140.dll` 등)을 가져다 쓰지 않는지, 빌드 경로가 들어 있지 않은지, 버전이 맞는지
 - 서드파티 고지: [scripts/notices.ps1](scripts/notices.ps1)이 `Cargo.lock`과 로컬 Cargo 레지스트리에서 실행 파일에 들어가는 패키지(빌드 스크립트·프로시저 매크로·테스트 전용 제외)의 라이선스와 전문을 모아 `THIRD-PARTY-NOTICES.txt`를 씀. 허용 목록 밖의 라이선스나 전문이 없는 패키지가 있으면 실패
 

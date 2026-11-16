@@ -20,7 +20,7 @@ cargo test --workspace --locked --no-fail-fast
 
 - `-p <크레이트>`로 일부만 빌드하면 기능(feature) 조합이 달라져 같은 의존성이 한 벌 더 생김. 빠른 확인용으로는 써도 되지만, 기본은 `--workspace`
 - 릴리스 빌드(`--release`)는 속도·메모리 측정이나 실행 파일 확인이 필요할 때만. 결과물이 5 GB 이상
-- 배포용 zip은 `pwsh -File scripts/package.ps1 -Jobs 3` (README "릴리스 만들기"). 경로를 지우는 플래그가 달라 `target/package-build`에 따로 빌드하고 끝나면 지움
+- 배포용 zip은 `pwsh -File scripts/package.ps1 -Jobs 3` (README "릴리스 만들기"). 경로를 지우는 플래그가 달라 `target/package-build`에 따로 빌드하고, 성공하든 중간에 실패하든 끝나면 지움 (강제 종료로 남은 것은 `scripts/cache.ps1`이 지움)
 - 커밋 전에는 위 세 명령이 모두 통과해야 함
 
 ## 디스크 사용 규칙 (중요)
@@ -40,6 +40,8 @@ Cargo는 옛 빌드 결과물을 지우지 않는다(rust-lang/cargo#13136). 의
    - 에이전트는 **긴 작업(의존성·기능·프로필 변경, `-p` 빌드 여러 번)을 마치면 직접 한 번 실행**한다
    - 다른 cargo/rustc가 돌고 있거나 명령이 실패하면 아무것도 지우지 않는다 (종료 코드 2)
    - 릴리스 빌드는 7일 동안 안 쓰면 통째로 지운다. 계속 쓰는 중이면 `-IncludeRelease`로 같은 방식 정리
+   - `target/package-build`: 패키지 실행이 강제 종료돼 남은 것(`.package-run`의 프로세스가 없고 `.package-kept` 표시도 없음)은 바로, `-KeepBuild`로 남긴 것은 7일 동안 안 쓰면 지운다. 실행 중인 패키지 빌드는 건드리지 않는다
+   - `target/dist`: 가장 최근에 만든 버전의 zip만 남기고 이전 버전과 중단된 실행의 임시 폴더를 지운다. 이 두 가지는 cargo 명령이 필요 없어 `-Auto`가 한도 아래일 때도 정리한다
 
 2. **의존성 기능은 워크스페이스에서만 정한다.** 멤버 크레이트의 `Cargo.toml`에서 `features = [...]`를 덧붙이지 않고 루트 `[workspace.dependencies]`에 합친다. 테스트 전용 기능도 만들지 않는다(테스트에서만 켜지는 기능은 그 크레이트와 위쪽 전부를 두 번 빌드하게 만든다 — 7z 테스트는 그래서 만들어 둔 픽스처 `testdata/archive/book.cb7`를 읽는다)
 

@@ -16,6 +16,12 @@ found through the links. Incremental caches untouched for -StaleDays are deleted
 release build untouched for -StaleDays (release builds are only for measuring; use
 -IncludeRelease to sweep it like debug instead).
 
+scripts/package.ps1 deletes its build tree (target/package-build) whenever its run ends. A tree
+whose run was killed (no live owner in .package-run, no .package-kept mark) is deleted here, one
+kept with -KeepBuild once unused for -StaleDays. In target/dist only the packages of the most
+recently packaged version are kept; staging folders of interrupted runs are deleted. These need
+no cargo commands, so -Auto removes them even below its limit.
+
 Nothing is deleted when another Cargo or rustc is running, or when any of the commands fails
 (the set of live units would be incomplete).
 
@@ -60,8 +66,9 @@ function Show-Status([string]$Label) {
     $drive = (Get-Item $root).PSDrive
     $free = [double](Get-PSDrive $drive.Name).Free / 1GB
     $total = Get-SizeGB $target
-    "{0}target {1:N1} GB (debug {2:N1}, release {3:N1}) | {4}: {5:N1} GB free" -f $Label, $total,
-        (Get-SizeGB (Join-Path $target 'debug')), (Get-SizeGB (Join-Path $target 'release')), $drive.Name, $free
+    "{0}target {1:N1} GB (debug {2:N1}, release {3:N1}, package-build {4:N1}) | {5}: {6:N1} GB free" -f $Label, $total,
+        (Get-SizeGB (Join-Path $target 'debug')), (Get-SizeGB (Join-Path $target 'release')),
+        (Get-SizeGB (Join-Path $target 'package-build')), $drive.Name, $free
     return @{ Total = $total; Free = $free }
 }
 
@@ -71,6 +78,17 @@ function Test-Limits($s) {
     if ($s.Free -lt $MinFreeGB) { $over += "less than $MinFreeGB GB free" }
     if ($over) { Write-Host "over the limit: $($over -join ', ') — run with -Clean to delete target/ entirely"; return 1 }
     return 0
+}
+
+# True while the package run that wrote $LockFile (its process id and start time) is running.
+# The same check is in scripts/package.ps1, which writes the file.
+function Test-PackageRunLive([string]$LockFile) {
+    if (-not (Test-Path -LiteralPath $LockFile)) { return $false }
+    try {
+        $id, $ticks = (Get-Content -LiteralPath $LockFile -Raw).Trim() -split '\s+'
+        $proc = Get-Process -Id ([int]$id) -ErrorAction Stop
+    } catch { return $false }
+    try { return $proc.StartTime.ToUniversalTime().Ticks -eq [long]$ticks } catch { return $proc.ProcessName -in 'pwsh', 'powershell' }
 }
 
 function Remove-Item-Safe([string]$Path) {
@@ -85,13 +103,54 @@ if ($Clean) {
     $s = Show-Status 'after:  '; $s[0]; exit 0
 }
 
+# scripts/package.ps1 builds in target/package-build and deletes it when the run ends, even on
+# failure. A tree is left only by a killed run (owner gone, no mark) or kept on purpose with
+# -KeepBuild (marked .package-kept): the first is deleted, the second once unused for -StaleDays.
+function Invoke-PackageSweep {
+    $packageBuild = Join-Path $target 'package-build'
+    $packageLive = Test-PackageRunLive (Join-Path $packageBuild '.package-run')
+    if (Test-Path -LiteralPath $packageBuild) {
+        $kept = Get-Item -LiteralPath (Join-Path $packageBuild '.package-kept') -Force -ErrorAction SilentlyContinue
+        if ($packageLive) {
+            'package-build: kept (a package run is using it)'
+        } elseif ($kept -and $kept.LastWriteTime -ge (Get-Date).AddDays(-$StaleDays)) {
+            "package-build: kept (-KeepBuild, used within $StaleDays days)"
+        } else {
+            Remove-Item-Safe $packageBuild
+            "package-build: $(if ($kept) { "kept with -KeepBuild but unused for $StaleDays days" } else { 'left by an interrupted package run' }), $(if ($DryRun) { 'would be deleted' } else { 'deleted' })"
+        }
+    }
+    # target/dist keeps the packages of the most recently packaged version; staging folders exist
+    # only while a run is writing the zips
+    $dist = Join-Path $target 'dist'
+    if ((Test-Path -LiteralPath $dist) -and -not $packageLive) {
+        $pattern = '^image-viewer-(?<v>.+?)-x86_64-windows(-symbols)?(\.zip(\.sha256)?)?$'
+        $newest = Get-ChildItem -LiteralPath $dist -File -Force | Where-Object { $_.Name -match $pattern -and $_.Extension -eq '.zip' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        $keep = if ($newest -and $newest.Name -match $pattern) { $Matches.v }
+        $n = 0
+        foreach ($item in Get-ChildItem -LiteralPath $dist -Force) {
+            if ($item.Name -notmatch $pattern) { continue }
+            if (-not $item.PSIsContainer -and $Matches.v -eq $keep) { continue }
+            Remove-Item-Safe $item.FullName
+            $n++
+        }
+        if ($n) { "dist: $n items of older versions or interrupted runs $(if ($DryRun) { 'found' } else { 'deleted' }), kept $(if ($keep) { $keep } else { 'nothing' })" }
+    }
+}
+
 $before = Show-Status 'before: '
 $before[0]
-if ($Auto -and $before[1].Total -le $AutoGB -and $before[1].Free -ge $MinFreeGB) { "auto: below $AutoGB GB, nothing to do"; exit 0 }
+$busy = Get-Process cargo, rustc, clippy-driver, rustdoc -ErrorAction SilentlyContinue
+if ($Auto -and $before[1].Total -le $AutoGB -and $before[1].Free -ge $MinFreeGB) {
+    # leftovers of package runs need no cargo commands, so they go even below the limit
+    if (-not $busy -and (Test-Path $target)) { Invoke-PackageSweep }
+    "auto: below $AutoGB GB, nothing else to do"; exit 0
+}
 if ($Report -or -not (Test-Path $target)) { exit (Test-Limits $before[1]) }
 
-$busy = Get-Process cargo, rustc, clippy-driver, rustdoc -ErrorAction SilentlyContinue
 if ($busy) { "skipped: another build is running ($(($busy | ForEach-Object Name | Sort-Object -Unique) -join ', '))"; exit 2 }
+Invoke-PackageSweep
 
 # Unit folders and copied outputs that the given cargo commands use.
 function Get-LiveSet([string]$Profile, $Commands) {
