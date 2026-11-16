@@ -17,7 +17,7 @@ M0~M6 완료:
 - 편집: 회전·뒤집기·자르기·보정·크기 변경, 실행 취소, 저장/다른 이름으로 저장 (JPEG 회전은 무손실)
 - 변환: 9개 형식 인코더, 일괄 변환 CLI, 확장자 바로잡기
 
-설계와 개발 단계는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 참고.
+설계와 개발 단계는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), 개발 규칙(빌드 캐시 용량 관리 포함)은 [AGENTS.md](AGENTS.md) 참고.
 
 ## 빌드
 

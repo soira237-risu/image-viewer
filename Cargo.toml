@@ -44,6 +44,10 @@ codegen-units = 1
 lto = "thin"
 debug = "line-tables-only"
 
+[profile.dev]
+# line numbers for panics and backtraces, without full variable info (that made 1.7 GB of .pdb)
+debug = "line-tables-only"
+
 # Decoders are the hot path; keep them optimized even in dev builds so timings stay meaningful.
 [profile.dev.package."*"]
 opt-level = 3
