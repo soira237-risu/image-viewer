@@ -211,11 +211,15 @@ pub fn release_cache() {
 /// Largest 7z header (the file list), in KiB, read and decompressed. The header is the archive's
 /// own claim and a few kilobytes of LZMA can expand to gigabytes before it is parsed, so it is
 /// held to this. Parsing it then needs at most about 100 bytes per header byte (the crate bounds
-/// every count by the header's length), so a hostile header costs some 1.6 GB at worst, briefly;
-/// real ones take 50 to 100 bytes per file, so this still lists 150 000 files or more. It also
-/// bounds the dictionary used to decompress the header (16 MiB; 7-Zip uses 1 MiB, the
-/// `sevenz-rust2` writer 8 MiB).
-const SEVEN_Z_HEADER_KIB: usize = 16 * 1024;
+/// every count by the header's length), so a hostile header costs some 1.7 GB at worst, briefly;
+/// real ones take 50 to 100 bytes per file, so this still lists 150 000 files or more.
+///
+/// `sevenz-rust2` has one limit for both the decoded header and the memory of the decoder that
+/// produces it, so this is also the largest header dictionary plus that decoder's state: a
+/// 16 MiB dictionary, the largest a common writer uses (py7zr's default, LZMA2 preset 7, needs
+/// 16 488 KiB; 7-Zip uses 1 MiB, the `sevenz-rust2` writer 8 MiB), and 1 MiB to spare. Not
+/// 64 MiB: that would let a hostile header cost four times as much to parse.
+const SEVEN_Z_HEADER_KIB: usize = 16 * 1024 + 1024;
 
 /// Largest dictionary, in KiB, a 7z block may ask for: as large as the largest entry read
 /// ([`MAX_ENTRY_BYTES`]) plus the decoder's own state. A block declaring more is refused before
@@ -642,11 +646,25 @@ mod seven_z_tests {
         assert!(err.contains(&format!("over the {SEVEN_Z_DICTIONARY_KIB} KiB limit")), "{err}");
     }
 
+    /// `header-lzma2-16m.cb7`: p1.png ("one") and p2.png ("two") (7-Zip, `-mhc=off`), the
+    /// header then moved into an LZMA2 stream (one stored chunk) whose dictionary property says
+    /// 16 MiB, as py7zr writes every header by default (LZMA2 preset 7). Decoding it needs
+    /// 16 488 KiB, more than the 16 MiB of header it may produce, so the header limit has to
+    /// leave room for the decoder too.
+    #[test]
+    fn a_7z_header_compressed_with_a_16_mib_dictionary_opens() {
+        let _turn = exclusive();
+        let cb7 = fixture("header-lzma2-16m.cb7");
+        assert_eq!(page_names(&cb7), ["p1.png", "p2.png"]);
+        assert_eq!(&*source_for(&cb7.join("p2.png")).unwrap().read_all().unwrap(), b"two");
+    }
+
     #[test]
     fn a_7z_header_at_the_limit_parses_into_a_bounded_index() {
         // every file of the index costs one entry per header byte at worst
         let worst = SEVEN_Z_HEADER_KIB as u64 * 1024 * std::mem::size_of::<sevenz_rust2::ArchiveEntry>() as u64;
-        assert!(worst <= 1700 * 1000 * 1000, "{worst} bytes");
+        // the bound the docs give (about 1.7 GB); an `ArchiveEntry` that grows would break it
+        assert!(worst <= 1750 * 1000 * 1000, "{worst} bytes");
     }
 
     fn page_names(archive: &Path) -> Vec<String> {

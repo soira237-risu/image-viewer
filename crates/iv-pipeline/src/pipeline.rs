@@ -233,6 +233,30 @@ impl State {
         (self.used_bytes - replaced).saturating_add(bytes) <= budget.saturating_add(evictable)
     }
 
+    /// Whether a decode of `path` is running that will be announced (one cancelled when the user
+    /// left the image will not be).
+    fn running(&self, path: &Path) -> bool {
+        self.in_flight.get(path).is_some_and(|t| !t.is_cancelled())
+    }
+
+    /// Records that the prefetch of `path` (token `cancel`, already out of `in_flight`) stopped
+    /// at the size check because the image is too big to prefetch. If the user has moved onto
+    /// it since, this job was its load (asking for it started none while this one ran live), so
+    /// a foreground load is queued; returns whether one was. Not when this job had been
+    /// cancelled: the user left the image first, and coming back to it started a load of its
+    /// own (queued, running or even finished), which a second one would only repeat.
+    fn too_big_to_prefetch(&mut self, path: PathBuf, cancel: &CancelToken) -> bool {
+        let requeue = self.plan.first() == Some(&path)
+            && !cancel.is_cancelled()
+            && !self.running(&path)
+            && !self.foreground.iter().any(|j| j.path == path);
+        if requeue {
+            self.foreground.push_back(Job { path: path.clone(), kind: Kind::Foreground });
+        }
+        self.too_big_to_prefetch.insert(path);
+        requeue
+    }
+
     fn stats(&self) -> Stats {
         Stats {
             cached: self.cache.len(),
@@ -369,14 +393,7 @@ impl Shared {
             let is_current = st.plan.first() == Some(&job.path);
             match result {
                 Ok(None) => {
-                    // The user moved onto it after the size check: this job was its load (asking
-                    // for it started none while this one ran), so it is loaded as the image on
-                    // screen now.
-                    if is_current && !st.foreground.iter().any(|j| j.path == job.path) {
-                        st.foreground.push_back(Job { path: job.path.clone(), kind: Kind::Foreground });
-                        requeued = true;
-                    }
-                    st.too_big_to_prefetch.insert(job.path);
+                    requeued = st.too_big_to_prefetch(job.path, &cancel);
                     None
                 }
                 Ok(Some(decoded)) => {
@@ -569,8 +586,7 @@ impl Pipeline {
             e.decoded.clone()
         });
         // a decode of this image that was cancelled when the user left it will not be announced
-        let running = |st: &State, p: &Path| st.in_flight.get(p).is_some_and(|t| !t.is_cancelled());
-        if hit.is_none() && !running(&st, current) {
+        if hit.is_none() && !st.running(current) {
             // an explicit request retries a file that failed before
             st.failed.remove(current);
             st.foreground.push_back(Job { path: current.to_path_buf(), kind: Kind::Foreground });
@@ -592,7 +608,7 @@ impl Pipeline {
             if planned > budget {
                 break;
             }
-            if !st.cache.contains_key(p) && !running(&st, p) {
+            if !st.cache.contains_key(p) && !st.running(p) {
                 todo.push(p.clone());
             }
         }
@@ -651,6 +667,70 @@ impl Drop for Pipeline {
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod too_big_tests {
+    use super::*;
+
+    fn on_screen(path: &Path) -> State {
+        State { plan: vec![path.to_path_buf()], ..State::default() }
+    }
+
+    fn queued(st: &State) -> usize {
+        st.foreground.len()
+    }
+
+    #[test]
+    fn a_live_prefetch_the_user_moved_onto_becomes_its_load() {
+        let big = Path::new("big.png");
+        let mut st = on_screen(big);
+        assert!(st.too_big_to_prefetch(big.into(), &CancelToken::new()));
+        assert_eq!(queued(&st), 1);
+        assert!(st.too_big_to_prefetch.contains(big));
+        // another late result for it adds nothing
+        assert!(!st.too_big_to_prefetch(big.into(), &CancelToken::new()));
+        assert_eq!(queued(&st), 1);
+    }
+
+    #[test]
+    fn a_prefetch_not_on_screen_is_only_remembered() {
+        let big = Path::new("big.png");
+        let mut st = on_screen(Path::new("other.png"));
+        assert!(!st.too_big_to_prefetch(big.into(), &CancelToken::new()));
+        assert_eq!(queued(&st), 0);
+        assert!(st.too_big_to_prefetch.contains(big));
+    }
+
+    /// The prefetch was cancelled (the user left the image) after its last cancellation check
+    /// and came back with `Ok(None)` after the user had returned: coming back already started a
+    /// load, which a second one would repeat.
+    #[test]
+    fn a_cancelled_prefetch_does_not_load_the_image_again() {
+        let big = Path::new("big.png");
+        let late = CancelToken::new();
+        late.cancel();
+
+        // the load the return started is running on another worker
+        let mut st = on_screen(big);
+        st.in_flight.insert(big.into(), CancelToken::new());
+        assert!(!st.too_big_to_prefetch(big.into(), &late));
+        assert_eq!(queued(&st), 0);
+
+        // it has already finished (say it failed fast): nothing is running or queued
+        let mut st = on_screen(big);
+        assert!(!st.too_big_to_prefetch(big.into(), &late));
+        assert_eq!(queued(&st), 0);
+    }
+
+    #[test]
+    fn a_live_load_already_running_is_not_doubled() {
+        let big = Path::new("big.png");
+        let mut st = on_screen(big);
+        st.in_flight.insert(big.into(), CancelToken::new());
+        assert!(!st.too_big_to_prefetch(big.into(), &CancelToken::new()));
+        assert_eq!(queued(&st), 0);
     }
 }
 

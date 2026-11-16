@@ -14,7 +14,7 @@ M0~M6 완료:
 - 빠른 보기: CPU 렌더러(보이는 부분만 SIMD 리샘플, 크게 줄일 때는 절반·4분의 1 크기 단계에서, GDI로 표시), 100%는 화면 픽셀에 맞춰 원본 그대로(번짐 없음), 미리보기 먼저, 방향 고려 미리 읽기(메모리 예산에 들어가는 이웃만), 키를 누르고 있을 때의 빠른 넘김
 - 16비트·부동소수 이미지는 화면용 8비트로 바꿔 캐시(디코드 작업자에서, 메모리 절반 이하). 저장은 파일을 다시 읽어 원래 정밀도로
 - 형식: JPEG, PNG/APNG, GIF, WebP, AVIF, HEIC, JPEG XL, TIFF, BMP, ICO, QOI, TGA, PNM, DDS, EXR, HDR, SVG, 카메라 RAW, ICC 색 관리 (HEIC와 RAW는 Windows 코덱으로 읽음: [선택 코덱](#선택-코덱-heicraw) 참고)
-- 압축파일: ZIP/CBZ, 7z/CB7 (만화 두 쪽 보기, 7z는 페이지가 든 압축 블록만 풂). `\`로 구분한 항목 이름(일부 Windows 도구)도 열림. 압축파일 밖을 가리키는 이름(`..`, `C:`, `/`로 시작)의 항목은 목록에서 빠짐. 항목 하나는 1 GiB까지 읽음. 7z의 헤더(파일 목록)는 풀어서 16 MiB까지, 압축 사전은 1 GiB까지만 받음
+- 압축파일: ZIP/CBZ, 7z/CB7 (만화 두 쪽 보기, 7z는 페이지가 든 압축 블록만 풂). `\`로 구분한 항목 이름(일부 Windows 도구)도 열림. 압축파일 밖을 가리키는 이름(`..`, `C:`, `/`로 시작)의 항목은 목록에서 빠짐. 항목 하나는 1 GiB까지 읽음. 7z의 헤더(파일 목록)는 풀어서 17 MiB까지(헤더 압축 사전 16 MiB까지, py7zr 기본값 포함), 압축 사전은 1 GiB까지만 받음
 - SVG: 문서 안에 `data:`로 넣은 이미지만 그림. 바깥 파일·네트워크 경로(`\\서버\...`)를 가리키는 이미지는 읽지 않고 빈 칸으로 둠
 - 편집: 회전·뒤집기·자르기·보정·크기 변경, 실행 취소, 저장/다른 이름으로 저장 (JPEG 회전은 무손실)
 - 변환: 9개 형식 인코더, 확장자 바로잡기(뷰어 Ctrl+E, `iv fix-ext`), 일괄 변환(`iv convert`, 명령줄 전용)
@@ -59,7 +59,6 @@ cargo build --release
 ./target/release/iv bench <파일|폴더>   # probe / preview / decode 시간 측정
 ./target/release/iv convert --to webp --opt quality=82 --max 1920 --out out <파일|폴더>   # 일괄 변환
 ./target/release/iv convert --to jpg --no-metadata --out out <파일|폴더>   # 위치(EXIF)·XMP·ICC·주석을 지운 사본 (JPEG→JPEG은 다시 압축하지 않음)
-|폴더>   # 일괄 변환
 ./target/release/iv fix-ext --dry-run <파일|폴더>   # 내용과 다른 확장자 찾기 (빼면 실제로 바꿈)
 ./target/release/image-viewer <파일|폴더>    # 뷰어 (--trace: 시작 단계별 시간 출력, --no-activate: 포커스를 가져가지 않고 열기)
 ./target/release/image-viewer --version     # 버전 (`iv --version`도 같음)
