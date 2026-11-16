@@ -126,23 +126,44 @@ fn open(src: &Source, format: FormatId) -> Result<impl ImageDecoder> {
     reader.into_decoder().map_err(err)
 }
 
-/// Converts to the pipeline's RGBA layouts, keeping 16-bit and float precision.
+/// Converts to the pipeline's RGBA layouts, keeping 16-bit and float precision. Deep pixels
+/// are written straight into the image's one buffer (no RGBA copy of the decoder's pixels to
+/// copy again).
 pub(crate) fn to_image_buf(img: DynamicImage) -> Result<ImageBuf> {
+    /// Copies `src` pixels of `C` channels into RGBA samples, `opaque` as alpha when `C` < 4.
+    fn widen<T: Copy, const C: usize>(src: &[T], out: &mut [T], opaque: T) {
+        for (o, p) in out.chunks_exact_mut(4).zip(src.chunks_exact(C)) {
+            o.copy_from_slice(&match C {
+                1 => [p[0], p[0], p[0], opaque],
+                2 => [p[0], p[0], p[0], p[1]],
+                3 => [p[0], p[1], p[2], opaque],
+                _ => [p[0], p[1], p[2], p[3]],
+            });
+        }
+    }
     let (w, h) = (img.width(), img.height());
-    match img.color() {
-        ColorType::Rgb16 | ColorType::Rgba16 | ColorType::L16 | ColorType::La16 => {
-            ImageBuf::byte_len(w, h, PixelFormat::Rgba16)?;
-            let raw = img.into_rgba16().into_raw();
-            ImageBuf::new(w, h, PixelFormat::Rgba16, bytemuck::cast_slice::<u16, u8>(&raw).to_vec())
+    match img {
+        DynamicImage::ImageLuma16(b) => {
+            ImageBuf::with_samples(w, h, PixelFormat::Rgba16, |o| widen::<u16, 1>(&b, o, u16::MAX))
         }
-        ColorType::Rgb32F | ColorType::Rgba32F => {
-            ImageBuf::byte_len(w, h, PixelFormat::RgbaF32)?;
-            let raw = img.into_rgba32f().into_raw();
-            ImageBuf::new(w, h, PixelFormat::RgbaF32, bytemuck::cast_slice::<f32, u8>(&raw).to_vec())
+        DynamicImage::ImageLumaA16(b) => {
+            ImageBuf::with_samples(w, h, PixelFormat::Rgba16, |o| widen::<u16, 2>(&b, o, u16::MAX))
         }
-        _ => {
+        DynamicImage::ImageRgb16(b) => {
+            ImageBuf::with_samples(w, h, PixelFormat::Rgba16, |o| widen::<u16, 3>(&b, o, u16::MAX))
+        }
+        DynamicImage::ImageRgba16(b) => {
+            ImageBuf::with_samples(w, h, PixelFormat::Rgba16, |o| widen::<u16, 4>(&b, o, u16::MAX))
+        }
+        DynamicImage::ImageRgb32F(b) => {
+            ImageBuf::with_samples(w, h, PixelFormat::RgbaF32, |o| widen::<f32, 3>(&b, o, 1.0))
+        }
+        DynamicImage::ImageRgba32F(b) => {
+            ImageBuf::with_samples(w, h, PixelFormat::RgbaF32, |o| widen::<f32, 4>(&b, o, 1.0))
+        }
+        other => {
             ImageBuf::byte_len(w, h, PixelFormat::Rgba8)?;
-            ImageBuf::new(w, h, PixelFormat::Rgba8, img.into_rgba8().into_raw())
+            ImageBuf::new(w, h, PixelFormat::Rgba8, other.into_rgba8().into_raw())
         }
     }
 }

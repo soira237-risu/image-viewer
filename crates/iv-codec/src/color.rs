@@ -55,10 +55,12 @@ fn convert(img: &ImageBuf, src: &ColorProfile, dst: &ColorProfile) -> Result<Ima
         PixelFormat::Rgba16 => {
             let t = src.create_transform_16bit(Layout::Rgba, dst, Layout::Rgba, opts).map_err(|e| e.to_string())?;
             let input: &[u16] = bytemuck::cast_slice(img.data());
-            let mut out = vec![0u16; input.len()];
-            t.transform(input, &mut out).map_err(|e| e.to_string())?;
-            ImageBuf::new(img.width(), img.height(), PixelFormat::Rgba16, bytemuck::cast_slice(&out).to_vec())
-                .map_err(|e| e.to_string())
+            let mut result = Ok(());
+            let out = ImageBuf::with_samples::<u16>(img.width(), img.height(), PixelFormat::Rgba16, |out| {
+                result = t.transform(input, out).map_err(|e| e.to_string());
+            })
+            .map_err(|e| e.to_string())?;
+            result.map(|()| out)
         }
         PixelFormat::RgbaF32 => Err("float".into()),
     }

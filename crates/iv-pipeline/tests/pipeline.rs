@@ -528,3 +528,85 @@ impl Drop for Gated {
         self.open();
     }
 }
+
+/// Counts the decodes of files whose name starts with `prefix`, then lets the next decoder
+/// (image-rs) decode them for real.
+struct Counter {
+    info: iv_codec::DecoderInfo,
+    prefix: &'static str,
+    decodes: Arc<AtomicUsize>,
+}
+
+impl iv_codec::Decoder for Counter {
+    fn info(&self) -> &iv_codec::DecoderInfo {
+        &self.info
+    }
+    fn claims(&self, src: &Source, _: FormatId) -> iv_core::Result<bool> {
+        Ok(src.display_name().starts_with(self.prefix))
+    }
+    fn probe(&self, _: &Source, _: FormatId) -> iv_core::Result<ImageInfo> {
+        Err(iv_core::Error::decode("counter", "probe by the next decoder"))
+    }
+    fn decode(&self, _: &Source, _: FormatId, _: &CancelToken) -> iv_core::Result<iv_codec::Decoded> {
+        self.decodes.fetch_add(1, Ordering::AcqRel);
+        Err(iv_core::Error::decode("counter", "counted"))
+    }
+}
+
+#[test]
+fn prefetching_never_decodes_what_the_budget_cannot_keep() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = write_pngs(dir.path(), 14);
+    let decodes = Arc::new(AtomicUsize::new(0));
+    let mut reg = iv_codec::default_registry();
+    reg.register(Arc::new(Counter {
+        info: iv_codec::DecoderInfo { id: "counter", name: "counter", formats: &[FormatId::Png], priority: 1000 },
+        prefix: "img",
+        decodes: decodes.clone(),
+    }));
+    // the current image and two neighbours fit; the plan asks for four neighbours
+    let budget = IMAGE_BYTES * 7 / 2;
+    let (p, rx) = pipeline_with(reg, budget, 3, |_| {});
+    let plan = |i: usize| -> Vec<PathBuf> { files[i + 1..i + 5].to_vec() };
+
+    p.request(&files[0], &plan(0));
+    ready_for(&rx, &files[0]);
+    settle(&p);
+    for i in 1..=8 {
+        let before = decodes.load(Ordering::Acquire);
+        assert!(p.request(&files[i], &plan(i)).is_some(), "step {i}: the next image was prefetched");
+        settle(&p);
+        assert_eq!(decodes.load(Ordering::Acquire) - before, 1, "step {i}: only the one new neighbour that fits");
+        assert!(p.cached(&files[i + 1]).is_some() && p.cached(&files[i + 2]).is_some(), "step {i}");
+        assert!(p.cached(&files[i + 3]).is_none(), "step {i}: one too many for the budget");
+        assert!(p.stats().used_bytes <= budget, "step {i}: {:?}", p.stats());
+    }
+}
+
+#[test]
+fn the_cache_keeps_display_pixels_and_real_transparency() {
+    let dir = tempfile::tempdir().unwrap();
+    let deep = dir.path().join("deep.png");
+    image::ImageBuffer::<image::Rgba<u16>, _>::from_fn(5, 3, |x, _| image::Rgba([x as u16 * 10000, 257, 65535, 65535]))
+        .save(&deep)
+        .unwrap();
+    let opaque_rgba = dir.path().join("opaque.png");
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255])).save(&opaque_rgba).unwrap();
+    let see_through = dir.path().join("alpha.png");
+    image::RgbaImage::from_fn(4, 4, |x, _| image::Rgba([1, 2, 3, if x == 3 { 0 } else { 255 }]))
+        .save(&see_through)
+        .unwrap();
+    let (p, rx) = pipeline(u64::MAX, 1);
+
+    p.request(&deep, &[]);
+    let d = ready_for(&rx, &deep);
+    assert_eq!(d.image.format(), iv_core::PixelFormat::Rgba8, "8-bit for the screen");
+    assert_eq!(d.memory_size(), 5 * 3 * 4, "the budget counts the 8-bit pixels");
+    assert_eq!(d.info.bits_per_channel, 16, "the file's own depth is still reported");
+    assert_eq!(&d.image.data()[4..8], &[39, 1, 255, 255], "rounded from 16 bits");
+
+    p.request(&opaque_rgba, &[]);
+    assert!(!ready_for(&rx, &opaque_rgba).info.has_alpha, "an RGBA file without transparency");
+    p.request(&see_through, &[]);
+    assert!(ready_for(&rx, &see_through).info.has_alpha);
+}

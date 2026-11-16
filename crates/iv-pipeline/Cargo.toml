@@ -12,6 +12,7 @@ iv-codec.workspace = true
 iv-ops.workspace = true
 zip.workspace = true
 sevenz-rust2.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 moxcms.workspace = true

@@ -1,11 +1,15 @@
 //! Applies a [`Geometry`] to pixels: crop, orient, resize, adjust.
+//!
+//! Every step works on whole rows in parallel and keeps at most two full images alive at once
+//! (the one it reads and the one it writes); adjusting reuses the buffer when it is not shared.
 
 use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{PixelType, ResizeOptions, Resizer};
 use iv_core::{Error, ImageBuf, Orientation, PixelFormat, Result};
+use rayon::prelude::*;
 
 use crate::geometry::Geometry;
-use crate::op::{Adjust, Rect};
+use crate::op::{Adjust, Rect, ToneTable};
 
 fn crop(img: &ImageBuf, r: Rect) -> Result<ImageBuf> {
     if r == (Rect { x: 0, y: 0, width: img.width(), height: img.height() }) {
@@ -21,6 +25,30 @@ fn crop(img: &ImageBuf, r: Rect) -> Result<ImageBuf> {
     ImageBuf::new(r.width, r.height, img.format(), out)
 }
 
+/// Where output row `y` of `img` shown with `o` comes from: the stored index of the row's first
+/// pixel and the index step to the next pixel, for a stored `w` × `h` image. Orientations are D4
+/// transforms (`display_to_stored_uv` has entries 0 and ±1), so this is exact integer
+/// arithmetic.
+fn row_source(o: Orientation, (w, h): (usize, usize), y: usize) -> (isize, isize) {
+    let m = o.display_to_stored_uv();
+    // a stored coordinate is the output x or the output y, possibly mirrored:
+    // (its value at the row's first pixel, its change per pixel)
+    let pick = |along_x: f64, along_y: f64, n: usize| -> (isize, isize) {
+        if along_x > 0.5 {
+            (0, 1)
+        } else if along_x < -0.5 {
+            (n as isize - 1, -1)
+        } else if along_y > 0.5 {
+            (y as isize, 0)
+        } else {
+            (n as isize - 1 - y as isize, 0)
+        }
+    };
+    let (sx0, sx_step) = pick(m[0][0], m[0][1], w);
+    let (sy0, sy_step) = pick(m[1][0], m[1][1], h);
+    (sy0 * w as isize + sx0, sy_step * w as isize + sx_step)
+}
+
 /// Bakes `o` into the pixels: the result, shown without transform, looks like `img` shown with `o`.
 pub fn orient(img: &ImageBuf, o: Orientation) -> Result<ImageBuf> {
     if o == Orientation::Normal {
@@ -29,20 +57,20 @@ pub fn orient(img: &ImageBuf, o: Orientation) -> Result<ImageBuf> {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let (ow, oh) = if o.swaps_dimensions() { (h, w) } else { (w, h) };
     let bpp = img.format().bytes_per_pixel();
-    let m = o.display_to_stored_uv();
     let src = img.data();
     let mut out = vec![0u8; ow * oh * bpp];
-    for y in 0..oh {
-        let v = (y as f64 + 0.5) / oh as f64;
-        for x in 0..ow {
-            let u = (x as f64 + 0.5) / ow as f64;
-            let sx = ((m[0][0] * u + m[0][1] * v + m[0][2]) * w as f64) as usize;
-            let sy = ((m[1][0] * u + m[1][1] * v + m[1][2]) * h as f64) as usize;
-            let s = (sy.min(h - 1) * w + sx.min(w - 1)) * bpp;
-            let d = (y * ow + x) * bpp;
-            out[d..d + bpp].copy_from_slice(&src[s..s + bpp]);
+    out.par_chunks_mut(ow * bpp).enumerate().for_each(|(y, row)| {
+        let (base, step) = row_source(o, (w, h), y);
+        if step == 1 {
+            let s = base as usize * bpp;
+            row.copy_from_slice(&src[s..s + row.len()]);
+            return;
         }
-    }
+        for (x, px) in row.chunks_exact_mut(bpp).enumerate() {
+            let s = (base + x as isize * step) as usize * bpp;
+            px.copy_from_slice(&src[s..s + bpp]);
+        }
+    });
     ImageBuf::new(ow as u32, oh as u32, img.format(), out)
 }
 
@@ -66,58 +94,69 @@ pub fn resize(img: &ImageBuf, width: u32, height: u32) -> Result<ImageBuf> {
     ImageBuf::new(width, height, img.format(), dst.into_vec())
 }
 
-/// Applies tone adjustments in order to every pixel.
-pub fn adjust(img: &ImageBuf, adjusts: &[Adjust]) -> Result<ImageBuf> {
-    if adjusts.is_empty() {
-        return Ok(img.clone());
-    }
-    let run = |rgb: [f32; 3]| adjusts.iter().fold(rgb, |c, a| a.apply(c));
-    let (w, h, f) = (img.width(), img.height(), img.format());
-    let data = match f {
-        PixelFormat::Rgba8 => img
-            .data()
-            .chunks_exact(4)
-            .flat_map(|p| {
-                let [r, g, b] = run([p[0], p[1], p[2]].map(|c| c as f32 / 255.0)).map(|c| (c * 255.0).round() as u8);
-                [r, g, b, p[3]]
-            })
-            .collect(),
-        PixelFormat::Rgba16 => {
-            let px: &[u16] = bytemuck::cast_slice(img.data());
-            let out: Vec<u16> = px
-                .chunks_exact(4)
-                .flat_map(|p| {
-                    let [r, g, b] =
-                        run([p[0], p[1], p[2]].map(|c| c as f32 / 65535.0)).map(|c| (c * 65535.0).round() as u16);
-                    [r, g, b, p[3]]
-                })
-                .collect();
-            bytemuck::cast_slice(&out).to_vec()
+/// Pixels per parallel work item when mapping tones.
+const ROWS_OF: usize = 16 * 1024;
+
+/// Maps `src` pixels to `out` (both RGBA samples of one type) through `map`, in parallel.
+fn map_pixels<T: Copy + Send + Sync>(src: &[T], out: &mut [T], map: impl Fn([T; 3]) -> [T; 3] + Sync) {
+    out.par_chunks_mut(ROWS_OF * 4).zip(src.par_chunks(ROWS_OF * 4)).for_each(|(o, s)| {
+        for (o, s) in o.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
+            let [r, g, b] = map([s[0], s[1], s[2]]);
+            o.copy_from_slice(&[r, g, b, s[3]]);
         }
-        PixelFormat::RgbaF32 => {
-            let px: &[f32] = bytemuck::cast_slice(img.data());
-            let out: Vec<f32> = px
-                .chunks_exact(4)
-                .flat_map(|p| {
-                    let [r, g, b] = run([p[0], p[1], p[2]]);
-                    [r, g, b, p[3]]
-                })
-                .collect();
-            bytemuck::cast_slice(&out).to_vec()
-        }
-    };
-    ImageBuf::new(w, h, f, data)
+    });
 }
 
-/// The edited image: `img` (stored pixels) with `g` applied.
+/// Applies tone adjustments in order to every pixel.
+pub fn adjust(img: &ImageBuf, adjusts: &[Adjust]) -> Result<ImageBuf> {
+    adjust_owned(img.clone(), adjusts)
+}
+
+/// [`adjust`], writing over `img`'s own buffer when nothing else shares it.
+fn adjust_owned(img: ImageBuf, adjusts: &[Adjust]) -> Result<ImageBuf> {
+    if adjusts.is_empty() {
+        return Ok(img);
+    }
+    let (w, h, f) = (img.width(), img.height(), img.format());
+    match f {
+        PixelFormat::Rgba8 => {
+            let table = ToneTable::new(adjusts, 256).expect("not empty");
+            match img.try_into_vec() {
+                Ok(mut data) => {
+                    data.par_chunks_mut(ROWS_OF * 4).for_each(|chunk| {
+                        for p in chunk.chunks_exact_mut(4) {
+                            let [r, g, b] = table.map8([p[0], p[1], p[2]]);
+                            p[..3].copy_from_slice(&[r, g, b]);
+                        }
+                    });
+                    ImageBuf::new(w, h, f, data)
+                }
+                Err(img) => ImageBuf::with_samples::<u8>(w, h, f, |out| map_pixels(img.data(), out, |c| table.map8(c))),
+            }
+        }
+        PixelFormat::Rgba16 => {
+            let table = ToneTable::new(adjusts, 65536).expect("not empty");
+            ImageBuf::with_samples::<u16>(w, h, f, |out| {
+                map_pixels(bytemuck::cast_slice(img.data()), out, |c| table.map(c))
+            })
+        }
+        PixelFormat::RgbaF32 => {
+            let run = |rgb: [f32; 3]| adjusts.iter().fold(rgb, |c, a| a.apply(c));
+            ImageBuf::with_samples::<f32>(w, h, f, |out| map_pixels(bytemuck::cast_slice(img.data()), out, run))
+        }
+    }
+}
+
+/// The edited image: `img` (stored pixels) with `g` applied. Each step's input is freed as soon
+/// as its output exists.
 pub fn render(img: &ImageBuf, g: &Geometry) -> Result<ImageBuf> {
     if (img.width(), img.height()) != g.stored {
         return Err(Error::decode("edit", "geometry was computed for a different image size"));
     }
-    let cropped = crop(img, g.crop_pixels())?;
-    let oriented = orient(&cropped, g.orientation)?;
-    let sized = resize(&oriented, g.size.0, g.size.1)?;
-    adjust(&sized, &g.adjusts)
+    let mut out = crop(img, g.crop_pixels())?;
+    out = orient(&out, g.orientation)?;
+    out = resize(&out, g.size.0, g.size.1)?;
+    adjust_owned(out, &g.adjusts)
 }
 
 #[cfg(test)]
@@ -154,6 +193,26 @@ mod tests {
         }
         let four = (0..4).try_fold(img.clone(), |acc, _| orient(&acc, Orientation::Rotate90)).unwrap();
         assert_eq!(four.data(), img.data());
+    }
+
+    /// The integer remap lands every pixel where the orientation's UV map says it comes from.
+    #[test]
+    fn orient_matches_the_uv_map_for_every_orientation() {
+        let (w, h) = (7u32, 4u32);
+        let img = coords(w, h);
+        for o in Orientation::ALL {
+            let out = orient(&img, o).unwrap();
+            let (ow, oh) = (out.width(), out.height());
+            let m = o.display_to_stored_uv();
+            for y in 0..oh {
+                for x in 0..ow {
+                    let (u, v) = ((x as f64 + 0.5) / ow as f64, (y as f64 + 0.5) / oh as f64);
+                    let sx = ((m[0][0] * u + m[0][1] * v + m[0][2]) * w as f64) as u32;
+                    let sy = ((m[1][0] * u + m[1][1] * v + m[1][2]) * h as f64) as u32;
+                    assert_eq!(px(&out, x, y), px(&img, sx, sy), "{o:?} ({x}, {y})");
+                }
+            }
+        }
     }
 
     #[test]
@@ -195,6 +254,41 @@ mod tests {
         let p: &[u16] = bytemuck::cast_slice(out.data());
         assert!(p[0] == p[1] && p[1] == p[2], "{p:?}");
         assert_eq!(p[3], 1234);
+    }
+
+    /// Adjusting is the per-pixel fold of `Adjust::apply`, whether it writes a new buffer or
+    /// over an unshared one, for every pixel format.
+    #[test]
+    fn adjust_is_the_per_pixel_arithmetic() {
+        let chain = [Adjust { brightness: 0.05, contrast: 0.3, gamma: 1.4, saturation: 0.5 }];
+        let fold = |rgb: [f32; 3]| chain.iter().fold(rgb, |c, a| a.apply(c));
+        let n = 70_000u32; // more than one parallel work item
+        let data: Vec<u8> = (0..n).flat_map(|i| [(i % 251) as u8, (i % 256) as u8, (i / 300) as u8, 99]).collect();
+        let img = ImageBuf::new(n, 1, PixelFormat::Rgba8, data).unwrap();
+        let shared = adjust(&img, &chain).unwrap();
+        let owned =
+            adjust_owned(ImageBuf::new(n, 1, PixelFormat::Rgba8, img.data().to_vec()).unwrap(), &chain).unwrap();
+        assert_eq!(shared.data(), owned.data());
+        for (o, s) in shared.data().chunks_exact(4).zip(img.data().chunks_exact(4)) {
+            let want = fold([s[0], s[1], s[2]].map(|c| c as f32 / 255.0)).map(|c| (c * 255.0).round() as u8);
+            assert_eq!(o, [want[0], want[1], want[2], 99]);
+        }
+
+        let deep: Vec<u16> = (0..n * 4).map(|i| (i * 7919 % 65536) as u16).collect();
+        let img16 = ImageBuf::new(n, 1, PixelFormat::Rgba16, bytemuck::cast_slice(&deep).to_vec()).unwrap();
+        let out16 = adjust(&img16, &chain).unwrap();
+        for (o, s) in bytemuck::cast_slice::<u8, u16>(out16.data()).chunks_exact(4).zip(deep.chunks_exact(4)) {
+            let want = fold([s[0], s[1], s[2]].map(|c| c as f32 / 65535.0)).map(|c| (c * 65535.0).round() as u16);
+            assert_eq!(o, [want[0], want[1], want[2], s[3]]);
+        }
+
+        let float: Vec<f32> = (0..400).map(|i| i as f32 / 397.0).collect();
+        let imgf = ImageBuf::new(100, 1, PixelFormat::RgbaF32, bytemuck::cast_slice(&float).to_vec()).unwrap();
+        let outf = adjust(&imgf, &chain).unwrap();
+        for (o, s) in bytemuck::cast_slice::<u8, f32>(outf.data()).chunks_exact(4).zip(float.chunks_exact(4)) {
+            let want = fold([s[0], s[1], s[2]]);
+            assert_eq!(o, [want[0], want[1], want[2], s[3]]);
+        }
     }
 
     #[test]

@@ -46,36 +46,30 @@ fn header(bytes: &[u8]) -> Result<Header> {
 
 /// `avif-decode` scales every 10/12-bit channel, colour and alpha, to the full 16-bit range
 /// (measured: 10-bit red 220/255 comes out as 56503 ≈ 220 × 257), so values are taken as is.
+/// Pixels are written straight into the image's one buffer.
 fn to_image_buf(img: Image) -> Result<ImageBuf> {
-    let rgba8 =
-        |w: usize, h: usize, px: Vec<[u8; 4]>| ImageBuf::new(w as u32, h as u32, PixelFormat::Rgba8, px.concat());
-    let rgba16 = |w: usize, h: usize, px: Vec<[u16; 4]>| {
-        ImageBuf::new(w as u32, h as u32, PixelFormat::Rgba16, bytemuck::cast_slice::<[u16; 4], u8>(&px).to_vec())
-    };
+    fn fill<T: bytemuck::Pod>(
+        (w, h): (usize, usize),
+        format: PixelFormat,
+        px: impl Iterator<Item = [T; 4]>,
+    ) -> Result<ImageBuf> {
+        ImageBuf::with_samples::<T>(w as u32, h as u32, format, |out| {
+            for (o, p) in out.chunks_exact_mut(4).zip(px) {
+                o.copy_from_slice(&p);
+            }
+        })
+    }
+    use PixelFormat::{Rgba8, Rgba16};
     match img {
-        Image::Rgba8(i) => {
-            let (w, h) = (i.width(), i.height());
-            rgba8(w, h, i.pixels().map(|p| [p.r, p.g, p.b, p.a]).collect())
-        }
-        Image::Rgb8(i) => {
-            let (w, h) = (i.width(), i.height());
-            rgba8(w, h, i.pixels().map(|p| [p.r, p.g, p.b, 255]).collect())
-        }
+        Image::Rgba8(i) => fill((i.width(), i.height()), Rgba8, i.pixels().map(|p| [p.r, p.g, p.b, p.a])),
+        Image::Rgb8(i) => fill((i.width(), i.height()), Rgba8, i.pixels().map(|p| [p.r, p.g, p.b, 255])),
         Image::Gray8(i) => {
-            let (w, h) = (i.width(), i.height());
-            rgba8(w, h, i.pixels().map(|g| [g.value(), g.value(), g.value(), 255]).collect())
+            fill((i.width(), i.height()), Rgba8, i.pixels().map(|g| [g.value(), g.value(), g.value(), 255]))
         }
-        Image::Rgba16(i) => {
-            let (w, h) = (i.width(), i.height());
-            rgba16(w, h, i.pixels().map(|p| [p.r, p.g, p.b, p.a]).collect())
-        }
-        Image::Rgb16(i) => {
-            let (w, h) = (i.width(), i.height());
-            rgba16(w, h, i.pixels().map(|p| [p.r, p.g, p.b, u16::MAX]).collect())
-        }
+        Image::Rgba16(i) => fill((i.width(), i.height()), Rgba16, i.pixels().map(|p| [p.r, p.g, p.b, p.a])),
+        Image::Rgb16(i) => fill((i.width(), i.height()), Rgba16, i.pixels().map(|p| [p.r, p.g, p.b, u16::MAX])),
         Image::Gray16(i) => {
-            let (w, h) = (i.width(), i.height());
-            rgba16(w, h, i.pixels().map(|g| [g.value(), g.value(), g.value(), u16::MAX]).collect())
+            fill((i.width(), i.height()), Rgba16, i.pixels().map(|g| [g.value(), g.value(), g.value(), u16::MAX]))
         }
     }
 }

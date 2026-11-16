@@ -1603,6 +1603,9 @@ impl App {
         }
         self.dirty = false;
         frame.resize(self.viewport.0, self.viewport.1);
+        // redraws that change only the selection (a Shift+drag), the tones (edit panel sliders)
+        // or the background (settings) reuse the resampled image; otherwise nothing is kept
+        frame.keep_resampled(self.select_from.is_some() || self.panel.open || self.settings_open);
         let t = Instant::now();
         let editing = self.current.as_ref().zip(self.display.as_ref()).is_some_and(|(c, d)| c.path == d.path);
         let live: &[Op] = if editing { self.edits.active() } else { &[] };
@@ -1628,7 +1631,8 @@ impl App {
                         dest,
                     }),
                     Some(s) => {
-                        let main_w = dest.width * s.fraction;
+                        // a whole number of screen pixels, so both pages start on whole pixels too
+                        let main_w = (dest.width * s.fraction).round();
                         let second_w = dest.width - main_w;
                         let rtl = self.spread.unwrap_or(true);
                         let (main_x, second_x) =

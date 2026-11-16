@@ -69,6 +69,7 @@ impl ViewState {
         self.mode = ZoomMode::Fit;
         self.zoom = self.fit_zoom();
         self.center = (self.image.0 / 2.0, self.image.1 / 2.0);
+        self.snap();
     }
 
     /// Replaces the image (e.g. a preview being swapped for the full decode). Keeps the view when
@@ -165,6 +166,25 @@ impl ViewState {
         }
         self.center.0 = axis(self.center.0, self.image.0, self.viewport.0, self.zoom);
         self.center.1 = axis(self.center.1, self.image.1, self.viewport.1, self.zoom);
+        self.snap();
+    }
+
+    /// Moves the image by less than half a pixel so its top-left corner lands on a whole screen
+    /// pixel: at 100 % every image pixel then covers exactly one screen pixel and is drawn as it
+    /// is, not blended with its neighbour. An image that covers the viewport on an axis keeps
+    /// covering it (no sliver of background at an edge).
+    fn snap(&mut self) {
+        fn axis(center: f64, image: f64, viewport: f64, zoom: f64) -> f64 {
+            let size = image * zoom;
+            let origin = viewport / 2.0 - center * zoom;
+            let mut snapped = origin.round();
+            if size >= viewport {
+                snapped = snapped.clamp((viewport - size).ceil(), 0.0);
+            }
+            (viewport / 2.0 - snapped) / zoom
+        }
+        self.center.0 = axis(self.center.0, self.image.0, self.viewport.0, self.zoom);
+        self.center.1 = axis(self.center.1, self.image.1, self.viewport.1, self.zoom);
     }
 }
 
@@ -195,11 +215,48 @@ mod tests {
         let anchor = (100.0, 450.0);
         let before = v.screen_to_image(anchor);
         v.zoom_by_at(4.0, anchor);
-        let after = v.screen_to_image(anchor);
-        assert!(close(before.0, after.0) && close(before.1, after.1), "{before:?} vs {after:?}");
+        // the point stays under the cursor, give or take the snap to whole screen pixels
+        let moved = v.image_to_screen(before);
+        assert!((moved.0 - anchor.0).abs() <= 0.5 && (moved.1 - anchor.1).abs() <= 0.5, "{moved:?}");
         assert_eq!(v.mode(), ZoomMode::Manual);
+        let after = v.screen_to_image(anchor);
         let round = v.image_to_screen(after);
         assert!(close(round.0, anchor.0) && close(round.1, anchor.1), "{round:?}");
+    }
+
+    fn whole(v: f64) -> bool {
+        (v - v.round()).abs() < 1e-9
+    }
+
+    #[test]
+    fn the_image_lands_on_whole_screen_pixels() {
+        // odd and even sizes against odd and even viewports, fitted (100 %: small images)
+        for (image, viewport) in [((200, 100), (1001, 601)), ((201, 99), (1000, 600)), ((4001, 3001), (800, 601))] {
+            let v = ViewState::new(image, viewport);
+            let r = v.dest_rect();
+            assert!(whole(r.x) && whole(r.y), "{image:?} in {viewport:?}: {r:?}");
+        }
+        // 100 % from a fitted large image, around any point, then panned by whole pixels
+        let mut v = ViewState::new((4000, 3000), (1001, 777));
+        v.actual_size_at((333.3, 517.9));
+        let r = v.dest_rect();
+        assert!(whole(r.x) && whole(r.y) && close(v.zoom(), 1.0), "{r:?}");
+        v.pan_by(-7.0, 3.0);
+        let r = v.dest_rect();
+        assert!(whole(r.x) && whole(r.y), "{r:?}");
+    }
+
+    #[test]
+    fn snapping_never_uncovers_an_edge() {
+        // at a zoom where the image is a fractional number of screen pixels wide
+        let mut v = ViewState::new((3000, 2000), (800, 600));
+        v.set_zoom_at(0.3337, (400.0, 300.0));
+        for dx in [1e6, -1e6] {
+            v.pan_by(dx, dx);
+            let r = v.dest_rect();
+            assert!(r.x <= 1e-9 && r.x + r.width >= 800.0 - 1e-9, "{r:?}");
+            assert!(r.y <= 1e-9 && r.y + r.height >= 600.0 - 1e-9, "{r:?}");
+        }
     }
 
     #[test]

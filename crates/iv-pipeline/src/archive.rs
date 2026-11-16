@@ -8,7 +8,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use iv_core::{Error, FormatId, Result, Source};
+use iv_core::{CancelToken, Error, FormatId, Result, Source};
 
 use crate::natord::natural_cmp;
 
@@ -127,15 +127,18 @@ impl ArchiveId {
 }
 
 /// Encoded bytes of 7z entries already extracted, for the archive being browsed. In a solid
-/// archive every entry can only be reached by decompressing everything before it, so reading
-/// pages one by one would cost O(pages²); instead each pass keeps every image it walks past
-/// (measured on a 4-page solid 7z: 2.0 s for all pages without this). Entries are shared with
-/// the sources made from them, never copied.
+/// block every entry can only be reached by decompressing everything before it in that block,
+/// so reading pages one by one would cost O(pages²); instead each pass keeps every image it
+/// walks past (measured on a 4-page solid 7z: 2.0 s for all pages without this). Entries are
+/// shared with the sources made from them, never copied. Over [`SEVEN_Z_CACHE_BYTES`] the
+/// least recently used entries go first.
 #[derive(Default)]
 struct SevenZCache {
     archive: Option<ArchiveId>,
-    entries: HashMap<String, Arc<[u8]>>,
+    /// Name → (bytes, last use).
+    entries: HashMap<String, (Arc<[u8]>, u64)>,
     bytes: usize,
+    tick: u64,
 }
 
 impl SevenZCache {
@@ -146,29 +149,52 @@ impl SevenZCache {
         }
     }
 
+    fn get(&mut self, name: &str) -> Option<Arc<[u8]>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.entries.get_mut(name).map(|(bytes, used)| {
+            *used = tick;
+            bytes.clone()
+        })
+    }
+
     fn insert(&mut self, name: String, bytes: Arc<[u8]>) {
         if bytes.len() > SEVEN_Z_CACHE_BYTES {
             return;
         }
-        if self.bytes + bytes.len() > SEVEN_Z_CACHE_BYTES {
-            self.entries.clear();
-            self.bytes = 0;
-        }
-        self.bytes += bytes.len();
-        if let Some(old) = self.entries.insert(name, bytes) {
+        if let Some((old, _)) = self.entries.remove(&name) {
             self.bytes -= old.len();
         }
+        while self.bytes + bytes.len() > SEVEN_Z_CACHE_BYTES {
+            let Some(oldest) = self.entries.iter().min_by_key(|(_, (_, used))| *used).map(|(n, _)| n.clone()) else {
+                break;
+            };
+            if let Some((old, _)) = self.entries.remove(&oldest) {
+                self.bytes -= old.len();
+            }
+        }
+        self.tick += 1;
+        self.bytes += bytes.len();
+        self.entries.insert(name, (bytes, self.tick));
     }
 }
 
-/// Upper bound for cached encoded entries; over it the cache starts afresh.
+/// Upper bound for cached encoded entries.
 const SEVEN_Z_CACHE_BYTES: usize = 128 * 1024 * 1024;
-/// Image entries decompressed past the requested one.
+/// Image entries of the same solid block decompressed past the requested one.
 const SEVEN_Z_READ_AHEAD: usize = 6;
 
 fn seven_z_cache() -> MutexGuard<'static, SevenZCache> {
     static CACHE: OnceLock<Mutex<SevenZCache>> = OnceLock::new();
     CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Held while a 7z block is decompressed: the foreground and prefetch workers asking for pages
+/// of the same block wait for the one pass and then find their page in the cache, instead of
+/// each decompressing the block from its start at the same time.
+fn seven_z_walk() -> MutexGuard<'static, ()> {
+    static WALK: Mutex<()> = Mutex::new(());
+    WALK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Frees the encoded 7z pages kept for quick page turns, e.g. once the viewer has left the
@@ -177,45 +203,84 @@ pub fn release_cache() {
     *seven_z_cache() = SevenZCache::default();
 }
 
-/// One entry of a 7z archive, decompressing (and caching) every image entry on the way to it.
-fn seven_z_read(archive: &Path, entry: &str, limit: u64) -> Result<Arc<[u8]>> {
+fn cached_7z(id: &ArchiveId, entry: &str) -> Option<Arc<[u8]>> {
+    let mut cache = seven_z_cache();
+    cache.select(id);
+    cache.get(entry)
+}
+
+/// One entry of a 7z archive. Only the compression block holding it is decompressed: in a
+/// non-solid archive that is the entry alone; in a solid block, every entry before it (kept,
+/// see [`SevenZCache`]) and up to [`SEVEN_Z_READ_AHEAD`] images after it. Stops early, with
+/// [`Error::Cancelled`], once `cancel` is set.
+fn seven_z_read(archive: &Path, entry: &str, limit: u64, cancel: &CancelToken) -> Result<Arc<[u8]>> {
     let id = ArchiveId::of(archive)?;
-    {
-        let mut cache = seven_z_cache();
-        cache.select(&id);
-        if let Some(hit) = cache.entries.get(entry) {
-            return Ok(hit.clone());
-        }
+    if let Some(hit) = cached_7z(&id, entry) {
+        return Ok(hit);
     }
-    let mut reader = sevenz_rust2::ArchiveReader::open(archive, sevenz_rust2::Password::empty())
-        .map_err(|e| Error::decode("7z", e))?;
+    let _walk = seven_z_walk();
+    // another worker may have decompressed it while this one waited
+    if let Some(hit) = cached_7z(&id, entry) {
+        return Ok(hit);
+    }
+    cancel.check()?;
+    let fail = |e: sevenz_rust2::Error| Error::decode("7z", format!("{entry}: {e}"));
+    let password = sevenz_rust2::Password::empty();
+    let mut file = BufReader::new(File::open(archive)?);
+    let index = sevenz_rust2::Archive::read(&mut file, &password).map_err(fail)?;
+    let missing = || Error::decode("7z", format!("{entry}: not in the archive"));
+    let target = index
+        .files
+        .iter()
+        .position(|f| f.has_stream && !f.is_directory() && clean_name(f.name()).as_deref() == Some(entry))
+        .ok_or_else(missing)?;
+    let block = index.stream_map.file_block_index[target].ok_or_else(missing)?;
+    let target = &index.files[target];
+
     let mut found = None;
     let mut after_target = 0;
-    reader
-        .for_each_entries(|e, data| {
+    let mut cancelled = false;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    sevenz_rust2::BlockDecoder::new(threads, block, &index, &password, &mut file)
+        .for_each_entries(&mut |e, data| {
+            if cancel.is_cancelled() {
+                cancelled = true;
+                return Ok(false);
+            }
+            let is_target = std::ptr::eq(e, target);
             let Some(name) = clean_name(e.name()) else { return Ok(true) };
-            if e.is_directory() || !is_image_entry(&name) {
+            if !is_target && (e.is_directory() || !is_image_entry(&name)) {
                 return Ok(true);
             }
-            let bytes: Arc<[u8]> = read_entry(data, e.size(), limit)
-                .map_err(|err| std::io::Error::other(format!("{name}: {err}")))?
-                .into();
-            {
-                let mut cache = seven_z_cache();
-                cache.select(&id);
-                cache.insert(name.clone(), bytes.clone());
-            }
-            if found.is_some() {
-                after_target += 1;
-            } else if name == entry {
+            // pages kept from an earlier pass are not copied again (the decoder skips their data)
+            let kept = if is_target { None } else { cached_7z(&id, &name) };
+            let bytes = match kept {
+                Some(bytes) => bytes,
+                None => {
+                    let bytes: Arc<[u8]> = read_entry(data, e.size(), limit)
+                        .map_err(|err| std::io::Error::other(format!("{name}: {err}")))?
+                        .into();
+                    let mut cache = seven_z_cache();
+                    cache.select(&id);
+                    cache.insert(name, bytes.clone());
+                    bytes
+                }
+            };
+            if is_target {
                 found = Some(bytes);
+            } else if found.is_some() {
+                after_target += 1;
             }
-            // go a little past the target (the next pages are about to be asked for), but not
-            // through a whole book before the first page can show
-            Ok(after_target < SEVEN_Z_READ_AHEAD)
+            // go a little past the target (the next pages are about to be asked for), then stop:
+            // the rest of the block is not decompressed
+            Ok(found.is_none() || after_target < SEVEN_Z_READ_AHEAD)
         })
-        .map_err(|e| Error::decode("7z", format!("{entry}: {e}")))?;
-    found.ok_or_else(|| Error::decode("7z", format!("{entry}: not in the archive")))
+        .map_err(fail)?;
+    match found {
+        Some(bytes) => Ok(bytes),
+        None if cancelled => Err(Error::Cancelled),
+        None => Err(missing()),
+    }
 }
 
 /// Entry names of a 7z archive with `/` separators, unsafe names left out. Directories skipped.
@@ -269,10 +334,16 @@ pub fn list_images(archive: &Path) -> Result<Vec<PathBuf>> {
 /// A [`Source`] for a real file or an archive entry (read into memory, at most
 /// [`MAX_ENTRY_BYTES`]).
 pub fn source_for(path: &Path) -> Result<Source> {
+    source_for_cancellable(path, &CancelToken::never())
+}
+
+/// [`source_for`], giving up with [`Error::Cancelled`] once `cancel` is set while a 7z block is
+/// being decompressed (the decoding pipeline's page the user has already left).
+pub fn source_for_cancellable(path: &Path, cancel: &CancelToken) -> Result<Source> {
     let Some((archive, entry)) = split(path) else { return Ok(Source::from_path(path)) };
     let bytes: Arc<[u8]> = match kind(&archive) {
         Some(Kind::Zip) => zip_read(&archive, &entry, MAX_ENTRY_BYTES)?.into(),
-        Some(Kind::SevenZ) => seven_z_read(&archive, &entry, MAX_ENTRY_BYTES)?,
+        Some(Kind::SevenZ) => seven_z_read(&archive, &entry, MAX_ENTRY_BYTES, cancel)?,
         None => return Err(Error::UnsupportedFormat),
     };
     let name = entry.rsplit('/').next().unwrap_or(&entry).to_string();
@@ -429,18 +500,101 @@ mod tests {
 mod seven_z_tests {
     use super::*;
 
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/archive").join(name)
+    }
+
+    /// The 7z cache is one per process: these tests take turns with it.
+    fn exclusive() -> MutexGuard<'static, ()> {
+        static TURN: Mutex<()> = Mutex::new(());
+        let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        release_cache();
+        turn
+    }
+
+    fn cached_names() -> Vec<String> {
+        let cache = seven_z_cache();
+        let mut names: Vec<String> = cache.entries.keys().cloned().collect();
+        names.sort();
+        assert_eq!(cache.bytes, cache.entries.values().map(|(b, _)| b.len()).sum::<usize>(), "byte count");
+        names
+    }
+
+    fn page(archive: &Path, n: u32) -> PathBuf {
+        archive.join(format!("p{n:02}.png"))
+    }
+
     /// `testdata/archive/book.cb7` holds p10.png ("ten"), p2.png ("two") and readme.txt ("no"),
-    /// written by `sevenz_rust2::ArchiveWriter`. It is committed rather than written by the test so
-    /// the 7z writer (the crate's `compress` feature) stays out of every build: a test-only
-    /// feature would compile this crate and everything above it twice.
+    /// written by `sevenz_rust2::ArchiveWriter`. It and the others here are committed rather
+    /// than written by the test so the 7z writer (the crate's `compress` feature) stays out of
+    /// every build: a test-only feature would compile this crate and everything above it twice.
     #[test]
     fn seven_z_pages_list_and_read() {
-        let cb7 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/archive/book.cb7");
+        let _turn = exclusive();
+        let cb7 = fixture("book.cb7");
         assert!(is_archive(&cb7));
         let pages = list_images(&cb7).unwrap();
         let names: Vec<_> = pages.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(names, ["p2.png", "p10.png"]);
         assert_eq!(&*source_for(&pages[1]).unwrap().read_all().unwrap(), b"ten");
         assert!(source_for(&cb7.join("missing.png")).is_err());
+    }
+
+    /// `pages.cb7`: p01.png … p10.png ("page 01" …), one compression block each (7-Zip, -ms=off).
+    #[test]
+    fn a_non_solid_archive_decompresses_only_the_page_asked_for() {
+        let _turn = exclusive();
+        let cb7 = fixture("pages.cb7");
+        assert_eq!(&*source_for(&page(&cb7, 3)).unwrap().read_all().unwrap(), b"page 03");
+        assert_eq!(cached_names(), ["p03.png"], "no other block was decompressed");
+        assert_eq!(&*source_for(&page(&cb7, 10)).unwrap().read_all().unwrap(), b"page 10");
+        assert_eq!(cached_names(), ["p03.png", "p10.png"]);
+    }
+
+    /// `solid.cb7`: the same ten pages in one solid block (7-Zip, -ms=on).
+    #[test]
+    fn a_solid_block_is_read_up_to_a_few_pages_past_the_one_asked_for() {
+        let _turn = exclusive();
+        let cb7 = fixture("solid.cb7");
+        assert_eq!(&*source_for(&page(&cb7, 2)).unwrap().read_all().unwrap(), b"page 02");
+        let want: Vec<String> = (1..=2 + SEVEN_Z_READ_AHEAD as u32).map(|n| format!("p{n:02}.png")).collect();
+        assert_eq!(cached_names(), want, "the pages before it and the read-ahead, not the rest of the block");
+        // a page in the read-ahead is a hit; the next pass keeps going from where it is needed
+        assert_eq!(&*source_for(&page(&cb7, 5)).unwrap().read_all().unwrap(), b"page 05");
+        assert_eq!(&*source_for(&page(&cb7, 10)).unwrap().read_all().unwrap(), b"page 10");
+        assert_eq!(cached_names().len(), 10);
+        // reading it all again finds everything kept, counted once
+        for n in 1..=10 {
+            assert_eq!(&*source_for(&page(&cb7, n)).unwrap().read_all().unwrap(), format!("page {n:02}").as_bytes());
+        }
+        assert_eq!(cached_names().len(), 10);
+    }
+
+    #[test]
+    fn a_cancelled_read_stops_and_says_so() {
+        let _turn = exclusive();
+        let cb7 = fixture("solid.cb7");
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let err = source_for_cancellable(&page(&cb7, 9), &cancel).expect_err("cancelled");
+        assert!(matches!(err, Error::Cancelled), "{err}");
+        assert!(cached_names().is_empty(), "nothing decompressed");
+    }
+
+    #[test]
+    fn the_cache_drops_the_least_recently_used_pages_first() {
+        let mut cache = SevenZCache::default();
+        let big = |n: usize| -> Arc<[u8]> { vec![0u8; n].into() };
+        let third = SEVEN_Z_CACHE_BYTES / 3;
+        cache.insert("a".into(), big(third));
+        cache.insert("b".into(), big(third));
+        cache.insert("c".into(), big(third));
+        assert!(cache.get("a").is_some(), "a is now the most recently used");
+        cache.insert("d".into(), big(third));
+        let mut names: Vec<&str> = cache.entries.keys().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(names, ["a", "c", "d"]);
+        cache.insert("d".into(), big(10));
+        assert_eq!(cache.bytes, 2 * third + 10, "a replaced entry is not counted twice");
     }
 }

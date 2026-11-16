@@ -100,15 +100,19 @@ pub fn export(registry: &Registry, encoders: &Encoders, req: &ExportRequest) -> 
     let encoder = encoders
         .for_format(req.format)
         .ok_or_else(|| Error::NoDecoder { format: req.format, reason: "no encoder for this format".into() })?;
-    let decoded = registry.decode_unmanaged(&src, &CancelToken::never())?;
-    let dropped_frames = decoded.animation.as_ref().map_or(0, |a| a.frames.len().saturating_sub(1));
-    let g = Geometry::new((decoded.image.width(), decoded.image.height()), decoded.info.orientation, &req.ops);
-    let edited = apply::render(&decoded.image, &g)?;
+    let iv_codec::Decoded { info, image, animation, .. } = registry.decode_unmanaged(&src, &CancelToken::never())?;
+    drop(src);
+    let dropped_frames = animation.map_or(0, |a| a.frames.len().saturating_sub(1));
+    let g = Geometry::new((image.width(), image.height()), info.orientation, &req.ops);
+    let edited = apply::render(&image, &g)?;
+    // only the metadata is needed from here on: the decoded pixels are freed before the
+    // encoder's copy is made
+    drop(image);
 
     let meta = if req.keep_metadata {
         Metadata {
-            icc: decoded.info.icc_profile.as_ref().map(|p| p.to_vec()),
-            exif: decoded.info.exif.as_ref().map(|e| {
+            icc: info.icc_profile.as_ref().map(|p| p.to_vec()),
+            exif: info.exif.as_ref().map(|e| {
                 let mut e = e.to_vec();
                 // the orientation is now in the pixels, and the old thumbnail shows the old image
                 exif_edit::set_orientation(&mut e, 1);
@@ -120,7 +124,9 @@ pub fn export(registry: &Registry, encoders: &Encoders, req: &ExportRequest) -> 
         Metadata::default()
     };
     let prepared = prepare(&edited, encoder.info(), req.background);
+    drop(edited);
     let bytes = encoder.encode(&prepared, &req.options, &meta)?;
+    drop(prepared);
     write_atomic(&req.dest, |f| f.write_all(&bytes))?;
     Ok(ExportOutcome::Encoded { bytes: bytes.len(), dropped_frames })
 }

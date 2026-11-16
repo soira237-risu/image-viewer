@@ -117,28 +117,38 @@ fn err(id: &'static str, e: impl std::fmt::Display) -> Error {
 /// Converts pixels to what the encoder accepts: 16-bit only where supported, alpha dropped when
 /// the image is opaque (smaller files) and composited over `background` when the format has no
 /// alpha.
+///
+/// Each result is made in one pass straight from `img`'s pixels: no intermediate full copy.
 pub fn prepare(img: &ImageBuf, info: &EncoderInfo, background: [u8; 3]) -> DynamicImage {
     let (w, h) = (img.width(), img.height());
     let opaque = img.is_opaque();
     if img.format() == PixelFormat::Rgba16 && info.supports_16bit {
-        let px: Vec<u16> = bytemuck::cast_slice(img.data()).to_vec();
-        let rgba = image::ImageBuffer::from_raw(w, h, px).expect("buffer matches size");
-        let d = DynamicImage::ImageRgba16(rgba);
-        return if opaque || !info.supports_alpha { DynamicImage::ImageRgb16(d.to_rgb16()) } else { d };
+        let px: &[u16] = bytemuck::cast_slice(img.data());
+        if opaque || !info.supports_alpha {
+            let rgb: Vec<u16> = px.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+            return DynamicImage::ImageRgb16(image::ImageBuffer::from_raw(w, h, rgb).expect("buffer matches size"));
+        }
+        return DynamicImage::ImageRgba16(
+            image::ImageBuffer::from_raw(w, h, px.to_vec()).expect("buffer matches size"),
+        );
     }
-    let rgba = RgbaImage::from_raw(w, h, img.to_rgba8().into_owned()).expect("buffer matches size");
+    // 8-bit (16-bit and float rounded down to it), read without a converted copy when it already is
+    let rgba = img.to_rgba8();
     if opaque {
-        return DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(rgba).to_rgb8());
+        let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        return DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, rgb).expect("buffer matches size"));
     }
     if info.supports_alpha {
-        return DynamicImage::ImageRgba8(rgba);
+        return DynamicImage::ImageRgba8(RgbaImage::from_raw(w, h, rgba.into_owned()).expect("buffer matches size"));
     }
-    let flat = RgbImage::from_fn(w, h, |x, y| {
-        let p = rgba.get_pixel(x, y).0;
-        let a = p[3] as u32;
-        image::Rgb([0, 1, 2].map(|c| ((p[c] as u32 * a + background[c] as u32 * (255 - a) + 127) / 255) as u8))
-    });
-    DynamicImage::ImageRgb8(flat)
+    let flat: Vec<u8> = rgba
+        .chunks_exact(4)
+        .flat_map(|p| {
+            let a = p[3] as u32;
+            [0, 1, 2].map(|c| ((p[c] as u32 * a + background[c] as u32 * (255 - a) + 127) / 255) as u8)
+        })
+        .collect();
+    DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, flat).expect("buffer matches size"))
 }
 
 fn write_with(enc: impl ImageEncoder, img: &DynamicImage, meta: &Metadata, id: &'static str) -> Result<()> {

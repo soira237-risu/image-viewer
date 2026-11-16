@@ -10,3 +10,4 @@ publish.workspace = true
 iv-core.workspace = true
 fast_image_resize.workspace = true
 bytemuck.workspace = true
+rayon.workspace = true

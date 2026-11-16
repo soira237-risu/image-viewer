@@ -4,6 +4,17 @@
 //! The cache is the only owner of prefetched images (the viewer holds an `Arc` to the one on
 //! screen). Every decode result is either inserted into the cache under the budget or dropped,
 //! so nothing decoded can escape the accounting.
+//!
+//! The cache holds display-ready pixels: 8-bit RGBA (16-bit and float decodes are converted on
+//! the worker, in parallel, so showing one is not a full-image pass on the UI thread and the
+//! budget counts what is actually kept), and `info.has_alpha` only when some pixel is not fully
+//! opaque (an opaque RGBA file is drawn without alpha blending). Saving decodes the file again
+//! at full precision, so nothing is lost.
+//!
+//! Prefetching only starts the neighbours that fit in the budget together with the current
+//! image (sizes of decoded images are remembered; unknown ones are estimated from the last
+//! decode), and a neighbour whose result would only push out nearer images is not kept: no
+//! decode is thrown away and repeated on every step through large images.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -12,7 +23,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use iv_codec::{Decoded, Registry};
-use iv_core::{CancelToken, Error, ImageBuf, ImageInfo};
+use iv_core::{CancelToken, Error, ImageBuf, ImageInfo, PixelFormat};
+use rayon::prelude::*;
 
 /// Longest side asked of a preview.
 const PREVIEW_TARGET: u32 = 1920;
@@ -118,6 +130,11 @@ struct State {
     /// if the user has already moved past them, so held keys show images as fast as they decode.
     /// Only one of them runs at a time (see [`State::foreground_may_start`]).
     quick: bool,
+    /// Cached size of images decoded before (kept for the plan and the cache only), so
+    /// prefetching knows which neighbours fit.
+    sizes: HashMap<PathBuf, u64>,
+    /// Cached size of the last image decoded: the estimate for neighbours not decoded yet.
+    typical_bytes: u64,
 }
 
 /// Snapshot for tests, benchmarks and diagnostics.
@@ -184,6 +201,29 @@ impl State {
     /// order. A cancelled decode that is still finishing does not hold the next one back.
     fn foreground_may_start(&self) -> bool {
         !self.quick || self.foreground_running.iter().all(|(_, t)| t.is_cancelled())
+    }
+
+    /// Expected cached size of `path`: known when it is cached or was decoded before, else the
+    /// size of the last decode (0 before the first one: no limit yet).
+    fn estimate(&self, path: &Path) -> u64 {
+        self.cache.get(path).map(|e| e.bytes).or_else(|| self.sizes.get(path).copied()).unwrap_or(self.typical_bytes)
+    }
+
+    /// Whether a prefetched `path` of `bytes` can be kept within `budget` by evicting only
+    /// images outside the plan or farther in it than `path` (never nearer ones, never the
+    /// current image). Otherwise keeping it would push out an image the user reaches first,
+    /// which would then be decoded again.
+    fn has_room_for(&self, path: &Path, bytes: u64, budget: u64) -> bool {
+        let Some(pos) = self.plan.iter().position(|p| p == path) else { return false };
+        let replaced = self.cache.get(path).map_or(0, |e| e.bytes);
+        let evictable: u64 = self
+            .cache
+            .iter()
+            .filter(|(p, _)| p.as_path() != path)
+            .filter(|(p, _)| self.plan.iter().position(|q| q == *p).is_none_or(|q| q > pos))
+            .map(|(_, e)| e.bytes)
+            .sum();
+        (self.used_bytes - replaced).saturating_add(bytes) <= budget.saturating_add(evictable)
     }
 
     fn stats(&self) -> Stats {
@@ -253,12 +293,12 @@ impl Shared {
         // Decoders and archive readers run on untrusted files: a panic in one of them fails this
         // image, and the worker, its bookkeeping below and every later image carry on.
         let result = iv_core::panic::catch("image reader", || {
-            let src = crate::archive::source_for(&job.path)?;
+            let src = crate::archive::source_for_cancellable(&job.path, &cancel)?;
             let info = self.registry.probe(&src)?;
             let bytes = expected_bytes(&info);
             if job.kind == Kind::Foreground {
                 (self.sink)(PipelineEvent::Probed { path: job.path.clone(), info });
-            } else if bytes > self.config.budget_bytes / 2 {
+            } else if cached_bytes(&info) > self.config.budget_bytes / 2 {
                 return Ok(None);
             }
             reserved = self.reserve(bytes, job.kind, &cancel)?;
@@ -266,10 +306,13 @@ impl Shared {
             if job.kind == Kind::Foreground {
                 // a broken or missing preview is not an error: the decode follows
                 if let Ok(Some(image)) = self.registry.preview(&src, PREVIEW_TARGET, &cancel) {
-                    (self.sink)(PipelineEvent::Preview { path: job.path.clone(), image });
+                    (self.sink)(PipelineEvent::Preview { path: job.path.clone(), image: to_display(image) });
                 }
             }
-            self.registry.decode(&src, &cancel).map(Some)
+            let decoded = self.registry.decode(&src, &cancel)?;
+            drop(src);
+            cancel.check()?;
+            Ok(Some(display_ready(decoded)))
         });
 
         let event = {
@@ -296,7 +339,13 @@ impl Shared {
                     let decoded = Arc::new(decoded);
                     let bytes = decoded.memory_size() as u64;
                     let is_current = st.plan.first() == Some(&job.path);
-                    if st.plan.contains(&job.path) || quick_frame {
+                    st.sizes.insert(job.path.clone(), bytes);
+                    st.typical_bytes = bytes;
+                    let keep = match job.kind {
+                        Kind::Foreground => st.plan.contains(&job.path) || quick_frame,
+                        Kind::Prefetch => st.has_room_for(&job.path, bytes, self.config.budget_bytes),
+                    };
+                    if keep {
                         st.tick += 1;
                         let last_used = st.tick;
                         if let Some(old) =
@@ -333,16 +382,69 @@ impl Shared {
     }
 }
 
-/// Pixel memory a decode of `info` is expected to take: RGBA at the precision the pipeline keeps
-/// (8, 16 or 32-bit float channels), every frame of a known animation counted.
+/// Pixel memory a decode of `info` is expected to take while it runs: RGBA at the precision the
+/// decoder produces (8, 16 or 32-bit float channels), every frame of a known animation counted.
 fn expected_bytes(info: &ImageInfo) -> u64 {
     let pixel = match info.bits_per_channel {
         0..=8 => 4,
         9..=16 => 8,
         _ => 16,
     };
+    frames_of(info).saturating_mul(pixel)
+}
+
+/// Pixel memory the cache keeps for `info`: 8-bit RGBA (see [`display_ready`]).
+fn cached_bytes(info: &ImageInfo) -> u64 {
+    frames_of(info).saturating_mul(4)
+}
+
+/// Pixels of every frame of `info` (one when the count is unknown).
+fn frames_of(info: &ImageInfo) -> u64 {
     let frames = info.frame_count.unwrap_or(1).max(1) as u64;
-    (info.width as u64).saturating_mul(info.height as u64).saturating_mul(pixel).saturating_mul(frames)
+    (info.width as u64).saturating_mul(info.height as u64).saturating_mul(frames)
+}
+
+/// Pixels per parallel work item when converting.
+const CHUNK_PIXELS: usize = 64 * 1024;
+
+/// `img` as 8-bit RGBA: shared as it is when it already is, else converted in parallel.
+fn to_display(img: ImageBuf) -> ImageBuf {
+    if img.format() == PixelFormat::Rgba8 {
+        return img;
+    }
+    ImageBuf::with_samples::<u8>(img.width(), img.height(), PixelFormat::Rgba8, |out| {
+        out.par_chunks_mut(CHUNK_PIXELS * 4).enumerate().for_each(|(i, chunk)| img.rgba8_into(i * CHUNK_PIXELS, chunk));
+    })
+    .expect("an 8-bit copy is smaller than the image")
+}
+
+/// Whether every pixel of an RGBA8 image is fully opaque.
+fn is_opaque(img: &ImageBuf) -> bool {
+    debug_assert_eq!(img.format(), PixelFormat::Rgba8);
+    img.data().par_chunks(CHUNK_PIXELS * 4).all(|c| c.chunks_exact(4).all(|p| p[3] == u8::MAX))
+}
+
+/// What the cache keeps of a decode: the pixels (every frame) as 8-bit RGBA, and `has_alpha`
+/// cleared when no pixel of any frame is transparent.
+fn display_ready(mut d: Decoded) -> Decoded {
+    match &mut d.animation {
+        Some(anim) => {
+            for f in &mut anim.frames {
+                f.image = to_display(f.image.clone());
+            }
+            // the first frame is the still image: keep sharing it
+            d.image = anim.frames[0].image.clone();
+        }
+        None => d.image = to_display(d.image.clone()),
+    }
+    if d.info.has_alpha {
+        let opaque = match &d.animation {
+            Some(anim) => anim.frames.iter().all(|f| is_opaque(&f.image)),
+            None => is_opaque(&d.image),
+        };
+        d.info.has_alpha = !opaque;
+    }
+    d
 }
 
 impl Pipeline {
@@ -427,16 +529,27 @@ impl Pipeline {
             st.failed.remove(current);
             st.foreground.push_back(Job { path: current.to_path_buf(), kind: Kind::Foreground });
         }
-        let todo: Vec<PathBuf> = st.plan[1..]
-            .iter()
-            .filter(|p| {
-                !st.cache.contains_key(*p)
-                    && !running(&st, p)
-                    && !st.failed.contains(*p)
-                    && !st.too_big_to_prefetch.contains(*p)
-            })
-            .cloned()
-            .collect();
+        // remembered sizes are only needed for what may be asked for or evicted next
+        let State { sizes, plan, cache, .. } = &mut *st;
+        sizes.retain(|p, _| cache.contains_key(p) || plan.contains(p));
+        // neighbours nearest first, as far as they fit in the budget beside the current image:
+        // one that does not fit would only be decoded to be thrown away (and decoded again on the
+        // next step)
+        let budget = self.shared.config.budget_bytes;
+        let mut planned = st.estimate(current);
+        let mut todo: Vec<PathBuf> = Vec::new();
+        for p in &st.plan[1..] {
+            if st.too_big_to_prefetch.contains(p) || st.failed.contains(p) {
+                continue;
+            }
+            planned = planned.saturating_add(st.estimate(p));
+            if planned > budget {
+                break;
+            }
+            if !st.cache.contains_key(p) && !running(&st, p) {
+                todo.push(p.clone());
+            }
+        }
         st.background.extend(todo.into_iter().map(|path| Job { path, kind: Kind::Prefetch }));
         st.enforce_budget(self.shared.config.budget_bytes, Some(current));
         drop(st);
