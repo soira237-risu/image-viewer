@@ -100,7 +100,7 @@ const ROWS_OF: usize = 16 * 1024;
 /// Maps `src` pixels to `out` (both RGBA samples of one type) through `map`, in parallel.
 fn map_pixels<T: Copy + Send + Sync>(src: &[T], out: &mut [T], map: impl Fn([T; 3]) -> [T; 3] + Sync) {
     out.par_chunks_mut(ROWS_OF * 4).zip(src.par_chunks(ROWS_OF * 4)).for_each(|(o, s)| {
-        for (o, s) in o.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
+        for (o, s) in o.as_chunks_mut::<4>().0.iter_mut().zip(s.as_chunks::<4>().0) {
             let [r, g, b] = map([s[0], s[1], s[2]]);
             o.copy_from_slice(&[r, g, b, s[3]]);
         }
@@ -124,7 +124,7 @@ fn adjust_owned(img: ImageBuf, adjusts: &[Adjust]) -> Result<ImageBuf> {
             match img.try_into_vec() {
                 Ok(mut data) => {
                     data.par_chunks_mut(ROWS_OF * 4).for_each(|chunk| {
-                        for p in chunk.chunks_exact_mut(4) {
+                        for p in chunk.as_chunks_mut::<4>().0 {
                             let [r, g, b] = table.map8([p[0], p[1], p[2]]);
                             p[..3].copy_from_slice(&[r, g, b]);
                         }
@@ -235,12 +235,12 @@ mod tests {
         let opaque = ImageBuf::new(8, 8, PixelFormat::Rgba8, [10u8, 200, 30, 255].repeat(64)).unwrap();
         let out = resize(&opaque, 3, 5).unwrap();
         assert_eq!((out.width(), out.height()), (3, 5));
-        assert!(out.data().chunks_exact(4).all(|p| p == [10, 200, 30, 255]), "{:?}", &out.data()[..4]);
+        assert!(out.data().as_chunks::<4>().0.iter().all(|p| *p == [10, 200, 30, 255]), "{:?}", &out.data()[..4]);
 
         // alpha-aware resampling premultiplies in 8 bits, so translucent colour may round by 1
         let translucent = ImageBuf::new(8, 8, PixelFormat::Rgba8, [10u8, 200, 30, 128].repeat(64)).unwrap();
         let out = resize(&translucent, 3, 5).unwrap();
-        for p in out.data().chunks_exact(4) {
+        for p in out.data().as_chunks::<4>().0 {
             assert_eq!(p[3], 128);
             assert!(p.iter().zip([10u8, 200, 30]).all(|(a, b)| (*a as i32 - b as i32).abs() <= 1), "{p:?}");
         }
@@ -269,25 +269,29 @@ mod tests {
         let owned =
             adjust_owned(ImageBuf::new(n, 1, PixelFormat::Rgba8, img.data().to_vec()).unwrap(), &chain).unwrap();
         assert_eq!(shared.data(), owned.data());
-        for (o, s) in shared.data().chunks_exact(4).zip(img.data().chunks_exact(4)) {
+        for (o, s) in shared.data().as_chunks::<4>().0.iter().zip(img.data().as_chunks::<4>().0) {
             let want = fold([s[0], s[1], s[2]].map(|c| c as f32 / 255.0)).map(|c| (c * 255.0).round() as u8);
-            assert_eq!(o, [want[0], want[1], want[2], 99]);
+            assert_eq!(*o, [want[0], want[1], want[2], 99]);
         }
 
         let deep: Vec<u16> = (0..n * 4).map(|i| (i * 7919 % 65536) as u16).collect();
         let img16 = ImageBuf::new(n, 1, PixelFormat::Rgba16, bytemuck::cast_slice(&deep).to_vec()).unwrap();
         let out16 = adjust(&img16, &chain).unwrap();
-        for (o, s) in bytemuck::cast_slice::<u8, u16>(out16.data()).chunks_exact(4).zip(deep.chunks_exact(4)) {
+        for (o, s) in
+            bytemuck::cast_slice::<u8, u16>(out16.data()).as_chunks::<4>().0.iter().zip(deep.as_chunks::<4>().0)
+        {
             let want = fold([s[0], s[1], s[2]].map(|c| c as f32 / 65535.0)).map(|c| (c * 65535.0).round() as u16);
-            assert_eq!(o, [want[0], want[1], want[2], s[3]]);
+            assert_eq!(*o, [want[0], want[1], want[2], s[3]]);
         }
 
         let float: Vec<f32> = (0..400).map(|i| i as f32 / 397.0).collect();
         let imgf = ImageBuf::new(100, 1, PixelFormat::RgbaF32, bytemuck::cast_slice(&float).to_vec()).unwrap();
         let outf = adjust(&imgf, &chain).unwrap();
-        for (o, s) in bytemuck::cast_slice::<u8, f32>(outf.data()).chunks_exact(4).zip(float.chunks_exact(4)) {
+        for (o, s) in
+            bytemuck::cast_slice::<u8, f32>(outf.data()).as_chunks::<4>().0.iter().zip(float.as_chunks::<4>().0)
+        {
             let want = fold([s[0], s[1], s[2]]);
-            assert_eq!(o, [want[0], want[1], want[2], s[3]]);
+            assert_eq!(*o, [want[0], want[1], want[2], s[3]]);
         }
     }
 

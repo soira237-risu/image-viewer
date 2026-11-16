@@ -1,0 +1,11 @@
+# Settings every build of this workspace shares: local debug and release builds, CI and the
+# release package. Keep build-wide flags here, never in the RUSTFLAGS environment variable: that
+# variable replaces this list instead of adding to it, and any change of flags changes every
+# unit's fingerprint, so Cargo would keep a second full copy of target/ next to the first.
+
+[target.x86_64-pc-windows-msvc]
+# Link the C runtime statically (/MT): the executables then need no VCRUNTIME140.dll, which
+# Windows does not ship (it comes with the Visual C++ Redistributable). The Universal CRT is part
+# of Windows 10 and later; it is linked statically as well. The C code built by `cc` (libwebp)
+# follows this setting.
+rustflags = ["-C", "target-feature=+crt-static"]

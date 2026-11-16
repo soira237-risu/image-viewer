@@ -6,7 +6,7 @@
 
 ## 빌드 환경
 
-- Rust stable (MSVC), Visual Studio 2022 Build Tools, NASM (`rav1d` 어셈블리)
+- Rust stable (MSVC, 1.98 이상 — `Cargo.toml`의 `rust-version`), Visual Studio 2022 Build Tools, NASM (`rav1d` 어셈블리)
 - NASM이 PATH에 없으면 bash에서: `export PATH="$HOME/.cargo/bin:$(cygpath "$LOCALAPPDATA")/bin/NASM:$PATH"`
 - 메모리가 빠듯하면 `-j 3`처럼 병렬 작업 수를 줄일 것 (커밋 메모리 부족 시 rustc가 0xC0000409로 죽음)
 
@@ -20,6 +20,7 @@ cargo test --workspace --locked --no-fail-fast
 
 - `-p <크레이트>`로 일부만 빌드하면 기능(feature) 조합이 달라져 같은 의존성이 한 벌 더 생김. 빠른 확인용으로는 써도 되지만, 기본은 `--workspace`
 - 릴리스 빌드(`--release`)는 속도·메모리 측정이나 실행 파일 확인이 필요할 때만. 결과물이 5 GB 이상
+- 배포용 zip은 `pwsh -File scripts/package.ps1 -Jobs 3` (README "릴리스 만들기"). 경로를 지우는 플래그가 달라 `target/package-build`에 따로 빌드하고 끝나면 지움
 - 커밋 전에는 위 세 명령이 모두 통과해야 함
 
 ## 디스크 사용 규칙 (중요)
@@ -47,6 +48,8 @@ Cargo는 옛 빌드 결과물을 지우지 않는다(rust-lang/cargo#13136). 의
 4. **빌드 프로필의 디버그 정보를 늘리지 않는다.** 의존성은 `debug = false`, 우리 크레이트는 `debug = "line-tables-only"`(패닉·백트레이스의 줄 번호는 남음). 디버거로 변수를 봐야 하면 로컬에서만 잠시 바꾸고 커밋하지 않는다
 
 5. **빌드 캐시를 한 벌 더 만들지 않는다.** `CARGO_TARGET_DIR` 변경, 다른 위치의 `target/`, 추가 git worktree는 캐시를 통째로 복제한다. 꼭 필요하면 끝난 뒤 그 캐시를 지운다
+
+   - 모든 빌드에 공통인 컴파일러 플래그(C 런타임 정적 링크)는 `.cargo/config.toml`에만 둔다. `RUSTFLAGS`·`CARGO_ENCODED_RUSTFLAGS` 환경 변수는 쓰지 않는다: 설정 파일의 플래그를 덧붙이지 않고 대체하며(정적 CRT가 빠짐), 플래그가 바뀌면 모든 유닛의 지문이 바뀌어 target/이 한 벌 더 생긴다. 한 번만 다른 플래그가 필요하면 `--config`로 덧붙이고 별도 `--target-dir`에 빌드한 뒤 지운다(`scripts/package.ps1`이 그렇게 함)
 
 6. **예제·벤치마크는 필요할 때만** `--example <이름>`으로 빌드한다 (`crates/iv-win/examples/`, `iv bench`)
 

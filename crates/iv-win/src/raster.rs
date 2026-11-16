@@ -163,7 +163,7 @@ fn half(img: &ImageBuf, alpha: bool) -> ImageBuf {
     let mut out = vec![0u8; hw * hh * 4];
     out.par_chunks_mut(hw * 4).enumerate().for_each(|(y, row)| {
         let rows = [2 * y, (2 * y + 1).min(h - 1)];
-        for (x, px) in row.chunks_exact_mut(4).enumerate() {
+        for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let cols = [2 * x, (2 * x + 1).min(w - 1)];
             let mut sum = [0u32; 4];
             let mut weight = 0u32;
@@ -647,7 +647,7 @@ mod tests {
         resample(&mut resizer, &img, [700.5, 400.5, 740.5, 430.5], (80, 60), false, true, &mut out);
         let scratch = resizer.size_of_internal_buffers();
         assert!(scratch < 64 * 1024, "{scratch} bytes of scratch for a 40x30 region of a 6 MB image");
-        assert!(out.chunks_exact(4).all(|p| p[3] == 100));
+        assert!(out.as_chunks::<4>().0.iter().all(|p| p[3] == 100));
     }
 
     #[test]

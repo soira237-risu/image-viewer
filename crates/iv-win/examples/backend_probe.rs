@@ -223,7 +223,7 @@ fn main() {
             .decode(&Source::from_path(&path), &CancelToken::never())
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let mut px = d.image.to_rgba8().into_owned();
-        for p in px.chunks_exact_mut(4) {
+        for p in px.as_chunks_mut::<4>().0 {
             p.swap(0, 2); // RGBA → BGRA
         }
         println!(

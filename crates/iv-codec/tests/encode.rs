@@ -32,8 +32,10 @@ fn round_trip(format: FormatId, img: &ImageBuf, opts: &[&str], meta: &Metadata) 
 fn psnr(a: &ImageBuf, b: &ImageBuf) -> f64 {
     let (a, b) = (a.to_rgba8(), b.to_rgba8());
     let mse: f64 = a
-        .chunks_exact(4)
-        .zip(b.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<4>().0)
         .flat_map(|(p, q)| (0..3).map(move |c| (p[c] as f64 - q[c] as f64).powi(2)))
         .sum::<f64>()
         / (a.len() / 4 * 3) as f64;

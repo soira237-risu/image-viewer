@@ -72,7 +72,7 @@ fn jpeg_uses_zune_and_is_close_to_source() {
 
     // lossy: compare mean absolute error on colour channels; alpha must be opaque
     let mut err = 0u64;
-    for (got, want) in d.image.data().chunks_exact(4).zip(src.as_raw().chunks_exact(4)) {
+    for (got, want) in d.image.data().as_chunks::<4>().0.iter().zip(src.as_raw().as_chunks::<4>().0) {
         assert_eq!(got[3], 255);
         err += (0..3).map(|c| (got[c] as i32 - want[c] as i32).unsigned_abs() as u64).sum::<u64>();
     }
@@ -283,6 +283,42 @@ fn panicking_decoder_is_an_error_and_falls_through() {
         }
         other => panic!("expected NoDecoder, got {other:?}"),
     }
+}
+
+/// Needs a system codec that is not installed, like WIC without the HEIF extension.
+struct NoCodec(DecoderInfo);
+
+impl Decoder for NoCodec {
+    fn info(&self) -> &DecoderInfo {
+        &self.0
+    }
+    fn probe(&self, _: &Source, format: FormatId) -> Result<ImageInfo> {
+        Err(Error::CodecMissing { format })
+    }
+    fn decode(&self, _: &Source, format: FormatId, _: &CancelToken) -> Result<Decoded> {
+        Err(Error::CodecMissing { format })
+    }
+}
+
+#[test]
+fn missing_system_codec_is_reported_over_other_failures() {
+    let info = |id, priority| DecoderInfo { id, name: id, formats: &[FormatId::Png], priority };
+    let png = encode(&DynamicImage::ImageRgba8(pattern(4, 4, true)), ImageFormat::Png);
+    let src = Source::from_bytes("a.png", png);
+
+    // every decoder failed, one of them for want of a codec: that is the reason given
+    let mut reg = Registry::new();
+    reg.register(Arc::new(Broken(info("broken", 10))));
+    reg.register(Arc::new(NoCodec(info("no-codec", 5))));
+    match reg.decode(&src, &CancelToken::never()) {
+        Err(Error::CodecMissing { format }) => assert_eq!(format, FormatId::Png),
+        other => panic!("expected CodecMissing, got {other:?}"),
+    }
+
+    // a decoder that works still wins
+    let mut reg = default_registry();
+    reg.register(Arc::new(NoCodec(info("no-codec", 1000))));
+    assert_eq!(reg.decode(&src, &CancelToken::never()).unwrap().info.codec, "image-rs");
 }
 
 #[test]

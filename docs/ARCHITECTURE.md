@@ -243,12 +243,12 @@ export(source, edits, target_codec, options, dest):
 | EXIF 읽기 | `kamadak-exif` 0.6 |
 | 메타데이터 이식 (JPEG/PNG/WebP 청크) | `img-parts` 0.4 |
 | 색 관리 | `moxcms` 0.9 (순수 Rust, `image`도 내부 사용) vs `lcms2` 6.2 (C 빌드) — M3에서 결정 |
-| 폴더 감시 | `notify` 8.2 |
+| 폴더 감시 | `notify` 8.2 — 후보만, 아직 쓰지 않음 (폴더 감시는 남은 일) |
 | 파일 대화상자 | `IFileDialog` 직접 호출 (M5까지 `rfd`) |
 | 휴지통 | Win32 직접 (`SHFileOperationW`, `FOF_ALLOWUNDO`) — `trash` 크레이트는 쓰지 않음 |
 | 클립보드 | Win32 직접 (`CF_DIB`·`CF_DIBV5`·PNG·`CF_HDROP`·`CF_UNICODETEXT`) — `arboard`는 쓰지 않음 |
 | 아이콘·버전 리소스 | `build.rs`가 `.res`를 직접 씀 (`rc.exe`·`embed-resource` 없음) |
-| 압축파일 | `zip` 9.5, `sevenz-rust2` 0.25, `unrar` 0.5 (unRAR 라이선스 확인 필요) |
+| 압축파일 | `zip` 9.5, `sevenz-rust2` 0.25 — `unrar` 0.5는 후보만 (unRAR 라이선스 확인 필요, 쓰지 않음) |
 
 ## 6. 개발 단계 (각 단계마다 측정·테스트로 완료 판정)
 
@@ -495,6 +495,7 @@ GPU를 쓰는 순간 드라이버(AMD `amdxc64.dll` 등)가 100 MB대 바닥을 
 
 ### 남은 일 (다음 단계 후보)
 
+- 폴더 감시: 보고 있는 폴더에 다른 프로그램이 파일을 넣거나 지우면 목록 갱신 (지금은 폴더를 다시 열어야 반영)
 - AVIF 컨테이너 회전(irot/imir)·내장 ICC 읽기 (rav1d 경로)
 - 실제 카메라 RAW 파일로 WIC 경로 검증 (샘플 필요)
 - RAR/CBR (unRAR 라이선스 확인 후)
@@ -526,3 +527,14 @@ GPU를 쓰는 순간 드라이버(AMD `amdxc64.dll` 등)가 100 MB대 바닥을 
 - 폴더에서 보기(Ctrl+Shift+E, `file.show_in_folder`): `SHOpenFolderAndSelectItems`로 탐색기에서 파일 선택(압축파일 페이지는 압축파일). `explorer /select,` 명령줄은 쉼표·공백 따옴표 문제로 쓰지 않음
 - 아이콘·버전: 아이콘은 코드로 그림(`src/app_icon.rs`, 16~256 px 8가지, 8×8 슈퍼샘플링, PNG 이미지로 15 KB)이고 `res/app.ico`가 그 그림과 픽셀 단위로 같은지 테스트가 확인(`IV_WRITE_ICON=1`로 다시 씀). `build.rs`가 `res/winres.rs`로 아이콘 그룹 + `VERSIONINFO`(Cargo.toml 버전, FileDescription·ProductName 등)를 담은 `.res`를 직접 써서 링커에 넘김 → 탐색기·작업 표시줄·"연결 프로그램"·속성 > 자세히에 이름·버전·아이콘. 창 클래스는 `LoadImageW`로 큰·작은 아이콘을 시스템 크기에 맞게. 정보(Shift+F1, `app.about`): 버전·설정 폴더·기록 폴더. `--version`(`-V`)은 두 실행 파일 모두, 콘솔 없는 릴리스 빌드는 실행한 콘솔에 붙어서 출력
 - "연결 프로그램" 등록: 설정 창의 등록/등록 해제 버튼 또는 `--register`/`--unregister`. `HKEY_CURRENT_USER`만(관리자 권한 없음): `Software\Classes\Applications\image-viewer.exe`(FriendlyAppName, SupportedTypes, open 명령), ProgID `ImageViewer.Image`·`ImageViewer.Archive`(형식 이름, 아이콘, open 명령), 확장자마다 `.<ext>\OpenWithProgids`, `Software\image-viewer\Capabilities` + `RegisteredApplications`(기본 앱 목록). 확장자 목록은 코덱 레지스트리(`FormatId`)와 압축파일 읽기에서. 해제는 등록한 것만 지움: 뷰어 전용 키는 통째로, 다른 프로그램과 함께 쓰는 키(`.jpg\OpenWithProgids` 등)는 뷰어 값만 지우고 비었을 때만 키 삭제. `UserChoice`(사용자가 고른 기본 앱)는 건드리지 않음 — Windows 10/11에서는 프로그램이 스스로 기본 앱이 될 수 없으므로 "기본 앱 설정…" 버튼으로 설정 > 기본 앱을 엶. 쓸 값·지울 값 계획은 `iv_win::assoc`(플랫폼 독립 테스트), 실제 레지스트리 왕복은 `HKCU\Software\image-viewer-test-*` 임시 키에서 테스트
+
+### 출시 준비: 배포 패키지 (2026-11-17)
+
+- C 런타임 정적 링크: `.cargo/config.toml`의 `[target.x86_64-pc-windows-msvc] rustflags = ["-C", "target-feature=+crt-static"]`. 로컬·CI·배포 빌드가 모두 같은 플래그를 쓰므로 유닛 지문이 하나뿐(환경 변수 `RUSTFLAGS`는 이 설정을 대체하므로 쓰지 않음). `cc`로 빌드하는 libwebp도 `/MT`를 따름. 결과: 두 실행 파일의 가져오기에서 `VCRUNTIME140.dll`과 `api-ms-win-crt-*` 7개가 사라짐(UCRT도 정적), 크기는 각각 약 170 KB 증가(image-viewer 18.60 → 18.77 MB). `tests/executable.rs`가 디버그 실행 파일의 가져오기 표를 직접 읽어 확인
+- 매니페스트: `res/app.manifest`를 링커가 `/MANIFESTINPUT`으로 자기 부분(`asInvoker`)과 합침. 공용 컨트롤 6, `supportedOS` Windows 10/11, `dpiAwareness` PerMonitorV2(+ `dpiAware` true/pm). 런타임의 `SetProcessDpiAwarenessContext`는 매니페스트가 없을 때를 위해 남김(있으면 아무 일 없이 실패). 링커는 합친 XML의 네임스페이스를 접두사(`ms_compatibility:`)로 바꿔 씀 — 테스트가 리소스(RT_MANIFEST)를 읽어 내용 확인
+- 선택 코덱 없음 알림: WIC 디코더가 HRESULT를 형식과 함께 해석해 `Error::CodecMissing`으로 바꿈. HEIF·RAW에서 `WINCODEC_ERR_COMPONENTINITIALIZEFAILURE`(HEIF 디코더가 HEVC를 못 불러옴)는 항상, `WINCODEC_ERR_COMPONENTNOTFOUND`는 그 형식의 컨테이너 디코더(`GUID_ContainerFormatHeif`/`Raw`)가 `CreateDecoder`로 만들어지지 않을 때만(설치돼 있으면 손상된 파일). 레지스트리는 다른 디코더도 실패했으면 이 오류를 우선 보고, 파이프라인은 `FailureKind::CodecMissing`, 화면은 설치할 Store 확장 이름을 한국어·영어로 표시. 이 컴퓨터(코덱 설치됨)에서 손상된 `.heic`는 여전히 "열 수 없습니다 (…0xC00D36BE)"
+- `rust-version` 1.85 → 1.98 (잠긴 의존성 중 가장 높은 avif-decode 3.0). 올리자 clippy의 MSRV 조건부 린트(`as_chunks`, let 체인으로 합치는 `collapsible_if`, `is_multiple_of`)가 켜져 47곳을 고침(의미 같음, 테스트로 확인)
+- 배포: `scripts/package.ps1`(LICENSE 확인 → 버전·태그·CHANGELOG·rust-version 확인 → `target/package-build`에 깨끗한 릴리스 빌드, `--config`로 `--remap-path-prefix` 3개(사용자 폴더 → `/home`, Cargo 폴더 → `/cargo`, 저장소 → `/image-viewer`)를 덧붙임 → 실행 파일 검사(C 런타임 DLL 없음, 빌드 경로 없음, 버전) → 서드파티 고지 → zip·sha256·symbols zip, 빌드 폴더 삭제). `.github/workflows/release.yml`은 `v*` 태그에서 LICENSE 확인(없으면 바로 실패) → 고정 툴체인(1.100.0)·NASM → 테스트 → 이 스크립트 → `gh release create`. 빌드 캐시를 쓰지 않음
+- 서드파티 고지: `scripts/notices.ps1`이 `cargo metadata --filter-platform x86_64-pc-windows-msvc`에서 iv-win·iv-cli로부터 일반 의존성만 따라가(빌드 의존성·프로시저 매크로·dev 제외) 184개 패키지를 모으고, 레지스트리 폴더의 LICENSE/COPYING/NOTICE/PATENTS/COPYRIGHT 파일(+ `vendor/`: libwebp의 BSD-3·PATENTS)을 넣음. 파일이 없는 4개(alloc-stdlib, libwebp-sys, profiling, zune-inflate)는 표준 문안(MIT는 Rust 툴체인의 `share/doc/rust/licenses`, BSD-3은 스크립트 안)에 저자 이름. 같은 전문은 한 번(145개), 결과 432 KB, 같은 Cargo.lock이면 바이트 단위로 같은 파일. 허용 목록(MIT·Apache-2.0·BSD·Zlib·ISC·Unicode·CC0·Unlicense·BSL·MPL-2.0 등) 밖이면 실패 — MPL-2.0(avif-parse)은 각 패키지의 소스 주소를 함께 적어 조건을 채움. Rust 표준 라이브러리 고지는 `RUST-STD-COPYRIGHT.html`
+- 실측 (임시 LICENSE로 로컬 실행, `-Jobs 3`): 6분 0초, zip 13.45 MB(실행 파일 2개 + 문서 5개), symbols zip 30.0 MB. 고치기 전 릴리스 실행 파일은 `VCRUNTIME140.dll` 등 8개 CRT DLL을 가져오고 사용자 폴더 경로가 들어 있었음 → 새 실행 파일은 둘 다 없음. 새 실행 파일을 `--no-activate`로 띄워 HEIC가 WIC로 121 ms에 표시됨(매니페스트가 유효해 실행됨, 200% 화면에서 선명)
+- 남은 결정: 프로젝트 라이선스(소유자가 정함). 정해지기 전에는 패키지·릴리스가 LICENSE 확인에서 멈춤

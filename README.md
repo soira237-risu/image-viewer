@@ -5,7 +5,7 @@ Rust로 만드는 작고 빠른 Windows 이미지 뷰어. GPU 드라이버도 UI
 - **속도 우선**: 저해상도 미리보기 먼저 표시, 나선형 미리 읽기, GC 없는 일정한 반응성
 - **다양한 형식**: JPEG, PNG, WebP, GIF, TIFF, AVIF, HEIC, JPEG XL, RAW, SVG 등
 - **간단한 편집**: 회전, 뒤집기, 자르기, 크기 변경, 기본 보정, 실행 취소/다시 실행
-- **형식 변환**: 다른 이름으로 저장, 일괄 변환, 잘못된 확장자 바로잡기
+- **형식 변환**: 다른 이름으로 저장, 잘못된 확장자 바로잡기(Ctrl+E), 일괄 변환(명령줄 `iv convert`)
 
 ## 상태
 
@@ -13,17 +13,39 @@ M0~M6 완료:
 
 - 빠른 보기: CPU 렌더러(보이는 부분만 SIMD 리샘플, 크게 줄일 때는 절반·4분의 1 크기 단계에서, GDI로 표시), 100%는 화면 픽셀에 맞춰 원본 그대로(번짐 없음), 미리보기 먼저, 방향 고려 미리 읽기(메모리 예산에 들어가는 이웃만), 키를 누르고 있을 때의 빠른 넘김
 - 16비트·부동소수 이미지는 화면용 8비트로 바꿔 캐시(디코드 작업자에서, 메모리 절반 이하). 저장은 파일을 다시 읽어 원래 정밀도로
-- 형식: JPEG, PNG/APNG, GIF, WebP, AVIF, HEIC, JPEG XL, TIFF, BMP, ICO, QOI, TGA, PNM, DDS, EXR, HDR, SVG, 카메라 RAW(Windows 코덱), ICC 색 관리
+- 형식: JPEG, PNG/APNG, GIF, WebP, AVIF, HEIC, JPEG XL, TIFF, BMP, ICO, QOI, TGA, PNM, DDS, EXR, HDR, SVG, 카메라 RAW, ICC 색 관리 (HEIC와 RAW는 Windows 코덱으로 읽음: [선택 코덱](#선택-코덱-heicraw) 참고)
 - 압축파일: ZIP/CBZ, 7z/CB7 (만화 두 쪽 보기, 7z는 페이지가 든 압축 블록만 풂). `\`로 구분한 항목 이름(일부 Windows 도구)도 열림. 압축파일 밖을 가리키는 이름(`..`, `C:`, `/`로 시작)의 항목은 목록에서 빠짐. 항목 하나는 1 GiB까지 읽음
 - SVG: 문서 안에 `data:`로 넣은 이미지만 그림. 바깥 파일·네트워크 경로(`\\서버\...`)를 가리키는 이미지는 읽지 않고 빈 칸으로 둠
 - 편집: 회전·뒤집기·자르기·보정·크기 변경, 실행 취소, 저장/다른 이름으로 저장 (JPEG 회전은 무손실)
-- 변환: 9개 형식 인코더, 일괄 변환 CLI, 확장자 바로잡기
+- 변환: 9개 형식 인코더, 확장자 바로잡기(뷰어 Ctrl+E, `iv fix-ext`), 일괄 변환(`iv convert`, 명령줄 전용)
 
-설계와 개발 단계는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), 개발 규칙(빌드 캐시 용량 관리 포함)은 [AGENTS.md](AGENTS.md) 참고.
+설계와 개발 단계는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), 개발 규칙(빌드 캐시 용량 관리 포함)은 [AGENTS.md](AGENTS.md), 버전별 변경은 [CHANGELOG.md](CHANGELOG.md) 참고.
 
-## 빌드
+## 설치
 
-필요: Rust stable (MSVC 툴체인), Visual Studio 2022 Build Tools (C++ 워크로드), NASM (AV1 디코더 `rav1d`의 어셈블리 최적화용).
+GitHub 릴리스에서 `image-viewer-<버전>-x86_64-windows.zip`을 받아 원하는 폴더에 풀고 `image-viewer.exe`를 실행. 설치 과정·관리자 권한·Visual C++ 재배포 패키지가 필요 없음 (C 런타임이 실행 파일 안에 들어 있음).
+
+- 요구 사항: Windows 10 1703 이상 또는 Windows 11, 64비트(x64)
+- zip 내용: `image-viewer.exe`(뷰어), `iv.exe`(명령줄 도구: 일괄 변환·확장자 바로잡기·정보·속도 측정), `README.md`, `CHANGELOG.md`, `LICENSE`, `THIRD-PARTY-NOTICES.txt`·`RUST-STD-COPYRIGHT.html`(실행 파일에 들어 있는 오픈 소스 패키지의 라이선스)
+- 받은 파일 확인: 같은 이름의 `.sha256` 파일에 든 값과 `Get-FileHash <zip 파일>`의 값이 같아야 함
+- `…-symbols.zip`은 비정상 종료 기록(`crash.log`)을 분석할 때 쓰는 디버그 기호(.pdb). 뷰어를 쓰는 데는 필요 없음
+- 기본 뷰어로 쓰려면 [기본 뷰어로 쓰기](#기본-뷰어로-쓰기) 참고. 지울 때는 등록을 해제(`image-viewer --unregister`)한 뒤 폴더를 지우고, 설정(`%APPDATA%\image-viewer`)과 기록(`%LOCALAPPDATA%\image-viewer`)도 필요 없으면 지움
+
+### 선택 코덱 (HEIC·RAW)
+
+HEIC/HEIF와 카메라 RAW는 뷰어 안에 디코더가 없고 Windows 이미지 코덱(WIC)으로 읽음. Microsoft Store에서 아래 확장을 설치해야 열림. 없으면 열 때 제목 표시줄에 어떤 확장이 필요한지 표시됨.
+
+| 형식 | 필요한 확장 (Microsoft Store) |
+|---|---|
+| HEIC/HEIF (아이폰 사진 등) | **HEIF 이미지 확장** + **HEVC 비디오 확장** (HEVC는 PC에 따라 유료) |
+| 카메라 RAW (CR2·CR3·NEF·ARW·RAF·ORF·RW2·DNG 등) | **Raw 이미지 확장** |
+
+AVIF·WebP·JPEG XL을 비롯한 나머지 형식은 모두 뷰어 안의 디코더로 읽으므로 따로 설치할 것이 없음. RAW는 아직 실제 카메라 파일로 검증하지 못함.
+
+## 소스에서 빌드
+
+필요: Rust 1.98 이상 (MSVC 툴체인), Visual Studio 2022 Build Tools (C++ 워크로드), NASM (AV1 디코더 `rav1d`의 어셈블리 최적화용).
+C 런타임 정적 링크 등 모든 빌드에 공통인 설정은 `.cargo/config.toml`에 있음 (`RUSTFLAGS` 환경 변수를 쓰면 이 설정이 무시됨).
 
 ```bash
 winget install NASM.NASM   # PATH에 없으면 환경 변수 NASM에 nasm.exe 경로 지정
@@ -41,6 +63,19 @@ cargo build --release
 ./target/release/image-viewer --version     # 버전 (`iv --version`도 같음)
 ./target/release/image-viewer --register    # "연결 프로그램"·기본 앱 목록에 등록 (이 사용자만, --unregister로 해제)
 ```
+
+### 릴리스 만들기
+
+1. `Cargo.toml`의 `version`을 올리고 `CHANGELOG.md`에 `## [버전]` 절을 씀 (그 절이 릴리스 설명이 됨)
+2. `v<버전>` 태그를 push → [`.github/workflows/release.yml`](.github/workflows/release.yml)이 테스트, 패키지, GitHub 릴리스(zip·`.sha256`·symbols zip)까지 진행. 수동 실행(workflow_dispatch)은 릴리스를 만들지 않고 결과물만 작업 아티팩트로 남김
+
+같은 과정을 로컬에서: `pwsh -File scripts/package.ps1 -Jobs 3` → `target/dist/`. [scripts/package.ps1](scripts/package.ps1)이 순서대로 확인하고 하나라도 어긋나면 멈춤:
+
+- 저장소 최상위에 `LICENSE` 파일이 있는지 (**아직 라이선스가 정해지지 않아 지금은 여기서 실패함**. 소유자가 라이선스를 고르고 `LICENSE`와 `Cargo.toml`의 `license`를 추가해야 릴리스 가능)
+- 태그와 `Cargo.toml` 버전이 같은지, `CHANGELOG.md`에 그 버전 절이 있는지, `rust-version`이 잠긴 의존성들의 최소 Rust 버전 이상인지
+- 깨끗한 릴리스 빌드(`target/package-build`, 끝나면 지움): 빌드한 컴퓨터의 경로(사용자 폴더·Cargo 폴더·저장소 위치)를 `--remap-path-prefix`로 지움 (.pdb는 rustc가 원래 파일 이름만 넣음)
+- 두 실행 파일이 C 런타임 DLL(`VCRUNTIME140.dll` 등)을 가져다 쓰지 않는지, 빌드 경로가 들어 있지 않은지, 버전이 맞는지
+- 서드파티 고지: [scripts/notices.ps1](scripts/notices.ps1)이 `Cargo.lock`과 로컬 Cargo 레지스트리에서 실행 파일에 들어가는 패키지(빌드 스크립트·프로시저 매크로·테스트 전용 제외)의 라이선스와 전문을 모아 `THIRD-PARTY-NOTICES.txt`를 씀. 허용 목록 밖의 라이선스나 전문이 없는 패키지가 있으면 실패
 
 ### 기본 단축키
 

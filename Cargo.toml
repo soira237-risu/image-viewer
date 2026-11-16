@@ -5,7 +5,8 @@ members = ["crates/iv-core", "crates/iv-codec", "crates/iv-cli", "crates/iv-pipe
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# the highest rust-version among the locked dependencies (avif-decode 3.0); scripts/package.ps1 checks it
+rust-version = "1.98"
 publish = false
 
 [workspace.dependencies]

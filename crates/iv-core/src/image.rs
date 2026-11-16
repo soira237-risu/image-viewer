@@ -135,7 +135,7 @@ impl ImageBuf {
                 let srgb = |c: f32| if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
                 let enc = |c: f32| (srgb(c.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
                 let src: &[f32] = &bytemuck::cast_slice(&self.data)[first * 4..first * 4 + n];
-                for (o, p) in out.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                for (o, p) in out.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
                     o.copy_from_slice(&[enc(p[0]), enc(p[1]), enc(p[2]), (p[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8]);
                 }
             }
@@ -159,11 +159,13 @@ impl ImageBuf {
     /// Whether every pixel is fully opaque.
     pub fn is_opaque(&self) -> bool {
         match self.format {
-            PixelFormat::Rgba8 => self.data.chunks_exact(4).all(|p| p[3] == u8::MAX),
+            PixelFormat::Rgba8 => self.data.as_chunks::<4>().0.iter().all(|p| p[3] == u8::MAX),
             PixelFormat::Rgba16 => {
-                bytemuck::cast_slice::<u8, u16>(&self.data).chunks_exact(4).all(|p| p[3] == u16::MAX)
+                bytemuck::cast_slice::<u8, u16>(&self.data).as_chunks::<4>().0.iter().all(|p| p[3] == u16::MAX)
             }
-            PixelFormat::RgbaF32 => bytemuck::cast_slice::<u8, f32>(&self.data).chunks_exact(4).all(|p| p[3] >= 1.0),
+            PixelFormat::RgbaF32 => {
+                bytemuck::cast_slice::<u8, f32>(&self.data).as_chunks::<4>().0.iter().all(|p| p[3] >= 1.0)
+            }
         }
     }
 

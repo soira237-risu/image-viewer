@@ -76,7 +76,7 @@ fn sniff_isobmff(head: &[u8]) -> Option<FormatId> {
     let box_len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
     let end = box_len.clamp(16, head.len());
     // major brand at 8..12, minor version at 12..16, compatible brands from 16
-    let brands = std::iter::once(&head[8..12]).chain(head[16..end].chunks_exact(4));
+    let brands = std::iter::once(&head[8..12]).chain(head[16..end].as_chunks::<4>().0.iter().map(|b| b.as_slice()));
 
     let mut heif = false;
     for brand in brands {

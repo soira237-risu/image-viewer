@@ -6,12 +6,14 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use iv_core::{CancelToken, Error, FormatId, ImageBuf, ImageInfo, Orientation, PixelFormat, Result, Source};
-use windows::Win32::Foundation::GENERIC_READ;
+use windows::Win32::Foundation::{
+    GENERIC_READ, WINCODEC_ERR_COMPONENTINITIALIZEFAILURE, WINCODEC_ERR_COMPONENTNOTFOUND,
+};
 use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx};
 use windows::Win32::System::Variant::VT_UI2;
-use windows::core::{GUID, HSTRING, Interface, w};
+use windows::core::{GUID, HRESULT, HSTRING, Interface, w};
 
 use crate::decoder::{Decoded, Decoder, DecoderInfo};
 
@@ -55,6 +57,71 @@ fn wic_err(e: windows::core::Error) -> Error {
     Error::decode(ID, format!("{} (0x{:08X})", e.message(), e.code().0))
 }
 
+/// A failure inside this module. A WIC call keeps its HRESULT until the decoder's entry point,
+/// which knows the format and so what a missing component means.
+enum Failure {
+    Wic(windows::core::Error),
+    Other(Error),
+}
+
+impl From<windows::core::Error> for Failure {
+    fn from(e: windows::core::Error) -> Self {
+        Failure::Wic(e)
+    }
+}
+
+impl From<Error> for Failure {
+    fn from(e: Error) -> Self {
+        Failure::Other(e)
+    }
+}
+
+type WicResult<T> = std::result::Result<T, Failure>;
+
+impl Failure {
+    fn into_error(self, format: FormatId) -> Error {
+        match self {
+            Failure::Other(e) => e,
+            Failure::Wic(e) if codec_missing(format, e.code(), || decoder_installed(format)) => {
+                Error::CodecMissing { format }
+            }
+            Failure::Wic(e) => wic_err(e),
+        }
+    }
+}
+
+/// The container format of the optional Microsoft Store codec a format depends on.
+fn store_container(format: FormatId) -> Option<GUID> {
+    match format {
+        // "HEIF Image Extensions" (which needs "HEVC Video Extensions" to decode)
+        FormatId::Heif => Some(GUID_ContainerFormatHeif),
+        // "Raw Image Extension"
+        FormatId::Raw => Some(GUID_ContainerFormatRaw),
+        _ => None,
+    }
+}
+
+/// Whether a failure with `code` means the optional codec for `format` is not installed.
+/// COMPONENTNOTFOUND is also what an installed codec's format gets for bytes nobody recognises
+/// (a damaged file), so it only counts when the format's decoder is absent; `installed` is asked
+/// only then. COMPONENTINITIALIZEFAILURE is the HEIF decoder unable to load its HEVC codec.
+fn codec_missing(format: FormatId, code: HRESULT, installed: impl FnOnce() -> bool) -> bool {
+    if store_container(format).is_none() {
+        return false;
+    }
+    match code {
+        WINCODEC_ERR_COMPONENTINITIALIZEFAILURE => true,
+        WINCODEC_ERR_COMPONENTNOTFOUND => !installed(),
+        _ => false,
+    }
+}
+
+/// Whether WIC has a decoder for the container of `format`.
+fn decoder_installed(format: FormatId) -> bool {
+    let Some(container) = store_container(format) else { return false };
+    factory().is_ok_and(|f| unsafe { f.CreateDecoder(&container, std::ptr::null()) }.is_ok())
+}
+
 /// One factory per thread; COM is initialised for the thread on first use.
 fn factory() -> Result<IWICImagingFactory> {
     FACTORY.with(|cell| {
@@ -77,26 +144,22 @@ struct Opened {
     _bytes: Option<Arc<[u8]>>,
 }
 
-fn open(src: &Source) -> Result<Opened> {
+fn open(src: &Source) -> WicResult<Opened> {
     let f = factory()?;
     unsafe {
         if let Some(path) = src.path() {
-            let decoder = f
-                .CreateDecoderFromFilename(
-                    &HSTRING::from(path.as_os_str()),
-                    None,
-                    GENERIC_READ,
-                    WICDecodeMetadataCacheOnDemand,
-                )
-                .map_err(wic_err)?;
+            let decoder = f.CreateDecoderFromFilename(
+                &HSTRING::from(path.as_os_str()),
+                None,
+                GENERIC_READ,
+                WICDecodeMetadataCacheOnDemand,
+            )?;
             Ok(Opened { decoder, _bytes: None })
         } else {
             let bytes = src.read_all()?;
-            let stream = f.CreateStream().map_err(wic_err)?;
-            stream.InitializeFromMemory(&bytes).map_err(wic_err)?;
-            let decoder = f
-                .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
-                .map_err(wic_err)?;
+            let stream = f.CreateStream()?;
+            stream.InitializeFromMemory(&bytes)?;
+            let decoder = f.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)?;
             Ok(Opened { decoder, _bytes: Some(bytes) })
         }
     }
@@ -153,13 +216,13 @@ fn icc_profile(f: &IWICImagingFactory, frame: &IWICBitmapFrameDecode) -> Option<
     }
 }
 
-fn read_info(codec: &'static str, opened: &Opened, format: FormatId) -> Result<(ImageInfo, IWICBitmapFrameDecode)> {
+fn read_info(codec: &'static str, opened: &Opened, format: FormatId) -> WicResult<(ImageInfo, IWICBitmapFrameDecode)> {
     let f = factory()?;
     unsafe {
-        let frame = opened.decoder.GetFrame(0).map_err(wic_err)?;
+        let frame = opened.decoder.GetFrame(0)?;
         let (mut width, mut height) = (0u32, 0u32);
-        frame.GetSize(&mut width, &mut height).map_err(wic_err)?;
-        let pixel_format = frame.GetPixelFormat().map_err(wic_err)?;
+        frame.GetSize(&mut width, &mut height)?;
+        let pixel_format = frame.GetPixelFormat()?;
         let (bits_per_channel, has_alpha) = pixel_traits(&f, &pixel_format);
         let frame_count = opened.decoder.GetFrameCount().ok();
         let info = ImageInfo {
@@ -185,25 +248,23 @@ fn read_info(codec: &'static str, opened: &Opened, format: FormatId) -> Result<(
 }
 
 /// Converts any WIC source to straight-alpha RGBA, 8 or 16 bits per channel.
-fn to_image(source: &IWICBitmapSource, deep: bool) -> Result<ImageBuf> {
+fn to_image(source: &IWICBitmapSource, deep: bool) -> WicResult<ImageBuf> {
     let f = factory()?;
     unsafe {
         let (mut w, mut h) = (0u32, 0u32);
-        source.GetSize(&mut w, &mut h).map_err(wic_err)?;
+        source.GetSize(&mut w, &mut h)?;
         let (target, format) = if deep {
             (GUID_WICPixelFormat64bppRGBA, PixelFormat::Rgba16)
         } else {
             (GUID_WICPixelFormat32bppRGBA, PixelFormat::Rgba8)
         };
         let len = ImageBuf::byte_len(w, h, format)? as usize;
-        let converter = f.CreateFormatConverter().map_err(wic_err)?;
-        converter
-            .Initialize(source, &target, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)
-            .map_err(wic_err)?;
+        let converter = f.CreateFormatConverter()?;
+        converter.Initialize(source, &target, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
         let stride = w * format.bytes_per_pixel() as u32;
         let mut buf = vec![0u8; len];
-        converter.CopyPixels(std::ptr::null(), stride, &mut buf).map_err(wic_err)?;
-        ImageBuf::new(w, h, format, buf)
+        converter.CopyPixels(std::ptr::null(), stride, &mut buf)?;
+        Ok(ImageBuf::new(w, h, format, buf)?)
     }
 }
 
@@ -213,8 +274,11 @@ impl Decoder for WicDecoder {
     }
 
     fn probe(&self, src: &Source, format: FormatId) -> Result<ImageInfo> {
-        let opened = open(src)?;
-        Ok(read_info(self.codec_id(), &opened, format)?.0)
+        let probe = || -> WicResult<ImageInfo> {
+            let opened = open(src)?;
+            Ok(read_info(self.codec_id(), &opened, format)?.0)
+        };
+        probe().map_err(|e| e.into_error(format))
     }
 
     fn preview(
@@ -229,39 +293,95 @@ impl Decoder for WicDecoder {
         if format == FormatId::Avif {
             return Ok(None);
         }
-        let opened = open(src)?;
-        cancel.check()?;
-        let thumb = unsafe {
-            // container thumbnail (HEIF, RAW previews), then the first frame's own (EXIF)
-            opened.decoder.GetThumbnail().or_else(|_| opened.decoder.GetFrame(0).and_then(|fr| fr.GetThumbnail()))
+        let preview = || -> WicResult<Option<ImageBuf>> {
+            let opened = open(src)?;
+            cancel.check()?;
+            let thumb = unsafe {
+                // container thumbnail (HEIF, RAW previews), then the first frame's own (EXIF)
+                opened.decoder.GetThumbnail().or_else(|_| opened.decoder.GetFrame(0).and_then(|fr| fr.GetThumbnail()))
+            };
+            match thumb {
+                Ok(t) => Ok(Some(to_image(&t, false)?)),
+                Err(_) => Ok(None),
+            }
         };
-        match thumb {
-            Ok(t) => Ok(Some(to_image(&t, false)?)),
-            Err(_) => Ok(None),
-        }
+        preview().map_err(|e| e.into_error(format))
     }
 
     fn decode(&self, src: &Source, format: FormatId, cancel: &CancelToken) -> Result<Decoded> {
-        cancel.check()?;
-        let opened = open(src)?;
-        let (info, frame) = read_info(self.codec_id(), &opened, format)?;
-        cancel.check()?;
-        let image = to_image(&frame.cast::<IWICBitmapSource>().map_err(wic_err)?, info.bits_per_channel > 8)?;
-        cancel.check()?;
-        Ok(Decoded::still(info, image))
+        let decode = || -> WicResult<Decoded> {
+            cancel.check()?;
+            let opened = open(src)?;
+            let (info, frame) = read_info(self.codec_id(), &opened, format)?;
+            cancel.check()?;
+            let image = to_image(&frame.cast::<IWICBitmapSource>()?, info.bits_per_channel > 8)?;
+            cancel.check()?;
+            Ok(Decoded::still(info, image))
+        };
+        decode().map_err(|e| e.into_error(format))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Foundation::WINCODEC_ERR_BADHEADER;
 
-    /// Bytes no installed codec recognises give WINCODEC_ERR_COMPONENTNOTFOUND, the code the HEIF
-    /// test treats as "HEIF Image Extensions not installed".
+    /// Bytes no installed codec recognises give WINCODEC_ERR_COMPONENTNOTFOUND. With the HEIF
+    /// decoder installed that is a damaged file, reported with WIC's code; without it, the missing
+    /// codec is the reason, whatever the bytes.
     #[test]
     fn unrecognised_bytes_report_component_not_found() {
         let src = Source::from_bytes("junk.heic", vec![0x5au8; 64]);
         let err = WicDecoder::primary().decode(&src, FormatId::Heif, &CancelToken::never()).err().unwrap();
-        assert!(err.to_string().contains("0x88982F50"), "{err}");
+        if decoder_installed(FormatId::Heif) {
+            assert!(err.to_string().contains("0x88982F50"), "{err}");
+        } else {
+            assert!(matches!(err, Error::CodecMissing { format: FormatId::Heif }), "{err}");
+        }
+    }
+
+    /// Damaged JPEG bytes reach the fallback decoder: never "codec missing", the JPEG codec is
+    /// part of Windows.
+    #[test]
+    fn built_in_formats_never_report_a_missing_codec() {
+        let src = Source::from_bytes("junk.jpg", vec![0x5au8; 64]);
+        let err = WicDecoder::fallback().decode(&src, FormatId::Jpeg, &CancelToken::never()).err().unwrap();
+        assert!(matches!(err, Error::Decode { .. }), "{err}");
+    }
+
+    #[test]
+    fn missing_codec_is_told_apart_from_a_damaged_file() {
+        let never = || -> bool { panic!("only asked for COMPONENTNOTFOUND") };
+        for format in [FormatId::Heif, FormatId::Raw] {
+            // decoder absent: nothing could read the file
+            assert!(codec_missing(format, WINCODEC_ERR_COMPONENTNOTFOUND, || false));
+            // decoder present: the file itself is bad
+            assert!(!codec_missing(format, WINCODEC_ERR_COMPONENTNOTFOUND, || true));
+            // the HEIF decoder without its HEVC codec
+            assert!(codec_missing(format, WINCODEC_ERR_COMPONENTINITIALIZEFAILURE, never));
+            assert!(!codec_missing(format, WINCODEC_ERR_BADHEADER, never));
+        }
+        for format in [FormatId::Jpeg, FormatId::Tiff, FormatId::Avif] {
+            assert!(!codec_missing(format, WINCODEC_ERR_COMPONENTNOTFOUND, || false));
+            assert!(!codec_missing(format, WINCODEC_ERR_COMPONENTINITIALIZEFAILURE, || false));
+        }
+    }
+
+    /// Where the HEIF fixture decodes, the HEIF decoder must be found, or a damaged HEIF file
+    /// would be blamed on a missing codec.
+    #[test]
+    fn heif_decoder_is_found_where_heif_decodes() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/heic/halves.heic");
+        match WicDecoder::primary().decode(&Source::from_path(path), FormatId::Heif, &CancelToken::never()) {
+            Ok(_) => assert!(decoder_installed(FormatId::Heif)),
+            Err(e) => eprintln!("skipped: HEIF does not decode here ({e})"),
+        }
+    }
+
+    #[test]
+    fn only_store_codecs_are_looked_up() {
+        assert!(!decoder_installed(FormatId::Jpeg));
+        assert!(!decoder_installed(FormatId::Png));
     }
 }

@@ -54,7 +54,7 @@ fn to_image_buf(img: Image) -> Result<ImageBuf> {
         px: impl Iterator<Item = [T; 4]>,
     ) -> Result<ImageBuf> {
         ImageBuf::with_samples::<T>(w as u32, h as u32, format, |out| {
-            for (o, p) in out.chunks_exact_mut(4).zip(px) {
+            for (o, p) in out.as_chunks_mut::<4>().0.iter_mut().zip(px) {
                 o.copy_from_slice(&p);
             }
         })

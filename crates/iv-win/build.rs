@@ -1,6 +1,7 @@
 //! Windows resources of the viewer's executable:
-//! - the application manifest: version 6 of the common controls (themed buttons, trackbars and
-//!   fields) and per-monitor DPI awareness;
+//! - the application manifest (`res/app.manifest`): version 6 of the common controls (themed
+//!   buttons, trackbars and fields), Windows 10/11 as the supported OS and per-monitor DPI
+//!   awareness v2;
 //! - the icon (`res/app.ico`) and the version information (from Cargo.toml), written as a `.res`
 //!   file that the linker takes directly, so no resource compiler is needed.
 
@@ -15,14 +16,13 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=res/app.ico");
     println!("cargo:rerun-if-changed=res/winres.rs");
+    println!("cargo:rerun-if-changed=res/app.manifest");
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
         return;
     }
+    let dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
-    println!(
-        "cargo:rustc-link-arg-bins=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' \
-         version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
-    );
+    println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", dir.join("res").join("app.manifest").display());
 
     let number = |key: &str| -> u16 {
         let v = std::env::var(key).unwrap_or_default();

@@ -125,7 +125,7 @@ fn conversion_keeps_pixels_and_the_icc_profile() {
     assert_eq!(out.info.format, FormatId::Webp);
     assert_eq!(out.info.icc_profile.as_deref(), Some(p3.as_slice()), "profile carried over");
     // saved in its own colour space, not converted to sRGB on the way
-    let rgb = |d: &[u8]| d.chunks_exact(4).map(|p| [p[0], p[1], p[2]]).collect::<Vec<_>>();
+    let rgb = |d: &[u8]| d.as_chunks::<4>().0.iter().map(|p| [p[0], p[1], p[2]]).collect::<Vec<_>>();
     assert_eq!(rgb(out.image.data()), rgb(pattern().as_raw()));
 }
 

@@ -547,11 +547,11 @@ impl App {
             self.selection = None;
             self.after_image_change();
         }
-        if let (Some(cur), Some(decoded)) = (self.current.as_mut(), hit) {
-            if cur.full.is_none() {
-                cur.info = Some(decoded.info.clone());
-                cur.full = Some(decoded);
-            }
+        if let (Some(cur), Some(decoded)) = (self.current.as_mut(), hit)
+            && cur.full.is_none()
+        {
+            cur.info = Some(decoded.info.clone());
+            cur.full = Some(decoded);
         }
         self.sync_display();
         self.update_title();
@@ -604,12 +604,14 @@ impl App {
             _ => {
                 // the full image is up already, e.g. shown while flipping past it with a key
                 // held (that display does not play): start its animation now that it is current
-                if let (Some(d), Some(full)) = (self.display.as_mut().filter(|_| same_image), &cur.full) {
-                    if d.kind == Shown::Full && d.playback.is_none() && full.animation.is_some() {
-                        d.playback = Playback::start(full);
-                        self.trace.mark("animation started on the image already shown");
-                        self.schedule_animation();
-                    }
+                if let (Some(d), Some(full)) = (self.display.as_mut().filter(|_| same_image), &cur.full)
+                    && d.kind == Shown::Full
+                    && d.playback.is_none()
+                    && full.animation.is_some()
+                {
+                    d.playback = Playback::start(full);
+                    self.trace.mark("animation started on the image already shown");
+                    self.schedule_animation();
                 }
                 self.sync_second();
                 return;
@@ -938,12 +940,12 @@ impl App {
 
     /// Closes the window unless unsaved edits make the user change their mind.
     pub fn quit(&mut self) {
-        if self.confirm_discard(AfterSave::Quit) {
-            if let Some(h) = self.hwnd {
-                self.remember_placement(h);
-                unsafe {
-                    let _ = DestroyWindow(h);
-                }
+        if self.confirm_discard(AfterSave::Quit)
+            && let Some(h) = self.hwnd
+        {
+            self.remember_placement(h);
+            unsafe {
+                let _ = DestroyWindow(h);
             }
         }
     }
@@ -1177,10 +1179,10 @@ impl App {
             return;
         }
         let cx = self.panel_context();
-        if let Some(size) = cx.size {
-            if self.panel.resize == (0, 0) {
-                self.panel.resize = size;
-            }
+        if let Some(size) = cx.size
+            && self.panel.resize == (0, 0)
+        {
+            self.panel.resize = size;
         }
         panel::sync(&self.panel, &cx);
     }
@@ -1284,10 +1286,9 @@ impl App {
         if self.edits.is_empty() {
             // back to the plain image: the view returns to its unedited size
             if let (Some(d), Some(info)) = (self.display.as_mut(), self.current.as_ref().and_then(|c| c.info.as_ref()))
+                && d.second.is_none()
             {
-                if d.second.is_none() {
-                    d.view.set_image_size(info.display_size());
-                }
+                d.view.set_image_size(info.display_size());
             }
             self.panel.resize = self.geometry().map_or((0, 0), |g| g.size);
         }
@@ -1446,10 +1447,10 @@ impl App {
                 if unchanged {
                     self.edits.clear();
                 }
-                if let ExportOutcome::Encoded { dropped_frames, .. } = outcome {
-                    if dropped_frames > 0 {
-                        self.set_notice(fill(self.t().first_frame_only, &[("count", &dropped_frames.to_string())]));
-                    }
+                if let ExportOutcome::Encoded { dropped_frames, .. } = outcome
+                    && dropped_frames > 0
+                {
+                    self.set_notice(fill(self.t().first_frame_only, &[("count", &dropped_frames.to_string())]));
                 }
                 if dest == source {
                     if unchanged {
@@ -1870,22 +1871,24 @@ impl App {
             self.first_frame_logged = true;
             self.trace.mark(&format!("first frame drawn in {:.1} ms", t.elapsed().as_secs_f64() * 1000.0));
         }
-        if let (Some(cur), Some(d)) = (&mut self.current, &self.display) {
-            if d.path == cur.path && d.kind == Shown::Full && !cur.shown_logged {
-                cur.shown_logged = true;
-                let stats = self.pipeline.stats();
-                self.trace.mark(&format!(
-                    "shown {} {:.1} ms after request ({}; drawn in {:.1} ms) | cache {} images, {:.0} MiB of {:.0} MiB{}",
-                    file_name(&cur.path),
-                    cur.requested_at.elapsed().as_secs_f64() * 1000.0,
-                    if cur.load_time.is_some() { "decoded" } else { "cache hit" },
-                    t.elapsed().as_secs_f64() * 1000.0,
-                    stats.cached,
-                    stats.used_bytes as f64 / 1048576.0,
-                    self.pipeline.budget_bytes() as f64 / 1048576.0,
-                    if self.quick_browsing { " | quick browsing" } else { "" }
-                ));
-            }
+        if let (Some(cur), Some(d)) = (&mut self.current, &self.display)
+            && d.path == cur.path
+            && d.kind == Shown::Full
+            && !cur.shown_logged
+        {
+            cur.shown_logged = true;
+            let stats = self.pipeline.stats();
+            self.trace.mark(&format!(
+                "shown {} {:.1} ms after request ({}; drawn in {:.1} ms) | cache {} images, {:.0} MiB of {:.0} MiB{}",
+                file_name(&cur.path),
+                cur.requested_at.elapsed().as_secs_f64() * 1000.0,
+                if cur.load_time.is_some() { "decoded" } else { "cache hit" },
+                t.elapsed().as_secs_f64() * 1000.0,
+                stats.cached,
+                stats.used_bytes as f64 / 1048576.0,
+                self.pipeline.budget_bytes() as f64 / 1048576.0,
+                if self.quick_browsing { " | quick browsing" } else { "" }
+            ));
         }
     }
 

@@ -23,7 +23,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use iv_codec::{Decoded, Registry};
-use iv_core::{CancelToken, Error, ImageBuf, ImageInfo, PixelFormat};
+use iv_core::{CancelToken, Error, FormatId, ImageBuf, ImageInfo, PixelFormat};
 use rayon::prelude::*;
 
 /// Longest side asked of a preview.
@@ -70,6 +70,8 @@ pub enum FailureKind {
     TooLarge { width: u32, height: u32 },
     /// The file does not exist (any more).
     NotFound,
+    /// The format needs an optional system codec that is not installed.
+    CodecMissing { format: FormatId },
     /// Anything else; the error text has the detail.
     Other,
 }
@@ -80,6 +82,7 @@ impl FailureKind {
             Error::UnsupportedFormat => FailureKind::Unsupported,
             Error::TooLarge { width, height, .. } => FailureKind::TooLarge { width: *width, height: *height },
             Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => FailureKind::NotFound,
+            Error::CodecMissing { format } => FailureKind::CodecMissing { format: *format },
             _ => FailureKind::Other,
         }
     }
@@ -323,10 +326,10 @@ impl Shared {
             if st.in_flight.get(&job.path).is_some_and(|t| t.same(&cancel)) {
                 st.in_flight.remove(&job.path);
             }
-            if job.kind == Kind::Foreground {
-                if let Some(i) = st.foreground_running.iter().position(|(_, t)| t.same(&cancel)) {
-                    st.foreground_running.remove(i);
-                }
+            if job.kind == Kind::Foreground
+                && let Some(i) = st.foreground_running.iter().position(|(_, t)| t.same(&cancel))
+            {
+                st.foreground_running.remove(i);
             }
             // a quick-browse frame the user has already passed is still worth showing
             let quick_frame = job.kind == Kind::Foreground && st.quick;
@@ -421,7 +424,7 @@ fn to_display(img: ImageBuf) -> ImageBuf {
 /// Whether every pixel of an RGBA8 image is fully opaque.
 fn is_opaque(img: &ImageBuf) -> bool {
     debug_assert_eq!(img.format(), PixelFormat::Rgba8);
-    img.data().par_chunks(CHUNK_PIXELS * 4).all(|c| c.chunks_exact(4).all(|p| p[3] == u8::MAX))
+    img.data().par_chunks(CHUNK_PIXELS * 4).all(|c| c.as_chunks::<4>().0.iter().all(|p| p[3] == u8::MAX))
 }
 
 /// What the cache keeps of a decode: the pixels (every frame) as 8-bit RGBA, and `has_alpha`
@@ -612,6 +615,8 @@ mod failure_kind_tests {
         assert_eq!(FailureKind::of(&big), FailureKind::TooLarge { width: 70000, height: 70000 });
         let gone = Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
         assert_eq!(FailureKind::of(&gone), FailureKind::NotFound);
+        let heif = Error::CodecMissing { format: FormatId::Heif };
+        assert_eq!(FailureKind::of(&heif), FailureKind::CodecMissing { format: FormatId::Heif });
         assert_eq!(FailureKind::of(&Error::decode("x", "bad huffman table")), FailureKind::Other);
     }
 }

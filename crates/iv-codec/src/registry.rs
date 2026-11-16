@@ -129,6 +129,9 @@ impl Registry {
 
     fn try_each<T>(&self, src: &Source, format: FormatId, mut f: impl FnMut(&dyn Decoder) -> Result<T>) -> Result<T> {
         let mut failures = Vec::new();
+        // a decoder that needs an uninstalled system codec names the real fix, so it wins over the
+        // others' failures
+        let mut codec_missing = false;
         for d in self.decoders_for(format) {
             let codec = d.info().id;
             match catch(codec, || d.claims(src, format)) {
@@ -142,8 +145,14 @@ impl Registry {
             match catch(codec, || f(d.as_ref())) {
                 Ok(v) => return Ok(v),
                 Err(Error::Cancelled) => return Err(Error::Cancelled),
-                Err(e) => failures.push(format!("{}: {e}", d.info().id)),
+                Err(e) => {
+                    codec_missing |= matches!(e, Error::CodecMissing { .. });
+                    failures.push(format!("{}: {e}", d.info().id));
+                }
             }
+        }
+        if codec_missing {
+            return Err(Error::CodecMissing { format });
         }
         let reason = if failures.is_empty() { "no decoder registered".to_string() } else { failures.join("; ") };
         Err(Error::NoDecoder { format, reason })

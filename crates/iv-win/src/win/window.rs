@@ -70,11 +70,11 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 /// modal dialog, which must not happen while the frame is borrowed and the window unpainted.
 fn render(frame: &mut Frame) {
     APP.with(|cell| {
-        if let Ok(mut guard) = cell.try_borrow_mut() {
-            if let Some(app) = guard.as_mut() {
-                app.apply_pending_size();
-                app.render_if_dirty(frame);
-            }
+        if let Ok(mut guard) = cell.try_borrow_mut()
+            && let Some(app) = guard.as_mut()
+        {
+            app.apply_pending_size();
+            app.render_if_dirty(frame);
         }
     });
 }
@@ -252,6 +252,8 @@ fn app_icon(instance: HINSTANCE, cx: SYSTEM_METRICS_INDEX, cy: SYSTEM_METRICS_IN
 /// Opens the window and runs until it closes. Returns the process exit code.
 pub fn run(opts: Options) -> i32 {
     unsafe {
+        // the manifest (res/app.manifest) already sets this, and then the call fails harmlessly;
+        // it still applies when the executable runs without its manifest
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         // the file dialogs need a single-threaded apartment on this thread
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);

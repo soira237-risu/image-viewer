@@ -122,11 +122,11 @@ pub fn convert(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Some(dir) = &a.out_dir {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!("{}: {e}", dir.display());
-            return ExitCode::FAILURE;
-        }
+    if let Some(dir) = &a.out_dir
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        eprintln!("{}: {e}", dir.display());
+        return ExitCode::FAILURE;
     }
 
     let paths = files::collect(&a.inputs);

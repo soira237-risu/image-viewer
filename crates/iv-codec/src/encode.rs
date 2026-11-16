@@ -125,7 +125,7 @@ pub fn prepare(img: &ImageBuf, info: &EncoderInfo, background: [u8; 3]) -> Dynam
     if img.format() == PixelFormat::Rgba16 && info.supports_16bit {
         let px: &[u16] = bytemuck::cast_slice(img.data());
         if opaque || !info.supports_alpha {
-            let rgb: Vec<u16> = px.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+            let rgb: Vec<u16> = px.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
             return DynamicImage::ImageRgb16(image::ImageBuffer::from_raw(w, h, rgb).expect("buffer matches size"));
         }
         return DynamicImage::ImageRgba16(
@@ -135,14 +135,16 @@ pub fn prepare(img: &ImageBuf, info: &EncoderInfo, background: [u8; 3]) -> Dynam
     // 8-bit (16-bit and float rounded down to it), read without a converted copy when it already is
     let rgba = img.to_rgba8();
     if opaque {
-        let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let rgb: Vec<u8> = rgba.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
         return DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, rgb).expect("buffer matches size"));
     }
     if info.supports_alpha {
         return DynamicImage::ImageRgba8(RgbaImage::from_raw(w, h, rgba.into_owned()).expect("buffer matches size"));
     }
     let flat: Vec<u8> = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| {
             let a = p[3] as u32;
             [0, 1, 2].map(|c| ((p[c] as u32 * a + background[c] as u32 * (255 - a) + 127) / 255) as u8)

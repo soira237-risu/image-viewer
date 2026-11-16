@@ -14,6 +14,11 @@ pub enum Error {
     #[error("no decoder could open this {format} image: {reason}")]
     NoDecoder { format: FormatId, reason: String },
 
+    /// The format needs an optional system codec that is not installed (HEIF/HEVC or camera RAW
+    /// through Windows Imaging Component: Microsoft Store extensions).
+    #[error("the Windows codec for {format} is not installed")]
+    CodecMissing { format: FormatId },
+
     /// A codec recognised the data but failed while decoding it.
     #[error("{codec} failed to decode: {message}")]
     Decode { codec: &'static str, message: String },

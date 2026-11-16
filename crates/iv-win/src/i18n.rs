@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use iv_core::FormatId;
 use iv_pipeline::FailureKind;
 
 use crate::commands::Command;
@@ -101,7 +102,7 @@ strings! {
     filter_images, filter_all, ask_save_changes, save_failed, title_empty, loading, preview,
     cached, saving, no_images_inside, edit_single_page, format_not_writable, settings_error,
     panel_error, settings_window_error, help_window_error, cannot_open, unsupported_format, too_large,
-    file_not_found, unknown_file_type, cannot_write_format,
+    file_not_found, unknown_file_type, cannot_write_format, codec_missing_heif, codec_missing_raw, codec_missing,
     // saving safely
     archive_page_save_as, animated_save_as, save_not_loaded, first_frame_only, save_busy, continue_after_save,
     // fixing a wrong extension
@@ -167,6 +168,11 @@ impl Strings {
             FailureKind::NotFound => fill(self.file_not_found, &[("name", name)]),
             FailureKind::TooLarge { width, height } => {
                 fill(self.too_large, &[("name", name), ("width", &width.to_string()), ("height", &height.to_string())])
+            }
+            FailureKind::CodecMissing { format: FormatId::Heif } => fill(self.codec_missing_heif, &[("name", name)]),
+            FailureKind::CodecMissing { format: FormatId::Raw } => fill(self.codec_missing_raw, &[("name", name)]),
+            FailureKind::CodecMissing { format } => {
+                fill(self.codec_missing, &[("name", name), ("format", format.name())])
             }
             FailureKind::Other => fill(self.cannot_open, &[("name", name), ("error", detail)]),
         }
@@ -270,6 +276,9 @@ pub static KO: Strings = Strings {
     unsupported_format: "{name}: 지원하지 않는 형식입니다",
     too_large: "{name}: 이미지가 너무 커서 열 수 없습니다 ({width}×{height})",
     file_not_found: "{name}: 파일이 없습니다",
+    codec_missing_heif: "{name}: HEIC·HEIF를 열려면 Microsoft Store의 'HEIF 이미지 확장'과 'HEVC 비디오 확장'이 필요합니다",
+    codec_missing_raw: "{name}: 카메라 RAW를 열려면 Microsoft Store의 'Raw 이미지 확장'이 필요합니다",
+    codec_missing: "{name}: {format} 형식을 여는 Windows 코덱이 설치되어 있지 않습니다",
     unknown_file_type: "알 수 없는 파일 형식입니다: .{ext}",
     cannot_write_format: "{format} 형식으로는 저장할 수 없습니다",
     archive_page_save_as: "압축파일 안의 페이지는 그 자리에 저장할 수 없어 다른 이름으로 저장합니다",
@@ -410,6 +419,9 @@ pub static EN: Strings = Strings {
     unsupported_format: "{name}: unsupported format",
     too_large: "{name}: too large to open ({width}×{height})",
     file_not_found: "{name}: file not found",
+    codec_missing_heif: "{name}: HEIC/HEIF needs 'HEIF Image Extensions' and 'HEVC Video Extensions' from the Microsoft Store",
+    codec_missing_raw: "{name}: camera RAW needs 'Raw Image Extension' from the Microsoft Store",
+    codec_missing: "{name}: the Windows codec for {format} is not installed",
     unknown_file_type: "unknown file type: .{ext}",
     cannot_write_format: "{format} files cannot be written",
     archive_page_save_as: "pages inside an archive cannot be saved in place; choose a new file",
@@ -492,6 +504,17 @@ mod tests {
         assert_eq!(EN.open_failed("b.png", big, "x"), "b.png: too large to open (90000×80000)");
         let other = KO.open_failed("c.heic", FailureKind::Other, "WIC failed to decode: 0x88982F50");
         assert_eq!(other, "c.heic: 열 수 없습니다 (WIC failed to decode: 0x88982F50)");
+        // a missing Store codec names the extension to install, not an HRESULT
+        let heif = FailureKind::CodecMissing { format: FormatId::Heif };
+        let ko = KO.open_failed("d.heic", heif, "the Windows codec for HEIF is not installed");
+        assert_eq!(
+            ko,
+            "d.heic: HEIC·HEIF를 열려면 Microsoft Store의 'HEIF 이미지 확장'과 'HEVC 비디오 확장'이 필요합니다"
+        );
+        let raw = EN.open_failed("e.cr3", FailureKind::CodecMissing { format: FormatId::Raw }, "x");
+        assert_eq!(raw, "e.cr3: camera RAW needs 'Raw Image Extension' from the Microsoft Store");
+        let other = FailureKind::CodecMissing { format: FormatId::Jxl };
+        assert!(EN.open_failed("f.jxl", other, "x").starts_with("f.jxl: the Windows codec for "));
     }
 
     #[test]

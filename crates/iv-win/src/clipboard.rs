@@ -63,7 +63,7 @@ pub fn dib(rgba: &[u8], width: u32, height: u32, background: [u8; 3]) -> Vec<u8>
     let blend = |c: u8, a: u32, bg: u8| ((u32::from(c) * a + u32::from(bg) * (255 - a) + 127) / 255) as u8;
     for y in (0..height as usize).rev() {
         let src = &rgba[y * width as usize * 4..(y + 1) * width as usize * 4];
-        for p in src.chunks_exact(4) {
+        for p in src.as_chunks::<4>().0 {
             let a = u32::from(p[3]);
             out.extend_from_slice(&[
                 blend(p[2], a, background[2]),
@@ -100,7 +100,7 @@ pub fn dibv5(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     debug_assert_eq!(out.len(), V5_HEADER);
     for y in (0..height as usize).rev() {
         let src = &rgba[y * width as usize * 4..(y + 1) * width as usize * 4];
-        out.extend(src.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]));
+        out.extend(src.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0], p[3]]));
     }
     out
 }
@@ -202,7 +202,7 @@ mod tests {
         let d = file_drop(&[Path::new(r"C:\pics\한 장.jpg")]);
         assert_eq!(u32_at(&d, 0), 20);
         assert_eq!(u32_at(&d, 16), 1, "wide characters");
-        let units: Vec<u16> = d[20..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = d[20..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         let expected: Vec<u16> = r"C:\pics\한 장.jpg".encode_utf16().chain([0, 0]).collect();
         assert_eq!(units, expected);
     }

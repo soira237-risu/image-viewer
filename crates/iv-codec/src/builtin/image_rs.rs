@@ -132,7 +132,7 @@ fn open(src: &Source, format: FormatId) -> Result<impl ImageDecoder> {
 pub(crate) fn to_image_buf(img: DynamicImage) -> Result<ImageBuf> {
     /// Copies `src` pixels of `C` channels into RGBA samples, `opaque` as alpha when `C` < 4.
     fn widen<T: Copy, const C: usize>(src: &[T], out: &mut [T], opaque: T) {
-        for (o, p) in out.chunks_exact_mut(4).zip(src.chunks_exact(C)) {
+        for (o, p) in out.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<C>().0) {
             o.copy_from_slice(&match C {
                 1 => [p[0], p[0], p[0], opaque],
                 2 => [p[0], p[0], p[0], p[1]],
