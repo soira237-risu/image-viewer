@@ -32,13 +32,15 @@ pub enum Command {
     ViewToggleDirection,
     /// The settings window.
     AppSettings,
+    /// The keyboard and mouse help window.
+    AppHelp,
     /// Clear the selection; else leave full screen; else quit.
     Escape,
     AppQuit,
 }
 
 impl Command {
-    pub const ALL: [Command; 25] = [
+    pub const ALL: [Command; 26] = [
         Command::FileOpen,
         Command::FileSave,
         Command::FileSaveAs,
@@ -62,6 +64,7 @@ impl Command {
         Command::ViewToggleSpread,
         Command::ViewToggleDirection,
         Command::AppSettings,
+        Command::AppHelp,
         Command::Escape,
         Command::AppQuit,
     ];
@@ -91,6 +94,7 @@ impl Command {
             Command::ViewToggleSpread => "view.toggle_spread",
             Command::ViewToggleDirection => "view.toggle_direction",
             Command::AppSettings => "app.settings",
+            Command::AppHelp => "app.help",
             Command::Escape => "app.escape",
             Command::AppQuit => "app.quit",
         }

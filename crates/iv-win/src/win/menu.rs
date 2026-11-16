@@ -18,6 +18,11 @@ const ITEMS: &[Option<Command>] = &[
     Some(Command::FileSave),
     Some(Command::FileSaveAs),
     None,
+    Some(Command::NavNext),
+    Some(Command::NavPrev),
+    Some(Command::NavFirst),
+    Some(Command::NavLast),
+    None,
     Some(Command::EditRotateCw),
     Some(Command::EditRotateCcw),
     Some(Command::EditFlipH),
@@ -36,6 +41,7 @@ const ITEMS: &[Option<Command>] = &[
     None,
     Some(Command::ViewToggleEditPanel),
     Some(Command::AppSettings),
+    Some(Command::AppHelp),
     None,
     Some(Command::AppQuit),
 ];
@@ -51,6 +57,8 @@ pub struct MenuState {
     pub can_redo: bool,
     pub edited: bool,
     pub has_selection: bool,
+    /// A folder or archive with more than one image is open.
+    pub can_navigate: bool,
 }
 
 /// Menu id of a command (ids start at 1; 0 means "nothing chosen").
@@ -82,6 +90,7 @@ fn flags_for(cmd: Command, s: &MenuState) -> MENU_ITEM_FLAGS {
         Command::EditUndo => s.can_undo,
         Command::EditRedo => s.can_redo,
         Command::ViewToggleDirection => s.spread.is_some(),
+        Command::NavNext | Command::NavPrev | Command::NavFirst | Command::NavLast => s.can_navigate,
         _ => true,
     };
     let mut f = MF_STRING;
@@ -127,16 +136,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ids_map_back_to_commands_and_every_command_but_escape_is_listed() {
+    fn ids_map_back_to_commands_and_every_command_but_escape_is_listed_once() {
         for cmd in Command::ALL {
             assert_eq!(Command::ALL[id_of(cmd) - 1], cmd);
         }
         let listed: Vec<Command> = ITEMS.iter().flatten().copied().collect();
+        let unique: std::collections::HashSet<_> = listed.iter().collect();
+        assert_eq!(unique.len(), listed.len(), "a command is listed twice");
         for cmd in Command::ALL {
-            let expected = !matches!(
-                cmd,
-                Command::Escape | Command::NavNext | Command::NavPrev | Command::NavFirst | Command::NavLast
-            );
+            let expected = cmd != Command::Escape;
             assert_eq!(listed.contains(&cmd), expected, "{cmd:?}");
         }
     }

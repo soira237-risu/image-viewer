@@ -136,6 +136,14 @@ impl ViewState {
         )
     }
 
+    /// Inverse of [`Self::screen_to_image`].
+    pub fn image_to_screen(&self, p: (f64, f64)) -> (f64, f64) {
+        (
+            (p.0 - self.center.0) * self.zoom + self.viewport.0 / 2.0,
+            (p.1 - self.center.1) * self.zoom + self.viewport.1 / 2.0,
+        )
+    }
+
     /// Screen rectangle covered by the whole image.
     pub fn dest_rect(&self) -> ScreenRect {
         let width = self.image.0 * self.zoom;
@@ -190,6 +198,8 @@ mod tests {
         let after = v.screen_to_image(anchor);
         assert!(close(before.0, after.0) && close(before.1, after.1), "{before:?} vs {after:?}");
         assert_eq!(v.mode(), ZoomMode::Manual);
+        let round = v.image_to_screen(after);
+        assert!(close(round.0, anchor.0) && close(round.1, anchor.1), "{round:?}");
     }
 
     #[test]

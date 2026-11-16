@@ -38,6 +38,11 @@ const NAMED: &[&str] = &[
     "End",
     "PageUp",
     "PageDown",
+    // mouse: wheel notches and the side (back / forward) buttons
+    "WheelUp",
+    "WheelDown",
+    "Mouse4",
+    "Mouse5",
 ];
 
 /// Canonical spelling of a key name, or `None` if it is not a key this keymap knows.
@@ -52,6 +57,8 @@ pub fn canonical_key(name: &str) -> Option<String> {
         "arrowright" => "Right",
         "arrowup" => "Up",
         "arrowdown" => "Down",
+        "xbutton1" | "mouseback" => "Mouse4",
+        "xbutton2" | "mouseforward" => "Mouse5",
         _ => "",
     };
     if !alias.is_empty() {
@@ -142,6 +149,8 @@ const DEFAULTS: &[(&str, Command)] = &[
     ("PageUp", Command::NavPrev),
     ("Home", Command::NavFirst),
     ("End", Command::NavLast),
+    ("Mouse4", Command::NavPrev),
+    ("Mouse5", Command::NavNext),
     ("F", Command::ViewFit),
     ("Ctrl+0", Command::ViewFit),
     ("1", Command::ViewActualSize),
@@ -158,6 +167,7 @@ const DEFAULTS: &[(&str, Command)] = &[
     ("Shift+D", Command::ViewToggleDirection),
     ("Alt+Enter", Command::ViewToggleFullscreen),
     ("F2", Command::AppSettings),
+    ("F1", Command::AppHelp),
     ("Esc", Command::Escape),
     ("Ctrl+W", Command::AppQuit),
     ("Ctrl+Q", Command::AppQuit),
@@ -182,13 +192,21 @@ impl Keymap {
         self.bindings.get(chord).copied()
     }
 
+    /// Every chord bound to `cmd`, shortest first (ties broken alphabetically).
+    pub fn chords_for(&self, cmd: Command) -> Vec<Chord> {
+        let mut chords: Vec<Chord> =
+            self.bindings.iter().filter(|(_, c)| **c == cmd).map(|(chord, _)| chord.clone()).collect();
+        chords.sort_by_cached_key(|chord| {
+            let s = chord.to_string();
+            (s.len(), s)
+        });
+        chords
+    }
+
     /// The shortest chord bound to `cmd` (ties broken alphabetically), for showing next to a
     /// menu item.
     pub fn chord_for(&self, cmd: Command) -> Option<Chord> {
-        self.bindings.iter().filter(|(_, c)| **c == cmd).map(|(chord, _)| chord.clone()).min_by_key(|chord| {
-            let s = chord.to_string();
-            (s.len(), s)
-        })
+        self.chords_for(cmd).into_iter().next()
     }
 
     /// Applies overrides from TOML text. Returns one warning per entry that could not be used;
@@ -304,7 +322,24 @@ mod chord_for_tests {
         let map = Keymap::defaults();
         assert_eq!(map.chord_for(Command::EditRotateCw).unwrap().to_string(), "R");
         assert_eq!(map.chord_for(Command::FileSaveAs).unwrap().to_string(), "Ctrl+Shift+S");
-        // Right, Space and PageDown: "Right" is shortest
+        // Right, Space, PageDown and Mouse5: "Right" is shortest
         assert_eq!(map.chord_for(Command::NavNext).unwrap().to_string(), "Right");
+        let all: Vec<String> = map.chords_for(Command::NavNext).iter().map(Chord::to_string).collect();
+        assert_eq!(all, ["Right", "Space", "Mouse5", "PageDown"]);
+    }
+
+    #[test]
+    fn mouse_buttons_and_wheel_are_bindable() {
+        let map = Keymap::defaults();
+        assert_eq!(map.lookup(&Chord::parse("Mouse4").unwrap()), Some(Command::NavPrev));
+        assert_eq!(map.lookup(&Chord::parse("XButton2").unwrap()), Some(Command::NavNext));
+        assert_eq!(map.lookup(&Chord::parse("F1").unwrap()), Some(Command::AppHelp));
+        // the wheel is unbound by default (it zooms); the keymap can give it commands
+        assert_eq!(map.lookup(&Chord::parse("WheelUp").unwrap()), None);
+        let mut map = Keymap::defaults();
+        map.apply_toml("[bindings]\n\"Ctrl+WheelDown\" = \"nav.next\"\n").unwrap();
+        assert_eq!(map.lookup(&Chord::new("WheelDown", true, false, false)), Some(Command::NavNext));
+        // a named key is not a symbol: Shift stays part of the chord
+        assert_ne!(Chord::new("WheelUp", false, false, true), Chord::parse("WheelUp").unwrap());
     }
 }

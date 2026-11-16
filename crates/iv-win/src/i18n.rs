@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use iv_pipeline::FailureKind;
+
 use crate::commands::Command;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -82,17 +84,22 @@ strings! {
     // commands (menu items, panel buttons)
     open, save, save_as, rotate_cw, rotate_ccw, flip_h, flip_v, crop, undo, redo,
     next, previous, first, last, fit, actual_size, zoom_in, zoom_out, fullscreen,
-    two_pages, right_to_left, edit_panel, settings, escape, quit,
+    two_pages, right_to_left, edit_panel, settings, help, escape, quit,
     // edit panel
     panel_title, reset_adjustments, brightness, contrast, saturation, gamma, resize, keep_aspect,
     apply, save_quality,
     // settings window
     prefetch_count, cache_memory, wrap, spread_rtl, sharp_pixels, save_quality_range, background,
-    choose, cache_note, defaults, language,
+    choose, cache_note, defaults, language, wheel_navigates,
+    // help window: column titles, and mouse actions that are not in the keymap
+    help_action, help_keys, pan, select_area, fit_or_actual, zoom_at_cursor, all_commands_menu,
+    open_by_drop, mouse_drag, mouse_shift_drag, mouse_double_click, mouse_wheel, mouse_ctrl_wheel,
+    mouse_right_click, mouse_drop,
     // dialogs and the title bar
     filter_images, filter_all, ask_save_changes, save_failed, title_empty, loading, preview,
     cached, saving, no_images_inside, edit_single_page, format_not_writable, settings_error,
-    panel_error, settings_window_error,
+    panel_error, settings_window_error, help_window_error, cannot_open, unsupported_format, too_large,
+    file_not_found, unknown_file_type, cannot_write_format,
 }
 
 impl Strings {
@@ -122,8 +129,22 @@ impl Strings {
             Command::ViewToggleSpread => self.two_pages,
             Command::ViewToggleDirection => self.right_to_left,
             Command::AppSettings => self.settings,
+            Command::AppHelp => self.help,
             Command::Escape => self.escape,
             Command::AppQuit => self.quit,
+        }
+    }
+
+    /// Why `name` cannot be shown, in this language. Common causes get a full sentence; for the
+    /// rest the decoder's own (English) text is kept as the detail in brackets.
+    pub fn open_failed(&self, name: &str, kind: FailureKind, detail: &str) -> String {
+        match kind {
+            FailureKind::Unsupported => fill(self.unsupported_format, &[("name", name)]),
+            FailureKind::NotFound => fill(self.file_not_found, &[("name", name)]),
+            FailureKind::TooLarge { width, height } => {
+                fill(self.too_large, &[("name", name), ("width", &width.to_string()), ("height", &height.to_string())])
+            }
+            FailureKind::Other => fill(self.cannot_open, &[("name", name), ("error", detail)]),
         }
     }
 }
@@ -152,6 +173,7 @@ pub static KO: Strings = Strings {
     right_to_left: "오른쪽에서 왼쪽으로 읽기",
     edit_panel: "편집 패널",
     settings: "설정",
+    help: "단축키 도움말",
     escape: "선택 해제 / 전체 화면 해제 / 끝내기",
     quit: "끝내기",
     panel_title: "편집",
@@ -175,6 +197,22 @@ pub static KO: Strings = Strings {
     cache_note: "캐시 메모리는 다시 시작한 뒤 적용됩니다.",
     defaults: "기본값",
     language: "언어",
+    wheel_navigates: "휠로 사진 넘기기 (Ctrl+휠은 확대·축소)",
+    help_action: "동작",
+    help_keys: "키·마우스",
+    pan: "이동",
+    select_area: "영역 선택",
+    fit_or_actual: "창에 맞춤 ↔ 100%",
+    zoom_at_cursor: "커서 기준 확대·축소",
+    all_commands_menu: "모든 명령 메뉴",
+    open_by_drop: "파일이나 폴더 열기",
+    mouse_drag: "드래그",
+    mouse_shift_drag: "Shift+드래그",
+    mouse_double_click: "더블클릭",
+    mouse_wheel: "휠",
+    mouse_ctrl_wheel: "Ctrl+휠",
+    mouse_right_click: "우클릭",
+    mouse_drop: "끌어다 놓기",
     filter_images: "이미지와 압축파일",
     filter_all: "모든 파일",
     ask_save_changes: "{name}의 변경 사항을 저장할까요?",
@@ -190,6 +228,13 @@ pub static KO: Strings = Strings {
     settings_error: "설정: {error}",
     panel_error: "편집 패널을 만들 수 없습니다: {error}",
     settings_window_error: "설정 창을 만들 수 없습니다: {error}",
+    help_window_error: "도움말 창을 만들 수 없습니다: {error}",
+    cannot_open: "{name}: 열 수 없습니다 ({error})",
+    unsupported_format: "{name}: 지원하지 않는 형식입니다",
+    too_large: "{name}: 이미지가 너무 커서 열 수 없습니다 ({width}×{height})",
+    file_not_found: "{name}: 파일이 없습니다",
+    unknown_file_type: "알 수 없는 파일 형식입니다: .{ext}",
+    cannot_write_format: "{format} 형식으로는 저장할 수 없습니다",
 };
 
 pub static EN: Strings = Strings {
@@ -216,6 +261,7 @@ pub static EN: Strings = Strings {
     right_to_left: "Right to left",
     edit_panel: "Edit panel",
     settings: "Settings",
+    help: "Keyboard and mouse",
     escape: "Clear selection / leave full screen / quit",
     quit: "Quit",
     panel_title: "Edit",
@@ -239,6 +285,22 @@ pub static EN: Strings = Strings {
     cache_note: "Cache memory applies after a restart.",
     defaults: "Defaults",
     language: "Language",
+    wheel_navigates: "Wheel browses images (Ctrl+wheel zooms)",
+    help_action: "Action",
+    help_keys: "Keys and mouse",
+    pan: "Pan",
+    select_area: "Select an area",
+    fit_or_actual: "Fit ↔ 100%",
+    zoom_at_cursor: "Zoom at the cursor",
+    all_commands_menu: "Menu of every command",
+    open_by_drop: "Open a file or folder",
+    mouse_drag: "Drag",
+    mouse_shift_drag: "Shift+drag",
+    mouse_double_click: "Double-click",
+    mouse_wheel: "Wheel",
+    mouse_ctrl_wheel: "Ctrl+wheel",
+    mouse_right_click: "Right-click",
+    mouse_drop: "Drag and drop",
     filter_images: "Images and archives",
     filter_all: "All files",
     ask_save_changes: "Save changes to {name}?",
@@ -254,6 +316,13 @@ pub static EN: Strings = Strings {
     settings_error: "settings: {error}",
     panel_error: "cannot create the edit panel: {error}",
     settings_window_error: "cannot create the settings window: {error}",
+    help_window_error: "cannot create the help window: {error}",
+    cannot_open: "{name}: cannot open ({error})",
+    unsupported_format: "{name}: unsupported format",
+    too_large: "{name}: too large to open ({width}×{height})",
+    file_not_found: "{name}: file not found",
+    unknown_file_type: "unknown file type: .{ext}",
+    cannot_write_format: "{format} files cannot be written",
 };
 
 #[cfg(test)]
@@ -285,6 +354,16 @@ mod tests {
     fn templates_are_filled() {
         assert_eq!(fill(KO.ask_save_changes, &[("name", "a.jpg")]), "a.jpg의 변경 사항을 저장할까요?");
         assert_eq!(fill(EN.save_failed, &[("error", "disk full")]), "Save failed: disk full");
+    }
+
+    #[test]
+    fn open_failures_are_worded_per_language() {
+        assert_eq!(KO.open_failed("a.jpg", FailureKind::Unsupported, "x"), "a.jpg: 지원하지 않는 형식입니다");
+        assert_eq!(EN.open_failed("a.jpg", FailureKind::NotFound, "x"), "a.jpg: file not found");
+        let big = FailureKind::TooLarge { width: 90000, height: 80000 };
+        assert_eq!(EN.open_failed("b.png", big, "x"), "b.png: too large to open (90000×80000)");
+        let other = KO.open_failed("c.heic", FailureKind::Other, "WIC failed to decode: 0x88982F50");
+        assert_eq!(other, "c.heic: 열 수 없습니다 (WIC failed to decode: 0x88982F50)");
     }
 
     #[test]

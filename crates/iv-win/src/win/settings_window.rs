@@ -26,10 +26,11 @@ const ID_COLOUR: i32 = 106;
 const ID_SAVE: i32 = 107;
 const ID_DEFAULTS: i32 = 108;
 const ID_LANGUAGE: i32 = 109;
+const ID_WHEEL: i32 = 110;
 const ID_CANCEL: i32 = 2;
 
 const WIDTH: i32 = 360;
-const HEIGHT: i32 = 334;
+const HEIGHT: i32 = 360;
 
 /// A label in the current language, so controls can be relabelled when it changes.
 type Text = fn(&Strings) -> &'static str;
@@ -41,11 +42,14 @@ struct Window {
     cache: HWND,
     wrap: HWND,
     rtl: HWND,
+    wheel: HWND,
     nearest: HWND,
     quality: HWND,
     swatch: HWND,
     /// Controls showing translated text.
     texts: Vec<(HWND, Text)>,
+    /// Every control, for laying the window out again on a DPI change.
+    layout: controls::Layout,
 }
 
 thread_local! {
@@ -94,7 +98,7 @@ fn create(owner: HWND, s: &Strings) -> windows::core::Result<Window> {
             Some(instance.into()),
             None,
         )?;
-        let b = Builder { parent: hwnd, dpi, font: controls::message_font(dpi) };
+        let b = Builder::new(hwnd, dpi);
         let texts = RefCell::new(Vec::<(HWND, Text)>::new());
         let keep = |h: HWND, text: Text| {
             texts.borrow_mut().push((h, text));
@@ -131,18 +135,20 @@ fn create(owner: HWND, s: &Strings) -> windows::core::Result<Window> {
         let cache = field(74, ID_CACHE, true)?;
         let wrap = check(|s| s.wrap, 104, ID_WRAP)?;
         let rtl = check(|s| s.spread_rtl, 130, ID_RTL)?;
-        label(|s| s.sharp_pixels, 158)?;
-        let nearest = field(158, ID_NEAREST, false)?;
-        label(|s| s.save_quality_range, 188)?;
-        let quality = field(188, ID_QUALITY, true)?;
-        label(|s| s.background, 220)?;
-        let swatch = b.add(w!("STATIC"), "", SS_SUNKEN.0, 240, 218, 40, 24, 0)?;
-        button(|s| s.choose, 286, 217, 62, ID_COLOUR)?;
-        keep(b.add(w!("STATIC"), s.cache_note, 0, 12, 256, 336, 18, 0)?, |s| s.cache_note);
-        button(|s| s.save, 156, 292, 92, ID_SAVE)?;
-        button(|s| s.defaults, 256, 292, 92, ID_DEFAULTS)?;
+        let wheel = check(|s| s.wheel_navigates, 156, ID_WHEEL)?;
+        label(|s| s.sharp_pixels, 184)?;
+        let nearest = field(184, ID_NEAREST, false)?;
+        label(|s| s.save_quality_range, 214)?;
+        let quality = field(214, ID_QUALITY, true)?;
+        label(|s| s.background, 246)?;
+        let swatch = b.add(w!("STATIC"), "", SS_SUNKEN.0, 240, 244, 40, 24, 0)?;
+        button(|s| s.choose, 286, 243, 62, ID_COLOUR)?;
+        keep(b.add(w!("STATIC"), s.cache_note, 0, 12, 282, 336, 18, 0)?, |s| s.cache_note);
+        button(|s| s.save, 156, 318, 92, ID_SAVE)?;
+        button(|s| s.defaults, 256, 318, 92, ID_DEFAULTS)?;
         let texts = texts.into_inner();
-        Ok(Window { hwnd, language, prefetch, cache, wrap, rtl, nearest, quality, swatch, texts })
+        let layout = b.finish();
+        Ok(Window { hwnd, language, prefetch, cache, wrap, rtl, wheel, nearest, quality, swatch, texts, layout })
     }
 }
 
@@ -174,6 +180,7 @@ fn fill(s: &Settings) {
         controls::set_text(w.cache, &s.cache_mib.to_string());
         controls::set_checked(w.wrap, s.wrap);
         controls::set_checked(w.rtl, s.spread_right_to_left);
+        controls::set_checked(w.wheel, s.wheel_navigates);
         controls::set_text(w.nearest, &format!("{}", s.nearest_above_zoom));
         controls::set_text(w.quality, &s.save_quality.to_string());
         let index = Language::ALL.iter().position(|l| *l == s.language).unwrap_or(0);
@@ -244,6 +251,7 @@ fn read(prev: &Settings) -> Settings {
         }
         s.wrap = controls::checked(w.wrap);
         s.spread_right_to_left = controls::checked(w.rtl);
+        s.wheel_navigates = controls::checked(w.wheel);
         let index = unsafe { SendMessageW(w.language, CB_GETCURSEL, None, None).0 };
         if let Some(l) = usize::try_from(index).ok().and_then(|i| Language::ALL.get(i)) {
             s.language = *l;
@@ -252,9 +260,40 @@ fn read(prev: &Settings) -> Settings {
     })
 }
 
+/// Reports `s`. The app uses it clamped into range, so the window keeps the clamped value too.
 fn changed(s: Settings) {
+    let s = s.clamped();
     VALUE.with(|v| *v.borrow_mut() = s.clone());
     post_ui(UiEvent::SettingsChanged(s));
+}
+
+/// When the user leaves a number field: shows the value in effect if the field says otherwise
+/// (a number out of range was clamped, text that is not a number was ignored), so the window
+/// never shows a value the app is not using. Not while typing: "1024" passes through "1".
+fn refill_field(id: i32) {
+    let v = VALUE.with(|v| v.borrow().clone());
+    WINDOW.with(|w| {
+        let w = w.borrow();
+        let Some(w) = w.as_ref() else { return };
+        let int =
+            |h: HWND, value: u64| (h, controls::text(h).trim().parse::<u64>().ok() == Some(value), value.to_string());
+        let (field, shows_value, text) = match id {
+            ID_PREFETCH => int(w.prefetch, v.prefetch_count as u64),
+            ID_CACHE => int(w.cache, u64::from(v.cache_mib)),
+            ID_QUALITY => int(w.quality, u64::from(v.save_quality)),
+            ID_NEAREST => {
+                let zoom = v.nearest_above_zoom;
+                let same = controls::text(w.nearest).trim().parse::<f32>().ok() == Some(zoom);
+                (w.nearest, same, format!("{zoom}"))
+            }
+            _ => return,
+        };
+        if !shows_value {
+            SYNCING.with(|c| c.set(true));
+            controls::set_text(field, &text);
+            SYNCING.with(|c| c.set(false));
+        }
+    });
 }
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -264,7 +303,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             let current = VALUE.with(|v| v.borrow().clone());
             match (id, code) {
                 (ID_PREFETCH | ID_CACHE | ID_NEAREST | ID_QUALITY, EN_CHANGE)
-                | (ID_WRAP | ID_RTL, BN_CLICKED)
+                | (ID_WRAP | ID_RTL | ID_WHEEL, BN_CLICKED)
                 | (ID_LANGUAGE, CBN_SELCHANGE) => {
                     changed(read(&current));
                 }
@@ -275,11 +314,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     }
                 }
                 (ID_DEFAULTS, BN_CLICKED) => {
-                    let d = Settings::default();
+                    let d = Settings { window: current.window, ..Settings::default() };
                     fill(&d);
                     changed(d);
                 }
-                (ID_SAVE, BN_CLICKED) => post_ui(UiEvent::SettingsSave),
+                (ID_PREFETCH | ID_CACHE | ID_NEAREST | ID_QUALITY, EN_KILLFOCUS) => refill_field(id),
+                (ID_SAVE, BN_CLICKED) => {
+                    // what is written is what the window shows
+                    fill(&current);
+                    post_ui(UiEvent::SettingsSave);
+                }
                 (ID_CANCEL, _) => post_ui(UiEvent::SettingsClosed),
                 _ => {}
             }
@@ -295,6 +339,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         }
         WM_CLOSE => {
             post_ui(UiEvent::SettingsClosed);
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            WINDOW.with(|w| {
+                if let Some(w) = w.borrow().as_ref() {
+                    SYNCING.with(|c| c.set(true));
+                    w.layout.dpi_changed(hwnd, wp, lp);
+                    SYNCING.with(|c| c.set(false));
+                }
+            });
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },

@@ -18,7 +18,8 @@ use super::controls::{self, Builder};
 use super::{UiEvent, post_ui, wide};
 use crate::i18n::{Strings, fill};
 use crate::panel::{
-    PanelAction, PanelContext, PanelState, gamma_from_position, gamma_to_position, unit_from_position, unit_to_position,
+    PanelAction, PanelContext, PanelState, can_apply, field_value, gamma_from_position, gamma_to_position,
+    unit_from_position, unit_to_position,
 };
 
 const ID_ROTATE_LEFT: i32 = 100;
@@ -63,6 +64,8 @@ struct Panel {
     edit_buttons: [HWND; 5],
     /// Controls showing translated text.
     texts: Vec<(HWND, Text)>,
+    /// Every control, for laying the panel out again on a DPI change.
+    layout: controls::Layout,
 }
 
 thread_local! {
@@ -111,7 +114,7 @@ fn create(owner: HWND, s: &Strings) -> windows::core::Result<Panel> {
             None,
         )?;
 
-        let b = Builder { parent: hwnd, dpi, font: controls::message_font(dpi) };
+        let b = Builder::new(hwnd, dpi);
         let texts = RefCell::new(Vec::<(HWND, Text)>::new());
         let button = |text: Text, x, y, w, id| -> windows::core::Result<HWND> {
             let h = b.add(w!("BUTTON"), text(s), (BS_PUSHBUTTON | WS_TABSTOP.0 as i32) as u32, x, y, w, 26, id)?;
@@ -159,6 +162,7 @@ fn create(owner: HWND, s: &Strings) -> windows::core::Result<Panel> {
         controls::trackbar_init(quality, 1, 100, 5);
         let save = button(|s| s.save, 10, 520, 115, ID_SAVE)?;
         button(|s| s.save_as, 135, 520, 115, ID_SAVE_AS)?;
+        let texts = texts.into_inner();
         Ok(Panel {
             hwnd,
             sliders,
@@ -174,7 +178,8 @@ fn create(owner: HWND, s: &Strings) -> windows::core::Result<Panel> {
             quality,
             quality_value,
             edit_buttons,
-            texts: texts.into_inner(),
+            texts,
+            layout: b.finish(),
         })
     }
 }
@@ -246,15 +251,16 @@ pub fn sync(st: &PanelState, cx: &PanelContext) {
         }
         let (w, h) = st.resize;
         let shown = |v: u32| if has_image && v > 0 { v.to_string() } else { String::new() };
-        // rewriting a field the user is typing in would move the caret: only when it differs
-        if controls::text(p.width) != shown(w) {
-            controls::set_text(p.width, &shown(w));
-        }
-        if controls::text(p.height) != shown(h) {
-            controls::set_text(p.height, &shown(h));
+        // rewriting a field the user is typing in would move the caret: only when its value
+        // differs (an empty, zero or out-of-range field already stands for 0)
+        for (field, v) in [(p.width, w), (p.height, h)] {
+            let text = controls::text(field);
+            if field_value(&text) != v || !has_image && !text.is_empty() {
+                controls::set_text(field, &shown(v));
+            }
         }
         controls::set_checked(p.keep_aspect, st.keep_aspect);
-        controls::enable(p.apply, has_image && cx.size != Some(st.resize) && w > 0 && h > 0);
+        controls::enable(p.apply, can_apply(st.resize, cx.size));
         controls::enable(p.undo, cx.can_undo);
         controls::enable(p.redo, cx.can_redo);
         controls::enable(p.save, cx.edited);
@@ -289,11 +295,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     let on = PANEL.with(|p| p.borrow().as_ref().is_some_and(|p| controls::checked(p.keep_aspect)));
                     Some(PanelAction::KeepAspect(on))
                 }
+                // always reported, an empty or invalid field as 0: the app must not keep the
+                // last valid number while the field shows something else
                 (ID_WIDTH | ID_HEIGHT, EN_CHANGE) => {
                     let field = PANEL.with(|p| {
                         p.borrow().as_ref().map(|p| controls::text(if id == ID_WIDTH { p.width } else { p.height }))
                     });
-                    field.and_then(|t| t.trim().parse::<u32>().ok()).filter(|v| (1..=65535).contains(v)).map(|v| {
+                    field.map(|t| field_value(&t)).map(|v| {
                         if id == ID_WIDTH { PanelAction::ResizeWidth(v) } else { PanelAction::ResizeHeight(v) }
                     })
                 }
@@ -332,6 +340,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         }
         WM_CLOSE => {
             report(PanelAction::Closed);
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            PANEL.with(|p| {
+                if let Some(p) = p.borrow().as_ref() {
+                    SYNCING.with(|s| s.set(true));
+                    p.layout.dpi_changed(hwnd, wp, lp);
+                    SYNCING.with(|s| s.set(false));
+                }
+            });
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },

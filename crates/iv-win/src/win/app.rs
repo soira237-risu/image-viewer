@@ -2,6 +2,7 @@
 //! and saving. The window procedure (`window.rs`) feeds it messages; pipeline and worker threads
 //! feed it [`AppEvent`]s through a channel.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -10,12 +11,12 @@ use std::time::{Duration, Instant};
 use iv_codec::Decoded;
 use iv_codec::encode::Encoders;
 use iv_core::{FormatId, ImageBuf, ImageInfo, Orientation};
-use iv_ops::{EditStack, Geometry, Op};
+use iv_ops::{EditStack, Geometry, Op, Rect};
 use iv_pipeline::export::{ExportOutcome, export};
 use iv_pipeline::{FolderList, Pipeline, PipelineConfig, PipelineEvent, prefetch_order, step};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient};
-use windows::Win32::System::SystemServices::MK_SHIFT;
+use windows::Win32::System::SystemServices::{MK_CONTROL, MK_SHIFT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_CONTROL, VK_MENU, VK_SHIFT,
 };
@@ -23,19 +24,23 @@ use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::dialogs::{self, Answer, Filter};
-use super::{UiEvent, keys, menu, panel, settings_window, wake, wide};
+use super::{UiEvent, help, keys, menu, panel, settings_window, wake, wide};
 use crate::commands::Command;
-use crate::edit::{drag_rect, in_place_format, save_request, selection_to_crop};
+use crate::edit::{in_place_format, save_request, selection_on_screen, selection_rect};
 use crate::i18n::{Strings, fill};
 use crate::keymap::{Chord, Keymap};
-use crate::panel::{PanelAction, PanelContext, PanelState, follow_aspect};
+use crate::panel::{PanelAction, PanelContext, PanelState, typed_resize};
 use crate::raster::{self, Frame, Page, Picture, Style};
-use crate::settings::Settings;
+use crate::settings::{Settings, WindowPlacement};
 use crate::trace::Trace;
 use crate::view::{ScreenRect, ViewState, ZoomMode};
+use crate::wheel::{WheelSteps, WheelUse, wheel_use};
 
 const ZOOM_STEP: f64 = 1.25;
 const ANIMATION_TIMER: usize = 1;
+/// Clears a notice from the title bar.
+const NOTICE_TIMER: usize = 2;
+const NOTICE_TIME_MS: u32 = 6000;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -97,6 +102,9 @@ struct Display {
     playback: Option<Playback>,
     /// Two-page view: the page shown beside `path`.
     second: Option<Second>,
+    /// Edits that were just saved into the file this display shows: the old pixels stay up,
+    /// drawn with those edits (as the saved file looks), until the file is decoded again.
+    saved_edits: Option<Vec<Op>>,
 }
 
 struct Second {
@@ -104,6 +112,8 @@ struct Second {
     picture: Picture,
     stored: (u32, u32),
     orientation: Orientation,
+    /// Display (oriented) size of the page.
+    size: (u32, u32),
     /// Share of the combined width taken by the main page.
     fraction: f64,
 }
@@ -170,11 +180,22 @@ pub struct App {
     direction: i32,
     /// A navigation key is being held: flip without prefetching.
     quick_browsing: bool,
+    /// Why the current file (or folder) cannot be shown; stays until another one is opened.
     error: Option<String>,
+    /// A one-off message (a refused edit, a failed save): shown after the title, gone after a
+    /// few seconds or at the next command.
+    notice: Option<String>,
+    /// What the title bar says now, so the same text is not set again (panning, prefetch).
+    last_title: RefCell<String>,
     cursor: (f64, f64),
     drag_from: Option<(f64, f64)>,
+    /// Shift+drag in progress: where it started, in image pixels.
     select_from: Option<(f64, f64)>,
-    selection: Option<ScreenRect>,
+    /// The selection in the shown image's pixels: it stays on the same part of the image while
+    /// the view zooms or pans or the window resizes, and it is exactly what Crop keeps.
+    selection: Option<Rect>,
+    /// Wheel deltas toward the next whole notch, for wheel commands.
+    wheel: WheelSteps,
     first_frame_logged: bool,
     no_activate: bool,
     edits: EditStack,
@@ -186,6 +207,7 @@ pub struct App {
     settings: Settings,
     settings_path: Option<PathBuf>,
     settings_open: bool,
+    help_open: bool,
     style: Style,
     fullscreen: Option<Restore>,
     /// A key handled as WM_SYSKEYDOWN: swallow the WM_SYSCHAR that follows (else: a beep).
@@ -241,10 +263,13 @@ impl App {
             direction: 0,
             quick_browsing: false,
             error: None,
+            notice: None,
+            last_title: RefCell::new(String::new()),
             cursor: (0.0, 0.0),
             drag_from: None,
             select_from: None,
             selection: None,
+            wheel: WheelSteps::default(),
             first_frame_logged: false,
             no_activate,
             edits: EditStack::new(),
@@ -255,6 +280,7 @@ impl App {
             settings,
             settings_path,
             settings_open: false,
+            help_open: false,
             style,
             fullscreen: None,
             swallow_syschar: false,
@@ -277,7 +303,9 @@ impl App {
     /// Handles everything queued by other threads and by the panel / settings windows.
     pub fn drain(&mut self) {
         loop {
-            if let Ok(e) = self.rx.try_recv() {
+            if let Some((w, h)) = super::take_pending_size() {
+                self.set_viewport(w, h);
+            } else if let Ok(e) = self.rx.try_recv() {
                 match e {
                     AppEvent::Pipeline(e) => self.handle_pipeline(e),
                     AppEvent::Folder { for_path, result } => self.handle_folder(for_path, result),
@@ -291,6 +319,28 @@ impl App {
         }
     }
 
+    /// The window's client area is now `w`×`h`.
+    pub fn set_viewport(&mut self, w: u32, h: u32) {
+        let vp = (w.max(1), h.max(1));
+        if vp == self.viewport {
+            return;
+        }
+        self.viewport = vp;
+        if let Some(d) = &mut self.display {
+            d.view.set_viewport(vp);
+        }
+        self.update_title();
+        self.invalidate();
+    }
+
+    /// Applies a client size that is waiting (from a `WM_SIZE` that arrived while the app was
+    /// busy), before anything is drawn for the old size.
+    pub fn apply_pending_size(&mut self) {
+        if let Some((w, h)) = super::take_pending_size() {
+            self.set_viewport(w, h);
+        }
+    }
+
     fn invalidate(&mut self) {
         self.dirty = true;
         if let Some(h) = self.hwnd {
@@ -300,7 +350,8 @@ impl App {
         }
     }
 
-    /// Opens a file (or an archive's first page) and lists its folder in the background.
+    /// Opens a file (or an archive's or a folder's first image) and lists its folder in the
+    /// background.
     pub fn open(&mut self, path: PathBuf) {
         if !self.confirm_discard() {
             return;
@@ -310,17 +361,28 @@ impl App {
         self.index = None;
         self.direction = 0;
 
-        if iv_pipeline::archive::is_archive(&path) && path.is_file() {
-            match FolderList::for_file(&path) {
+        // an archive or a folder: browse its images from the first
+        let listing = if iv_pipeline::archive::is_archive(&path) && path.is_file() {
+            Some(FolderList::for_file(&path))
+        } else if path.is_dir() {
+            Some(FolderList::scan(&path))
+        } else {
+            None
+        };
+        if let Some(listing) = listing {
+            let name = file_name(&path);
+            match listing {
                 Ok(list) if !list.is_empty() => {
                     let first = list.files()[0].clone();
-                    self.trace.mark(&format!("archive listed: {} images", list.len()));
+                    self.trace.mark(&format!("listed {}: {} images", path.display(), list.len()));
                     self.folder = Some(list);
                     self.index = Some(0);
                     self.request(first);
                 }
-                Ok(_) => self.set_error(fill(self.t().no_images_inside, &[("name", &file_name(&path))])),
-                Err(e) => self.set_error(format!("{}: {e}", file_name(&path))),
+                Ok(_) => self.show_open_error(fill(self.t().no_images_inside, &[("name", &name)])),
+                Err(e) => {
+                    self.show_open_error(fill(self.t().cannot_open, &[("name", &name), ("error", &e.to_string())]))
+                }
             }
             return;
         }
@@ -341,9 +403,39 @@ impl App {
         self.settings.language.strings()
     }
 
-    fn set_error(&mut self, e: String) {
+    /// Nothing could be opened (an empty or unreadable folder or archive): the previous image
+    /// is no longer current, and the title says why until something else is opened.
+    fn show_open_error(&mut self, e: String) {
+        self.current = None;
+        self.display = None;
+        self.edits.clear();
+        self.selection = None;
         self.error = Some(e);
+        self.after_image_change();
         self.update_title();
+    }
+
+    /// A one-off message after the title; it goes away after a few seconds or at the next
+    /// command, and never hides the file name, size or unsaved-edit mark.
+    fn set_notice(&mut self, message: String) {
+        self.notice = Some(message);
+        if let Some(h) = self.hwnd {
+            unsafe {
+                SetTimer(Some(h), NOTICE_TIMER, NOTICE_TIME_MS, None);
+            }
+        }
+        self.update_title();
+    }
+
+    fn clear_notice(&mut self) {
+        if self.notice.take().is_some() {
+            if let Some(h) = self.hwnd {
+                unsafe {
+                    let _ = KillTimer(Some(h), NOTICE_TIMER);
+                }
+            }
+            self.update_title();
+        }
     }
 
     /// Paths to prefetch around the current index, nearest first.
@@ -451,6 +543,15 @@ impl App {
             (Some(full), _, _) if shown != Some(Shown::Full) => (&full.image, &full.info, Shown::Full),
             (None, Some(preview), Some(info)) if shown.is_none() => (preview, info, Shown::Preview),
             _ => {
+                // the full image is up already, e.g. shown while flipping past it with a key
+                // held (that display does not play): start its animation now that it is current
+                if let (Some(d), Some(full)) = (self.display.as_mut().filter(|_| same_image), &cur.full) {
+                    if d.kind == Shown::Full && d.playback.is_none() && full.animation.is_some() {
+                        d.playback = Playback::start(full);
+                        self.trace.mark("animation started on the image already shown");
+                        self.schedule_animation();
+                    }
+                }
                 self.sync_second();
                 return;
             }
@@ -473,6 +574,8 @@ impl App {
                 d.picture = picture;
                 d.stored = stored;
                 d.orientation = info.orientation;
+                // the file as saved has arrived: its pixels already include the edits
+                d.saved_edits = None;
                 if d.second.is_none() {
                     d.view.set_image_size(size);
                 }
@@ -487,6 +590,7 @@ impl App {
                     orientation: info.orientation,
                     playback: None,
                     second: None,
+                    saved_edits: None,
                 })
             }
         }
@@ -509,8 +613,8 @@ impl App {
     /// removes it when there is none.
     fn sync_second(&mut self) {
         let want = self.partner();
+        let Some(main_size) = self.main_size() else { return };
         let Some(cur) = &self.current else { return };
-        let Some(main_size) = cur.info.as_ref().map(ImageInfo::display_size) else { return };
         let Some(d) = self.display.as_mut().filter(|d| d.path == cur.path) else { return };
         match want {
             None => {
@@ -521,12 +625,14 @@ impl App {
             }
             Some(partner) if d.second.as_ref().map(|s| &s.path) != Some(&partner) => {
                 let Some(page) = self.pipeline.cached(&partner) else { return };
-                let (total, fraction) = spread_layout(main_size, page.info.display_size());
+                let size = page.info.display_size();
+                let (total, fraction) = spread_layout(main_size, size);
                 d.second = Some(Second {
                     path: partner,
                     picture: Picture::new(&page.image, page.info.has_alpha),
                     stored: (page.info.width, page.info.height),
                     orientation: page.info.orientation,
+                    size,
                     fraction,
                 });
                 d.view.set_image_size(total);
@@ -534,6 +640,25 @@ impl App {
             }
             Some(_) => {}
         }
+    }
+
+    /// Display size of the current image as drawn: with its edits, if any.
+    fn main_size(&self) -> Option<(u32, u32)> {
+        let info = self.current.as_ref()?.info.as_ref()?;
+        if self.edits.is_empty() { Some(info.display_size()) } else { self.geometry().map(|g| g.size) }
+    }
+
+    /// Two-page view: the edited size of the current page changed (an undo or redo while two
+    /// pages are shown), so the pages share the width anew.
+    fn relayout_second(&mut self) {
+        let Some(main_size) = self.main_size() else { return };
+        let Some(cur) = &self.current else { return };
+        let Some(d) = self.display.as_mut().filter(|d| d.path == cur.path) else { return };
+        let Some(s) = d.second.as_mut() else { return };
+        let (total, fraction) = spread_layout(main_size, s.size);
+        s.fraction = fraction;
+        d.view.set_image_size(total);
+        self.invalidate();
     }
 
     /// Shows an image that is no longer current (quick browsing), unless the current one is
@@ -554,6 +679,7 @@ impl App {
             orientation: info.orientation,
             playback: None,
             second: None,
+            saved_edits: None,
         });
         self.invalidate();
     }
@@ -599,10 +725,19 @@ impl App {
             }
             (None, None) => format!("image-viewer — {}", t.title_empty),
         };
+        let title = match &self.notice {
+            Some(notice) => format!("{title} — {notice}"),
+            None => title,
+        };
+        // setting the same text again still repaints the caption; panning would do it per move
+        if *self.last_title.borrow() == title {
+            return;
+        }
         let w = wide(&title);
         unsafe {
             let _ = SetWindowTextW(hwnd, windows::core::PCWSTR(w.as_ptr()));
         }
+        *self.last_title.borrow_mut() = title;
     }
 
     fn handle_pipeline(&mut self, event: PipelineEvent) {
@@ -630,11 +765,13 @@ impl App {
                 cur.load_time = Some(elapsed);
                 cur.full = Some(decoded);
             }
-            PipelineEvent::Failed { path, error } if is_current(&path, &self.current) => {
+            PipelineEvent::Failed { path, error, kind } if is_current(&path, &self.current) => {
                 eprintln!("{}: {error}", path.display());
-                self.error = Some(format!("{}: {error}", file_name(&path)));
-                // nothing truthful to show for this file
+                self.error = Some(self.t().open_failed(&file_name(&path), kind, &error));
+                // nothing truthful to show for this file: not even its embedded preview, which
+                // would look like a healthy (blurry) image
                 self.display = None;
+                self.current.as_mut().expect("checked").preview = None;
                 self.invalidate();
             }
             // while a key is held, an image flipped past is shown as soon as it is decoded, so
@@ -668,6 +805,8 @@ impl App {
 
     pub fn run_command(&mut self, cmd: Command, repeat: bool) {
         let center = self.center();
+        // a notice is about the last thing done; the next command makes it stale
+        self.clear_notice();
         match cmd {
             Command::FileOpen => self.open_dialog(),
             Command::FileSave => self.save_in_place(),
@@ -693,6 +832,7 @@ impl App {
             Command::ViewZoomIn => self.with_view(|v| v.zoom_by(ZOOM_STEP)),
             Command::ViewZoomOut => self.with_view(|v| v.zoom_by(1.0 / ZOOM_STEP)),
             Command::AppSettings => self.toggle_settings(),
+            Command::AppHelp => self.toggle_help(),
             Command::ViewToggleEditPanel => self.toggle_panel(),
             Command::ViewToggleSpread => {
                 self.spread = if self.spread.is_some() { None } else { Some(self.settings.spread_right_to_left) };
@@ -724,10 +864,37 @@ impl App {
     pub fn quit(&mut self) {
         if self.confirm_discard() {
             if let Some(h) = self.hwnd {
+                self.remember_placement(h);
                 unsafe {
                     let _ = DestroyWindow(h);
                 }
             }
+        }
+    }
+
+    /// Writes where the window is (its restored rectangle and whether it is maximised) to the
+    /// settings file, so the next start opens it there. Full screen is not remembered: the
+    /// placement from before it is.
+    fn remember_placement(&self, hwnd: HWND) {
+        let Some(path) = &self.settings_path else { return };
+        let placement = match &self.fullscreen {
+            Some(r) => r.placement,
+            None => {
+                let mut p = WINDOWPLACEMENT { length: size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+                if unsafe { GetWindowPlacement(hwnd, &mut p) }.is_err() {
+                    return;
+                }
+                p
+            }
+        };
+        let r = placement.rcNormalPosition;
+        let maximized = placement.showCmd == SW_SHOWMAXIMIZED.0 as u32
+            || placement.showCmd == SW_SHOWMINIMIZED.0 as u32 && placement.flags.contains(WPF_RESTORETOMAXIMIZED);
+        let saved =
+            WindowPlacement { x: r.left, y: r.top, width: r.right - r.left, height: r.bottom - r.top, maximized };
+        match Settings::save_window(path, saved) {
+            Ok(()) => self.trace.mark(&format!("window placement saved: {saved:?}")),
+            Err(e) => eprintln!("window placement not saved: {e}"),
         }
     }
 
@@ -809,7 +976,7 @@ impl App {
                 Ok(()) => self.sync_panel(),
                 Err(e) => {
                     self.panel.open = false;
-                    self.set_error(e);
+                    self.set_notice(e);
                 }
             },
             _ => panel::hide(),
@@ -822,10 +989,28 @@ impl App {
             (true, Some(h)) => {
                 if let Err(e) = settings_window::show(h, &self.settings, !self.no_activate) {
                     self.settings_open = false;
-                    self.set_error(e);
+                    self.set_notice(e);
                 }
             }
             _ => settings_window::hide(),
+        }
+    }
+
+    fn help_rows(&self) -> Vec<crate::help::Row> {
+        crate::help::rows(&self.keymap, self.t(), self.settings.wheel_navigates)
+    }
+
+    fn toggle_help(&mut self) {
+        self.help_open = !self.help_open;
+        self.trace.mark(&format!("help: {}", if self.help_open { "open" } else { "closed" }));
+        match (self.help_open, self.hwnd) {
+            (true, Some(h)) => {
+                if let Err(e) = help::show(h, self.t(), &self.help_rows(), !self.no_activate) {
+                    self.help_open = false;
+                    self.set_notice(e);
+                }
+            }
+            _ => help::hide(),
         }
     }
 
@@ -834,12 +1019,18 @@ impl App {
             UiEvent::Panel(a) => self.apply_panel_action(a),
             UiEvent::SettingsChanged(s) => {
                 let language_changed = s.language != self.settings.language;
-                self.settings = s.clamped();
+                let help_changed = language_changed || s.wheel_navigates != self.settings.wheel_navigates;
+                // the window placement is the app's own, not the settings window's
+                let window = self.settings.window;
+                self.settings = Settings { window, ..s.clamped() };
                 if language_changed {
                     let t = self.t();
                     panel::set_language(t);
                     settings_window::set_language(t);
                     self.update_title();
+                }
+                if help_changed {
+                    help::refresh(self.t(), &self.help_rows());
                 }
                 self.panel.quality = self.settings.save_quality;
                 self.settings_changed();
@@ -848,6 +1039,10 @@ impl App {
             UiEvent::SettingsClosed => {
                 self.settings_open = false;
                 settings_window::hide();
+            }
+            UiEvent::HelpClosed => {
+                self.help_open = false;
+                help::hide();
             }
         }
     }
@@ -863,7 +1058,7 @@ impl App {
         let Some(path) = self.settings_path.clone() else { return };
         match self.settings.save(&path) {
             Ok(()) => self.trace.mark(&format!("settings saved to {}", path.display())),
-            Err(e) => self.set_error(fill(self.t().settings_error, &[("error", &e)])),
+            Err(e) => self.set_notice(fill(self.t().settings_error, &[("error", &e)])),
         }
     }
 
@@ -892,11 +1087,12 @@ impl App {
 
     fn apply_panel_action(&mut self, action: PanelAction) {
         let size = self.panel_context().size;
+        self.clear_notice();
         match action {
             PanelAction::Adjust(a) => {
                 self.panel.adjust = a;
                 if self.spread.is_some() {
-                    self.set_error(self.t().edit_single_page.into());
+                    self.set_notice(self.t().edit_single_page.into());
                 } else if self.current.as_ref().is_some_and(|c| c.info.is_some()) {
                     self.edits.push_or_replace(Op::Adjust(a), |o| matches!(o, Op::Adjust(_)));
                     self.after_edit_change();
@@ -912,16 +1108,10 @@ impl App {
                 self.settings.save_quality = q;
             }
             PanelAction::ResizeWidth(w) => {
-                self.panel.resize = match (self.panel.keep_aspect, size) {
-                    (true, Some(s)) => follow_aspect(true, (w, self.panel.resize.1), s),
-                    _ => (w, self.panel.resize.1),
-                };
+                self.panel.resize = typed_resize(self.panel.resize, self.panel.keep_aspect, size, true, w);
             }
             PanelAction::ResizeHeight(h) => {
-                self.panel.resize = match (self.panel.keep_aspect, size) {
-                    (true, Some(s)) => follow_aspect(false, (self.panel.resize.0, h), s),
-                    _ => (self.panel.resize.0, h),
-                };
+                self.panel.resize = typed_resize(self.panel.resize, self.panel.keep_aspect, size, false, h);
             }
             PanelAction::ResizeHalf => {
                 if let Some(s) = size {
@@ -961,11 +1151,15 @@ impl App {
         Some(Geometry::new((info.width, info.height), info.orientation, self.edits.active()))
     }
 
-    /// The view follows the edited size.
+    /// The view follows the edited size (in two-page view, the pages' shared layout does).
     fn apply_edits_to_view(&mut self) {
         let Some(g) = self.geometry() else { return };
         let (Some(d), Some(cur)) = (self.display.as_mut(), self.current.as_ref()) else { return };
-        if d.path != cur.path || d.second.is_some() {
+        if d.path != cur.path {
+            return;
+        }
+        if d.second.is_some() {
+            self.relayout_second();
             return;
         }
         if d.view.image_size() != (g.size.0 as f64, g.size.1 as f64) {
@@ -1003,7 +1197,7 @@ impl App {
 
     fn edit(&mut self, op: Op) {
         if self.spread.is_some() {
-            self.set_error(self.t().edit_single_page.into());
+            self.set_notice(self.t().edit_single_page.into());
             return;
         }
         if self.current.as_ref().is_some_and(|c| c.info.is_some()) {
@@ -1014,11 +1208,7 @@ impl App {
     }
 
     fn crop_to_selection(&mut self) {
-        let crop = match (&self.display, self.selection) {
-            (Some(d), Some(sel)) => selection_to_crop(&d.view, sel),
-            _ => None,
-        };
-        if let Some(r) = crop {
+        if let Some(r) = self.selection {
             self.edit(Op::Crop(r));
         }
     }
@@ -1069,7 +1259,7 @@ impl App {
         }
         let req = match save_request(&self.encoders, &cur.path, self.edits.active(), dest, self.panel.quality) {
             Ok(r) => r,
-            Err(e) => return self.set_error(e),
+            Err(e) => return self.set_notice(e.message(self.t())),
         };
         self.saving = true;
         self.update_title();
@@ -1089,11 +1279,15 @@ impl App {
             Ok(outcome) => {
                 self.trace.mark(&format!("saved {} ({outcome:?})", dest.display()));
                 self.pipeline.invalidate(&dest);
+                let saved_edits = self.edits.active().to_vec();
                 self.edits.clear();
                 if dest == source {
-                    // keep the old frame up until the new decode arrives, but mark it stale
-                    if let Some(d) = &mut self.display {
+                    // keep the old frame up until the new decode arrives, marked stale, and
+                    // drawn with the edits it was saved with: without them the old pixels would
+                    // be stretched into the edited (rotated, cropped) size
+                    if let Some(d) = self.display.as_mut().filter(|d| d.path == source) {
                         d.kind = Shown::Preview;
+                        d.saved_edits = Some(saved_edits);
                     }
                     self.current = None;
                     self.request(source);
@@ -1103,10 +1297,11 @@ impl App {
             }
             Err(e) => {
                 eprintln!("save failed: {e}");
+                let message = fill(self.t().save_failed, &[("error", &e)]);
+                self.set_notice(message.clone());
                 if let Some(h) = self.hwnd {
-                    dialogs::show_error(h, &fill(self.t().save_failed, &[("error", &e)]));
+                    dialogs::show_error(h, &message);
                 }
-                self.error = Some(fill(self.t().save_failed, &[("error", &e)]));
             }
         }
         self.sync_panel();
@@ -1126,13 +1321,16 @@ impl App {
                 let Some(cur) = &self.current else { return true };
                 let format_ok = cur.info.as_ref().and_then(|i| in_place_format(&self.encoders, i.format)).is_some();
                 if !format_ok {
-                    self.set_error(self.t().format_not_writable.into());
+                    self.set_notice(self.t().format_not_writable.into());
                     return false;
                 }
+                let t = self.t();
                 let saved =
                     save_request(&self.encoders, &cur.path, self.edits.active(), cur.path.clone(), self.panel.quality)
+                        .map_err(|e| e.message(t))
                         .and_then(|req| {
-                            export(&iv_codec::default_registry(), &self.encoders, &req).map_err(|e| e.to_string())
+                            export(&iv_codec::default_registry(), &self.encoders, &req)
+                                .map_err(|e| fill(t.save_failed, &[("error", &e.to_string())]))
                         });
                 match saved {
                     Ok(_) => {
@@ -1141,8 +1339,8 @@ impl App {
                         self.edits.clear();
                         true
                     }
-                    Err(e) => {
-                        self.set_error(fill(self.t().save_failed, &[("error", &e)]));
+                    Err(message) => {
+                        self.set_notice(message);
                         false
                     }
                 }
@@ -1204,11 +1402,19 @@ impl App {
         frame.resize(self.viewport.0, self.viewport.1);
         let t = Instant::now();
         let editing = self.current.as_ref().zip(self.display.as_ref()).is_some_and(|(c, d)| c.path == d.path);
-        let edited = if editing && !self.edits.is_empty() { self.geometry() } else { None };
+        let live: &[Op] = if editing { self.edits.active() } else { &[] };
         match &self.display {
             None => raster::render(frame, &[], None, &self.style),
             Some(d) => {
-                let main_g = edited.unwrap_or_else(|| Geometry::new(d.stored, d.orientation, &[]));
+                let main_g = match &d.saved_edits {
+                    // the old pixels of a file just saved in place: the saved edits, then any
+                    // made since (they apply to the saved file, which is those pixels edited)
+                    Some(saved) => {
+                        let ops: Vec<Op> = saved.iter().chain(live).cloned().collect();
+                        Geometry::new(d.stored, d.orientation, &ops)
+                    }
+                    None => Geometry::new(d.stored, d.orientation, live),
+                };
                 let dest = d.view.dest_rect();
                 let mut pages = Vec::with_capacity(2);
                 match &d.second {
@@ -1239,7 +1445,8 @@ impl App {
                         });
                     }
                 }
-                raster::render(frame, &pages, self.selection, &self.style);
+                let selection = self.selection.map(|r| selection_on_screen(&d.view, r));
+                raster::render(frame, &pages, selection, &self.style);
             }
         }
         if !self.first_frame_logged {
@@ -1268,6 +1475,8 @@ impl App {
     fn chord(&self, vk: VIRTUAL_KEY, lp: LPARAM) -> Option<Chord> {
         let shift = key_down(VK_SHIFT);
         let scan = ((lp.0 >> 16) & 0xff) as u32;
+        let extended = lp.0 & (1 << 24) != 0;
+        let vk = keys::real_key(vk, scan, extended);
         let name = keys::key_name(vk, scan, shift)?;
         Some(Chord::new(name, key_down(VK_CONTROL), key_down(VK_MENU), shift))
     }
@@ -1299,6 +1508,38 @@ impl App {
             can_redo: self.edits.can_redo(),
             edited: !self.edits.is_empty(),
             has_selection: self.selection.is_some(),
+            can_navigate: self.folder.as_ref().is_some_and(|f| f.len() > 1) && self.index.is_some(),
+        }
+    }
+
+    /// Ctrl and Shift from a mouse message's key flags, Alt from the keyboard state.
+    fn mouse_chord(&self, key: &str, wp: WPARAM) -> Chord {
+        let flags = wp.0 as u32;
+        Chord::new(key, flags & MK_CONTROL.0 != 0, key_down(VK_MENU), flags & MK_SHIFT.0 != 0)
+    }
+
+    fn on_wheel(&mut self, hwnd: HWND, wp: WPARAM, lp: LPARAM) {
+        let delta = i32::from((wp.0 >> 16) as u16 as i16);
+        let up = delta > 0;
+        let chord = self.mouse_chord(if up { "WheelUp" } else { "WheelDown" }, wp);
+        match wheel_use(&self.keymap, up, chord.ctrl, chord.alt, chord.shift, self.settings.wheel_navigates) {
+            WheelUse::Command(cmd) => {
+                // one command per whole notch, so a precision wheel does not race through files
+                if self.wheel.push(delta, Instant::now()) != 0 {
+                    self.run_command(cmd, false);
+                }
+            }
+            WheelUse::Zoom => {
+                let (sx, sy) = super::point_from_lparam(lp);
+                let mut pt = POINT { x: sx, y: sy };
+                unsafe {
+                    let _ = ScreenToClient(hwnd, &mut pt);
+                }
+                let anchor = (pt.x as f64, pt.y as f64);
+                self.with_view(|v| {
+                    v.zoom_by_at(ZOOM_STEP.powf(f64::from(delta) / f64::from(crate::wheel::NOTCH)), anchor)
+                });
+            }
         }
     }
 
@@ -1309,20 +1550,7 @@ impl App {
             (x as f64, y as f64)
         };
         match msg {
-            WM_SIZE => {
-                // minimised: keep the last size
-                if wp.0 as u32 != SIZE_MINIMIZED {
-                    let (w, h) = super::point_from_lparam(lp);
-                    self.viewport = (w.max(1) as u32, h.max(1) as u32);
-                    let vp = self.viewport;
-                    if let Some(d) = &mut self.display {
-                        d.view.set_viewport(vp);
-                    }
-                    self.update_title();
-                    self.invalidate();
-                }
-                Some(LRESULT(0))
-            }
+            // WM_SIZE is handled by the window procedure (see `super::set_pending_size`)
             WM_KEYDOWN => {
                 self.on_key_down(wp, lp);
                 Some(LRESULT(0))
@@ -1346,7 +1574,7 @@ impl App {
                     SetCapture(hwnd);
                 }
                 if wp.0 as u32 & MK_SHIFT.0 != 0 {
-                    self.select_from = Some(p);
+                    self.select_from = self.display.as_ref().map(|d| d.view.screen_to_image(p));
                     self.selection = None;
                     self.invalidate();
                 } else {
@@ -1361,9 +1589,14 @@ impl App {
             }
             WM_MOUSEMOVE => {
                 let p = point();
-                if let Some(from) = self.select_from {
-                    self.selection = Some(drag_rect(from, p));
-                    self.invalidate();
+                if let (Some(from), Some(d)) = (self.select_from, &self.display) {
+                    let to = d.view.screen_to_image(p);
+                    let (w, h) = d.view.image_size();
+                    let selection = selection_rect(from, to, (w, h));
+                    if selection != self.selection {
+                        self.selection = selection;
+                        self.invalidate();
+                    }
                 }
                 if let Some(from) = self.drag_from {
                     self.drag_from = Some(p);
@@ -1386,15 +1619,29 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_MOUSEWHEEL => {
-                let notches = ((wp.0 >> 16) as u16 as i16) as f64 / 120.0;
-                let (sx, sy) = super::point_from_lparam(lp);
-                let mut pt = POINT { x: sx, y: sy };
-                unsafe {
-                    let _ = ScreenToClient(hwnd, &mut pt);
-                }
-                let anchor = (pt.x as f64, pt.y as f64);
-                self.with_view(|v| v.zoom_by_at(ZOOM_STEP.powf(notches), anchor));
+                self.on_wheel(hwnd, wp, lp);
                 Some(LRESULT(0))
+            }
+            // the side buttons (back / forward): bound in the keymap as Mouse4 / Mouse5
+            WM_XBUTTONDOWN | WM_XBUTTONDBLCLK => {
+                let key = match (wp.0 >> 16) & 0xffff {
+                    1 => "Mouse4", // XBUTTON1
+                    _ => "Mouse5",
+                };
+                let cmd = self.keymap.lookup(&self.mouse_chord(key, wp))?;
+                self.run_command(cmd, false);
+                // Windows asks for TRUE from a handled X button message
+                Some(LRESULT(1))
+            }
+            WM_XBUTTONUP => {
+                // a bound button's release must not also become a "browser back" app command
+                let key = if (wp.0 >> 16) & 0xffff == 1 { "Mouse4" } else { "Mouse5" };
+                self.keymap.lookup(&self.mouse_chord(key, wp)).map(|_| LRESULT(1))
+            }
+            WM_KILLFOCUS => {
+                // the key-up of a held navigation key goes to the window that took the focus
+                self.end_quick_browsing();
+                None
             }
             WM_CONTEXTMENU => {
                 let (mut x, mut y) = super::point_from_lparam(lp);
@@ -1423,6 +1670,10 @@ impl App {
             }
             WM_TIMER if wp.0 == ANIMATION_TIMER => {
                 self.tick_animation();
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wp.0 == NOTICE_TIMER => {
+                self.clear_notice();
                 Some(LRESULT(0))
             }
             WM_CLOSE => {

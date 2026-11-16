@@ -2,29 +2,37 @@
 //!
 //! The app lives in a thread-local cell. Modal dialogs it opens (file pickers, message boxes)
 //! run nested message loops that call back into the window procedure while the app is
-//! borrowed; those messages are answered without it (paint blits the last frame, the rest go
-//! to Windows or wait in the queues the app drains afterwards).
+//! borrowed; those messages are answered without it (paint blits the last frame, a new client
+//! size waits for the app's next drain, the rest go to Windows or wait in the queues the app
+//! drains afterwards). Painting renders without draining and drains only after the frame is
+//! released and the window validated, so a dialog opened while draining can paint safely.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
-    BITMAPINFO, BITMAPINFOHEADER, BeginPaint, DIB_RGB_COLORS, EndPaint, PAINTSTRUCT, SetDIBitsToDevice,
+    BITMAPINFO, BITMAPINFOHEADER, BeginPaint, DIB_RGB_COLORS, EndPaint, GetMonitorInfoW, MONITOR_DEFAULTTONULL,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromRect, PAINTSTRUCT, SetDIBitsToDevice,
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
+use windows::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, GetDpiForSystem,
+    MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
+};
+use windows::Win32::UI::Input::Ime::{HIMC, ImmAssociateContextEx};
 use windows::Win32::UI::Shell::DragAcceptFiles;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
 use super::app::App;
-use super::{controls, panel, settings_window};
+use super::controls::scale;
+use super::{controls, help, panel, settings_window};
 use crate::keymap::Keymap;
 use crate::raster::Frame;
-use crate::settings::Settings;
+use crate::settings::{Settings, WindowPlacement};
 use crate::trace::Trace;
 
 thread_local! {
@@ -54,12 +62,27 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     })
 }
 
+/// Brings the frame up to date with the app, without draining its queues: draining can open a
+/// modal dialog, which must not happen while the frame is borrowed and the window unpainted.
+fn render(frame: &mut Frame) {
+    APP.with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            if let Some(app) = guard.as_mut() {
+                app.apply_pending_size();
+                app.render_if_dirty(frame);
+            }
+        }
+    });
+}
+
+/// Blits the frame. If the frame is busy (a paint nested inside another paint), the window is
+/// only validated, so the nested paint neither fails nor repeats forever.
 fn paint(hwnd: HWND) {
     unsafe {
         let mut ps = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut ps);
         FRAME.with(|f| {
-            let f = f.borrow();
+            let Ok(f) = f.try_borrow() else { return };
             let bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -95,10 +118,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         WM_PAINT => {
             FRAME.with(|f| {
                 if let Ok(mut frame) = f.try_borrow_mut() {
-                    with_app(|app| app.render_if_dirty(&mut frame));
+                    render(&mut frame);
                 }
             });
             paint(hwnd);
+            // now that the frame is free and the window painted, events may open dialogs
+            with_app(|_| ());
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            // minimised: keep the last size
+            if wp.0 as u32 != SIZE_MINIMIZED {
+                let (w, h) = ((lp.0 as u32 & 0xffff).max(1), ((lp.0 as u32 >> 16) & 0xffff).max(1));
+                // applied when the app next drains: right away if it is idle, else when whatever
+                // has it busy (full screen's SetWindowPos, a dialog) returns
+                super::set_pending_size((w, h));
+                with_app(|_| ());
+            }
             LRESULT(0)
         }
         // every pixel is painted from the frame
@@ -133,7 +169,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 /// Hands keyboard navigation (Tab, Esc, arrow keys on controls) to the panel and settings
 /// windows when a message is for them.
 fn dialog_message(msg: &MSG) -> bool {
-    for aux in [panel::hwnd(), settings_window::hwnd()].into_iter().flatten() {
+    for aux in [panel::hwnd(), settings_window::hwnd(), help::hwnd()].into_iter().flatten() {
         unsafe {
             if (msg.hwnd == aux || IsChild(aux, msg.hwnd).as_bool()) && IsDialogMessageW(aux, msg).as_bool() {
                 return true;
@@ -141,6 +177,59 @@ fn dialog_message(msg: &MSG) -> bool {
         }
     }
     false
+}
+
+/// The default window: 1280×800 logical pixels of client area.
+const DEFAULT_CLIENT: (i32, i32) = (1280, 800);
+
+/// A window of outer size `outer`, centred in the work area `work` and no larger than it.
+fn centred_in(outer: (i32, i32), work: RECT) -> (i32, i32, i32, i32) {
+    let (ww, wh) = (work.right - work.left, work.bottom - work.top);
+    let (w, h) = (outer.0.min(ww), outer.1.min(wh));
+    (work.left + (ww - w) / 2, work.top + (wh - h) / 2, w, h)
+}
+
+/// Whether enough of `r` lies in the work area `work` to see the window and drag it by its
+/// title bar (the top edge must be on screen).
+fn reachable(r: RECT, work: RECT) -> bool {
+    let visible_w = r.right.min(work.right) - r.left.max(work.left);
+    let visible_h = r.bottom.min(work.bottom) - r.top.max(work.top);
+    visible_w >= 120 && visible_h >= 60 && r.top >= work.top - 16 && r.top <= work.bottom - 60
+}
+
+/// The default window rectangle on the primary monitor, scaled for its DPI.
+fn default_rect(style: WINDOW_STYLE) -> (i32, i32, i32, i32) {
+    unsafe {
+        let monitor = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
+        let (mut dpi, mut dpi_y) = (0u32, 0u32);
+        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y).is_err() || dpi == 0 {
+            dpi = GetDpiForSystem().max(96);
+        }
+        let mut r = RECT { left: 0, top: 0, right: scale(DEFAULT_CLIENT.0, dpi), bottom: scale(DEFAULT_CLIENT.1, dpi) };
+        let _ = AdjustWindowRectExForDpi(&mut r, style, false, WINDOW_EX_STYLE(0), dpi);
+        let outer = (r.right - r.left, r.bottom - r.top);
+        let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
+            return (CW_USEDEFAULT, CW_USEDEFAULT, outer.0, outer.1);
+        }
+        centred_in(outer, mi.rcWork)
+    }
+}
+
+/// The saved restored rectangle, if it still lands on a connected monitor well enough to use.
+fn visible_placement(p: WindowPlacement) -> Option<RECT> {
+    let r = RECT { left: p.x, top: p.y, right: p.x + p.width, bottom: p.y + p.height };
+    unsafe {
+        let monitor = MonitorFromRect(&r, MONITOR_DEFAULTTONULL);
+        if monitor.is_invalid() {
+            return None;
+        }
+        let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
+            return None;
+        }
+        reachable(r, mi.rcWork).then_some(r)
+    }
 }
 
 /// Opens the window and runs until it closes. Returns the process exit code.
@@ -152,6 +241,7 @@ pub fn run(opts: Options) -> i32 {
     }
     controls::init_common_controls();
 
+    let saved_place = opts.settings.window;
     let app = App::new(opts.keymap, opts.trace, opts.settings, opts.settings_path, opts.no_activate);
     APP.with(|a| *a.borrow_mut() = Some(app));
     // decoding starts now and overlaps window creation
@@ -159,6 +249,9 @@ pub fn run(opts: Options) -> i32 {
         with_app(|app| app.open(file));
     }
 
+    // born where it was last time (so it starts at that monitor's DPI), else centred on the
+    // primary monitor at 1280×800 logical pixels
+    let restore = saved_place.and_then(visible_placement);
     let hwnd = unsafe {
         let instance = GetModuleHandleW(None).expect("module handle");
         let class = WNDCLASSEXW {
@@ -172,15 +265,19 @@ pub fn run(opts: Options) -> i32 {
             ..Default::default()
         };
         RegisterClassExW(&class);
+        let (x, y, w, h) = match restore {
+            Some(r) => (r.left, r.top, r.right - r.left, r.bottom - r.top),
+            None => default_rect(WS_OVERLAPPEDWINDOW),
+        };
         match CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("iv-viewer"),
             w!("image-viewer"),
             WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            1280,
-            800,
+            x,
+            y,
+            w,
+            h,
             None,
             None,
             Some(instance.into()),
@@ -199,11 +296,39 @@ pub fn run(opts: Options) -> i32 {
         app.attach(hwnd);
     });
     unsafe {
+        // No input method on the viewer itself: in Hangul mode the Korean IME would swallow
+        // every single-letter shortcut (R, F, D, ...). The panel's and settings' edit fields
+        // are other windows and keep theirs.
+        let ime_off = ImmAssociateContextEx(hwnd, HIMC::default(), 0).as_bool();
+        with_app(|app| app.trace(&format!("input method {}", if ime_off { "off" } else { "still on" })));
         let dark: i32 = 1;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, (&dark as *const i32).cast(), 4);
         DragAcceptFiles(hwnd, true);
         // with --no-activate the window never takes focus from what the user is doing
-        let _ = ShowWindow(hwnd, if opts.no_activate { SW_SHOWNOACTIVATE } else { SW_SHOW });
+        let show = match (opts.no_activate, saved_place) {
+            (true, _) => SW_SHOWNOACTIVATE,
+            (false, Some(p)) if p.maximized && restore.is_some() => SW_SHOWMAXIMIZED,
+            (false, _) => SW_SHOW,
+        };
+        match restore {
+            // exact restored rectangle (workspace coordinates) and the maximised state
+            Some(r) => {
+                let place = WINDOWPLACEMENT {
+                    length: size_of::<WINDOWPLACEMENT>() as u32,
+                    showCmd: show.0 as u32,
+                    rcNormalPosition: r,
+                    ptMinPosition: POINT { x: -1, y: -1 },
+                    ptMaxPosition: POINT { x: -1, y: -1 },
+                    ..Default::default()
+                };
+                if SetWindowPlacement(hwnd, &place).is_err() {
+                    let _ = ShowWindow(hwnd, show);
+                }
+            }
+            None => {
+                let _ = ShowWindow(hwnd, show);
+            }
+        }
     }
     // events that arrived before the window existed
     super::wake();
@@ -220,4 +345,33 @@ pub fn run(opts: Options) -> i32 {
     }
     APP.with(|a| a.borrow_mut().take());
     msg.wParam.0 as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT { left, top, right, bottom }
+    }
+
+    #[test]
+    fn default_window_is_centred_and_fits_the_work_area() {
+        // 1280x800 at 150 % is 1920x1200 plus the frame: too big for a 1920x1040 work area
+        let work = rect(0, 0, 1920, 1040);
+        assert_eq!(centred_in((1950, 1250), work), (0, 0, 1920, 1040));
+        // fits on a 4K monitor at 100 %: centred
+        assert_eq!(centred_in((1300, 850), rect(0, 0, 3840, 2100)), (1270, 625, 1300, 850));
+        // a secondary monitor left of the primary
+        assert_eq!(centred_in((1000, 600), rect(-1920, 0, 0, 1080)), (-1460, 240, 1000, 600));
+    }
+
+    #[test]
+    fn saved_placement_must_be_reachable() {
+        let work = rect(0, 0, 1920, 1040);
+        assert!(reachable(rect(100, 100, 1400, 900), work));
+        assert!(!reachable(rect(1900, 100, 3000, 900), work), "only 20 px on screen");
+        assert!(!reachable(rect(100, -400, 1400, 30), work), "title bar above the screen");
+        assert!(!reachable(rect(100, 1020, 1400, 1800), work), "title bar under the taskbar");
+    }
 }

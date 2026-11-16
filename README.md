@@ -35,7 +35,7 @@ cargo build --release
 ./target/release/iv bench <파일|폴더>   # probe / preview / decode 시간 측정
 ./target/release/iv convert --to webp --opt quality=82 --max 1920 --out out <파일|폴더>   # 일괄 변환
 ./target/release/iv fix-ext --dry-run <파일|폴더>   # 내용과 다른 확장자 찾기 (빼면 실제로 바꿈)
-./target/release/image-viewer <파일>    # 뷰어 (--trace: 시작 단계별 시간 출력, --no-activate: 포커스를 가져가지 않고 열기)
+./target/release/image-viewer <파일|폴더>    # 뷰어 (--trace: 시작 단계별 시간 출력, --no-activate: 포커스를 가져가지 않고 열기)
 ```
 
 ### 기본 단축키
@@ -43,7 +43,9 @@ cargo build --release
 | 키 | 동작 |
 |---|---|
 | Ctrl+O | 파일 열기 |
+| 파일·폴더 끌어다 놓기 | 열기 (폴더·압축파일은 첫 이미지부터) |
 | →, Space, PageDown / ←, Backspace, PageUp | 다음 / 이전 (누르고 있으면 빠른 넘김) |
+| 마우스 앞으로 / 뒤로 버튼 | 다음 / 이전 |
 | Home / End | 처음 / 마지막 |
 | R, Ctrl+R / L, Ctrl+L | 시계 / 반시계 방향 회전 |
 | H / V | 좌우 / 상하 뒤집기 |
@@ -53,7 +55,7 @@ cargo build --release
 | F, Ctrl+0 | 창에 맞춤 |
 | 1, Ctrl+1 | 100% |
 | +, =, Ctrl++ / -, Ctrl+- | 확대 / 축소 |
-| 휠 | 커서 기준 확대·축소 |
+| 휠 | 커서 기준 확대·축소 (설정에서 "휠로 사진 넘기기"를 켜면 이전·다음, 확대·축소는 Ctrl+휠) |
 | 드래그 | 이동 |
 | 더블클릭 | 맞춤 ↔ 100% |
 | F11, Alt+Enter | 전체 화면 |
@@ -61,10 +63,14 @@ cargo build --release
 | E | 편집 패널 (보정 슬라이더, 크기 변경, 저장 품질) |
 | 우클릭 | 모든 명령 메뉴 (단축키 표시) |
 | F2 | 설정 |
+| F1 | 단축키 도움말 (지금 키맵 그대로의 키·마우스 목록) |
 | Esc | 선택 해제 → 전체 화면 해제 → 종료 |
 | Ctrl+W, Ctrl+Q | 종료 |
 
+한글 입력 상태(IME 한글 모드)여도 R·F·D 같은 한 글자 단축키가 그대로 동작함 (뷰어 창에서는 입력기를 끔).
+
 설정은 F2 또는 `%APPDATA%\image-viewer\settings.toml` (`--settings <파일>`로 다른 파일 지정).
+창 위치·크기·최대화 상태는 닫을 때 같은 파일의 `[window]`에 기록되어 다음 실행 때 그대로 열림 (전체 화면은 기억하지 않음, 연결이 끊긴 모니터 위치는 무시). 처음 열 때는 주 모니터 배율에 맞춘 1280×800(논리 픽셀) 크기로 가운데에 열림.
 화면 언어는 한국어가 기본이고 설정(F2)의 "언어"에서 English로 바꿀 수 있음 (바로 적용, `settings.toml`의 `language = "ko"` / `"en"`).
 
 단축키는 `%APPDATA%\image-viewer\keymap.toml`로 바꿀 수 있음 (`--keymap <파일>`로 다른 파일 지정):
@@ -73,4 +79,7 @@ cargo build --release
 [bindings]
 "Q" = "app.quit"
 "F" = ""          # 기본 바인딩 해제
+"Ctrl+WheelDown" = "nav.next"   # 마우스: WheelUp, WheelDown, Mouse4(뒤로), Mouse5(앞으로)
 ```
+
+키맵에서 휠에 명령을 묶으면 그 조합의 휠은 확대 대신 그 명령을 실행함 (한 칸에 한 번).

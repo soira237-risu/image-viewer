@@ -24,6 +24,34 @@ pub struct Settings {
     pub save_quality: u8,
     /// Language of menus, windows and messages (`"ko"` or `"en"`).
     pub language: Language,
+    /// The plain mouse wheel moves to the previous / next image (Ctrl+wheel zooms); off: the
+    /// wheel zooms at the cursor.
+    pub wheel_navigates: bool,
+    /// Where the main window was when it last closed (written on close, not by the settings
+    /// window). Kept last: TOML needs plain values before tables.
+    pub window: Option<WindowPlacement>,
+}
+
+/// The main window's restored (not maximised, not full-screen) rectangle in workspace
+/// coordinates, as `GetWindowPlacement` reports it, and whether it was maximised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WindowPlacement {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub maximized: bool,
+}
+
+impl WindowPlacement {
+    /// Smallest restored size worth bringing back; anything smaller is treated as broken.
+    pub const MIN_SIZE: i32 = 120;
+
+    fn plausible(&self) -> bool {
+        let size_ok = |v: i32| (Self::MIN_SIZE..=100_000).contains(&v);
+        let pos_ok = |v: i32| (-100_000..=100_000).contains(&v);
+        size_ok(self.width) && size_ok(self.height) && pos_ok(self.x) && pos_ok(self.y)
+    }
 }
 
 impl Default for Settings {
@@ -37,6 +65,8 @@ impl Default for Settings {
             nearest_above_zoom: 3.0,
             save_quality: 90,
             language: Language::Korean,
+            wheel_navigates: false,
+            window: None,
         }
     }
 }
@@ -49,6 +79,7 @@ impl Settings {
         self.nearest_above_zoom =
             if self.nearest_above_zoom.is_finite() { self.nearest_above_zoom.clamp(1.0, 64.0) } else { 3.0 };
         self.save_quality = self.save_quality.clamp(1, 100);
+        self.window = self.window.filter(WindowPlacement::plausible);
         self
     }
 
@@ -70,6 +101,21 @@ impl Settings {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Records the window placement in the file at `path`, leaving every other value as the
+    /// file has it: changes made in the settings window but not saved stay unsaved. A file that
+    /// does not parse is left alone rather than replaced by defaults.
+    pub fn save_window(path: &Path, placement: WindowPlacement) -> Result<(), String> {
+        let (mut on_disk, warning) = Settings::load(path);
+        if let Some(w) = warning {
+            return Err(w);
+        }
+        if on_disk.window == Some(placement) {
+            return Ok(());
+        }
+        on_disk.window = Some(placement);
+        on_disk.save(path)
     }
 }
 
@@ -107,5 +153,37 @@ mod tests {
         assert!(warning.is_some());
         s = Settings::load(&dir.path().join("none.toml")).0;
         assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn window_placement_is_saved_alone_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let place = WindowPlacement { x: -1800, y: 40, width: 1600, height: 1000, maximized: true };
+        // no file yet: defaults plus the placement
+        Settings::save_window(&path, place).unwrap();
+        let (s, warning) = Settings::load(&path);
+        assert!(warning.is_none());
+        assert_eq!(s, Settings { window: Some(place), ..Settings::default() });
+
+        // other values on disk are kept, and unsaved in-memory values are not written
+        std::fs::write(&path, "wrap = false\nwheel_navigates = true\n").unwrap();
+        Settings::save_window(&path, place).unwrap();
+        let s = Settings::load(&path).0;
+        assert!(!s.wrap && s.wheel_navigates);
+        assert_eq!(s.window, Some(place));
+
+        // a file without the table (older versions) still loads
+        std::fs::write(&path, "save_quality = 70\n").unwrap();
+        assert_eq!(Settings::load(&path).0.window, None);
+
+        // nonsense sizes are dropped instead of restoring a 1-pixel window
+        std::fs::write(&path, "[window]\nx = 0\ny = 0\nwidth = 3\nheight = 900\nmaximized = false\n").unwrap();
+        assert_eq!(Settings::load(&path).0.window, None);
+
+        // a broken file is not overwritten
+        std::fs::write(&path, "wrap = \"maybe\"").unwrap();
+        assert!(Settings::save_window(&path, place).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "wrap = \"maybe\"");
     }
 }

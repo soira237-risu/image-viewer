@@ -35,7 +35,8 @@ impl FolderList {
     }
 
     /// The folder holding `file`, scanned. `file` itself is included even when its extension is
-    /// unknown (it was opened explicitly, so the user wants to see it).
+    /// unknown (it was opened explicitly, so the user wants to see it), unless it is a folder:
+    /// a folder is never an entry of an image list.
     pub fn for_file(file: &Path) -> std::io::Result<Self> {
         // an archive (or a page inside one) browses the archive's images
         let archive = if crate::archive::is_archive(file) && file.is_file() {
@@ -49,7 +50,7 @@ impl FolderList {
         }
         let dir = file.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
         let mut list = Self::scan(dir)?;
-        if list.position(file).is_none() {
+        if !file.is_dir() && list.position(file).is_none() {
             list.files.push(file.to_path_buf());
             list.files.sort_by(|a, b| natural_cmp(&name_of(a), &name_of(b)));
         }
@@ -133,6 +134,24 @@ mod tests {
         let list = FolderList::for_file(&odd).unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list.position(&odd), Some(1));
+    }
+
+    #[test]
+    fn a_folder_is_never_listed_as_an_image() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.jpg"), b"x").unwrap();
+        let sub = dir.path().join("photos");
+        std::fs::create_dir(&sub).unwrap();
+        for name in ["p2.png", "p10.png", "p1.png"] {
+            std::fs::write(sub.join(name), b"x").unwrap();
+        }
+        let around = FolderList::for_file(&sub).unwrap();
+        assert_eq!(around.files(), [dir.path().join("a.jpg")]);
+        assert_eq!(around.position(&sub), None);
+        // the folder's own images, in natural order
+        let inside = FolderList::scan(&sub).unwrap();
+        let names: Vec<_> = inside.files().iter().map(|p| name_of(p)).collect();
+        assert_eq!(names, ["p1.png", "p2.png", "p10.png"]);
     }
 
     #[test]

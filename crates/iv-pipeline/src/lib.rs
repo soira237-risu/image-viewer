@@ -10,4 +10,4 @@ mod pipeline;
 
 pub use folder::{FolderList, step};
 pub use order::prefetch_order;
-pub use pipeline::{Pipeline, PipelineConfig, PipelineEvent, Stats};
+pub use pipeline::{FailureKind, Pipeline, PipelineConfig, PipelineEvent, Stats};

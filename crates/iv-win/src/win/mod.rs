@@ -3,13 +3,14 @@
 pub mod app;
 pub mod controls;
 pub mod dialogs;
+pub mod help;
 pub mod keys;
 pub mod menu;
 pub mod panel;
 pub mod settings_window;
 pub mod window;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
@@ -49,6 +50,7 @@ pub enum UiEvent {
     SettingsChanged(Settings),
     SettingsSave,
     SettingsClosed,
+    HelpClosed,
 }
 
 thread_local! {
@@ -64,6 +66,21 @@ pub fn post_ui(e: UiEvent) {
 
 pub fn take_ui() -> Option<UiEvent> {
     INBOX.with(|q| q.borrow_mut().pop_front())
+}
+
+thread_local! {
+    static PENDING_SIZE: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
+}
+
+/// Records the main window's new client size. `WM_SIZE` often arrives while the app is busy
+/// further up the stack (it is sent synchronously by the `SetWindowPos` that full screen does, or
+/// during a modal dialog), so the size waits here and the app applies it when it next drains.
+pub fn set_pending_size(size: (u32, u32)) {
+    PENDING_SIZE.with(|s| s.set(Some(size)));
+}
+
+pub fn take_pending_size() -> Option<(u32, u32)> {
+    PENDING_SIZE.with(Cell::take)
 }
 
 /// UTF-16, NUL-terminated.

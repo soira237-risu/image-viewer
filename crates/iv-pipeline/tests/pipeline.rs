@@ -52,7 +52,7 @@ fn ready_for(rx: &Receiver<PipelineEvent>, path: &Path) -> Arc<iv_codec::Decoded
         let left = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left).expect("event before timeout") {
             PipelineEvent::Ready { path: p, decoded, .. } if p == path => return decoded,
-            PipelineEvent::Failed { path: p, error } if p == path => panic!("{error}"),
+            PipelineEvent::Failed { path: p, error, .. } if p == path => panic!("{error}"),
             _ => {}
         }
     }
@@ -237,4 +237,28 @@ fn normal_navigation_cancels_the_image_being_decoded() {
     settle(&p);
     assert!(p.cached(&slow).is_none(), "an image the user left is not kept");
     assert!(!readies(&rx).contains(&slow));
+}
+
+#[test]
+fn failures_say_what_kind_they_are() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("gone.jpg");
+    let junk = dir.path().join("junk.dat");
+    std::fs::write(&junk, b"definitely not an image of any kind").unwrap();
+    let (p, rx) = pipeline(u64::MAX, 1);
+    for (path, want) in [(&missing, iv_pipeline::FailureKind::NotFound), (&junk, iv_pipeline::FailureKind::Unsupported)]
+    {
+        p.request(path, &[]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("an event") {
+                PipelineEvent::Failed { path: p, kind, error } if p == *path => {
+                    assert_eq!(kind, want, "{}: {error}", path.display());
+                    break;
+                }
+                PipelineEvent::Ready { .. } => panic!("{} decoded", path.display()),
+                _ => {}
+            }
+        }
+    }
 }

@@ -64,6 +64,35 @@ pub fn follow_aspect(changed_width: bool, value: (u32, u32), image: (u32, u32)) 
     }
 }
 
+/// The value of a resize field as typed: 1..=65535, or 0 for empty, zero or out of range text
+/// (which disables Apply rather than leaving the last valid number in effect).
+pub fn field_value(text: &str) -> u32 {
+    text.trim().parse::<u32>().ok().filter(|v| (1..=65535).contains(v)).unwrap_or(0)
+}
+
+/// The resize fields after the user typed `value` into the width (or height) field. With "keep
+/// aspect", a valid value moves the other side too; 0 (an empty or invalid field) leaves the other
+/// side alone, so a field being retyped does not reshape the one beside it.
+pub fn typed_resize(
+    current: (u32, u32),
+    keep_aspect: bool,
+    image: Option<(u32, u32)>,
+    width_changed: bool,
+    value: u32,
+) -> (u32, u32) {
+    match (keep_aspect && value > 0, image, width_changed) {
+        (true, Some(size), true) => follow_aspect(true, (value, current.1), size),
+        (true, Some(size), false) => follow_aspect(false, (current.0, value), size),
+        (_, _, true) => (value, current.1),
+        (_, _, false) => (current.0, value),
+    }
+}
+
+/// Whether Apply would change anything: both fields valid and different from the image.
+pub fn can_apply(resize: (u32, u32), image: Option<(u32, u32)>) -> bool {
+    image.is_some() && image != Some(resize) && resize.0 > 0 && resize.1 > 0
+}
+
 /// Trackbar position (−100..=100) ↔ gamma (0.2..=5, logarithmic so 0 is 1.0).
 pub fn gamma_from_position(pos: i32) -> f32 {
     5f32.powf(pos.clamp(-100, 100) as f32 / 100.0)
@@ -91,6 +120,29 @@ mod tests {
         assert_eq!(follow_aspect(true, (1920, 999), (3840, 2400)), (1920, 1200));
         assert_eq!(follow_aspect(false, (1, 600), (3840, 2400)), (960, 600));
         assert_eq!(follow_aspect(true, (0, 0), (10, 10)), (1, 1));
+    }
+
+    #[test]
+    fn clearing_a_resize_field_disables_apply_and_keeps_the_other_side() {
+        let image = Some((3840, 2400));
+        let mut r = (1920, 1200);
+        assert!(can_apply(r, image));
+        // the user empties the width field: width 0, height untouched, Apply off
+        r = typed_resize(r, true, image, true, field_value(""));
+        assert_eq!(r, (0, 1200));
+        assert!(!can_apply(r, image));
+        // "0" and "70000" count as invalid too
+        assert_eq!(field_value(" 0 "), 0);
+        assert_eq!(field_value("70000"), 0);
+        assert_eq!(typed_resize((0, 1200), true, image, false, field_value("abc")), (0, 0));
+        // typing a valid width again follows the aspect ratio
+        r = typed_resize((0, 1200), true, image, true, field_value("960"));
+        assert_eq!(r, (960, 600));
+        assert!(can_apply(r, image));
+        // without keep-aspect only the typed side changes
+        assert_eq!(typed_resize((960, 600), false, image, false, 1000), (960, 1000));
+        assert!(!can_apply((3840, 2400), image), "same size: nothing to do");
+        assert!(!can_apply((10, 10), None), "no image");
     }
 
     #[test]

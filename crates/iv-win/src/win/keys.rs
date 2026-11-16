@@ -4,6 +4,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
 use crate::keymap::canonical_key;
 
+/// The key really pressed. An IME that is composing (the Korean IME in Hangul mode) reports
+/// letter keys as `VK_PROCESSKEY`; the scan code still says which key it was. The viewer window
+/// has no IME, so this is the fallback for one that still intercepts keys.
+pub fn real_key(vk: VIRTUAL_KEY, scan_code: u32, extended: bool) -> VIRTUAL_KEY {
+    if vk != VK_PROCESSKEY {
+        return vk;
+    }
+    let scan = scan_code | if extended { 0xe000 } else { 0 };
+    match unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) } {
+        0 => vk,
+        v => VIRTUAL_KEY(v as u16),
+    }
+}
+
 /// The keymap name of a key press: named keys by name, letters as their uppercase letter, and
 /// digits and punctuation as the character the keyboard layout gives with only Shift applied
 /// (so Ctrl+= is "=" and Shift+= is "+", as on every layout).
@@ -83,6 +97,23 @@ mod tests {
         assert_eq!(name(VK_ADD, false).as_deref(), Some("+"));
         assert_eq!(name(VK_SHIFT, true), None);
         assert_eq!(name(VK_CONTROL, false), None);
+    }
+
+    /// What the Korean IME in Hangul mode sends for R, F and D: VK_PROCESSKEY plus the key's
+    /// scan code. The shortcut must still be R, F and D.
+    #[test]
+    fn ime_processed_letters_resolve_to_their_key() {
+        for letter in *b"RFDE" {
+            let vk = VIRTUAL_KEY(u16::from(letter));
+            let scan = unsafe { MapVirtualKeyW(u32::from(vk.0), MAPVK_VK_TO_VSC) };
+            let real = real_key(VK_PROCESSKEY, scan, false);
+            assert_eq!(real, vk);
+            assert_eq!(key_name(real, scan, false).as_deref(), Some(char::from(letter).to_string().as_str()));
+        }
+        // other keys pass through untouched
+        assert_eq!(real_key(VK_RIGHT, 0x4d, true), VK_RIGHT);
+        // an extended scan code maps to the extended key (Right arrow, not numpad 6)
+        assert_eq!(real_key(VK_PROCESSKEY, 0x4d, true), VK_RIGHT);
     }
 
     /// Digits and punctuation come from the layout; US and Korean layouts agree on these.

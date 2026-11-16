@@ -35,25 +35,42 @@ impl Default for PipelineConfig {
 #[derive(Debug)]
 pub enum PipelineEvent {
     /// Header of the requested image (sent only for foreground loads).
-    Probed {
-        path: PathBuf,
-        info: ImageInfo,
-    },
+    Probed { path: PathBuf, info: ImageInfo },
     /// Fast stand-in for the requested image (sent only for foreground loads, when available).
-    Preview {
-        path: PathBuf,
-        image: ImageBuf,
-    },
+    Preview { path: PathBuf, image: ImageBuf },
     /// A decode finished (foreground or prefetch). `elapsed` covers the whole job.
-    Ready {
-        path: PathBuf,
-        decoded: Arc<Decoded>,
-        elapsed: Duration,
-    },
+    Ready { path: PathBuf, decoded: Arc<Decoded>, elapsed: Duration },
     Failed {
         path: PathBuf,
+        /// The error as text (English, for logs and as detail).
         error: String,
+        /// What kind of failure, so the viewer can word the common ones in its own language.
+        kind: FailureKind,
     },
+}
+
+/// The broad reason a decode failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    /// No codec recognised the data.
+    Unsupported,
+    /// The image needs more memory than one buffer may take.
+    TooLarge { width: u32, height: u32 },
+    /// The file does not exist (any more).
+    NotFound,
+    /// Anything else; the error text has the detail.
+    Other,
+}
+
+impl FailureKind {
+    pub fn of(e: &Error) -> Self {
+        match e {
+            Error::UnsupportedFormat => FailureKind::Unsupported,
+            Error::TooLarge { width, height, .. } => FailureKind::TooLarge { width: *width, height: *height },
+            Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => FailureKind::NotFound,
+            _ => FailureKind::Other,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,7 +253,7 @@ impl Shared {
                 Err(Error::Cancelled) => None,
                 Err(e) => {
                     st.failed.insert(job.path.clone());
-                    Some(PipelineEvent::Failed { path: job.path, error: e.to_string() })
+                    Some(PipelineEvent::Failed { path: job.path, error: e.to_string(), kind: FailureKind::of(&e) })
                 }
             }
         };
@@ -375,5 +392,20 @@ impl Drop for Pipeline {
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_kind_tests {
+    use super::*;
+
+    #[test]
+    fn errors_map_to_kinds() {
+        assert_eq!(FailureKind::of(&Error::UnsupportedFormat), FailureKind::Unsupported);
+        let big = Error::TooLarge { width: 70000, height: 70000, bytes: 1 << 40 };
+        assert_eq!(FailureKind::of(&big), FailureKind::TooLarge { width: 70000, height: 70000 });
+        let gone = Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(FailureKind::of(&gone), FailureKind::NotFound);
+        assert_eq!(FailureKind::of(&Error::decode("x", "bad huffman table")), FailureKind::Other);
     }
 }
