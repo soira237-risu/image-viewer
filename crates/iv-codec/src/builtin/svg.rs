@@ -191,11 +191,14 @@ mod tests {
         // absolute path, file URL and a relative name resolved from the working directory
         assert_eq!(centre_alpha(&png.display().to_string()), 0, "absolute path");
         assert_eq!(centre_alpha(&format!("file:///{}", png.display().to_string().replace('\\', "/"))), 0);
+        // relative to the working directory (the temp folder can be on another drive, as on CI,
+        // so this file goes in a short-lived folder under the working directory)
         let cwd = std::env::current_dir().unwrap();
-        let rel = png.strip_prefix(&cwd).map(|p| p.display().to_string());
-        if let Ok(rel) = rel {
-            assert_eq!(centre_alpha(&rel), 0, "relative path");
-        }
+        let local = tempfile::tempdir_in(&cwd).unwrap();
+        std::fs::write(local.path().join("secret.png"), green_png()).unwrap();
+        let rel = local.path().join("secret.png").strip_prefix(&cwd).unwrap().to_path_buf();
+        assert!(rel.is_relative() && rel.is_file());
+        assert_eq!(centre_alpha(&rel.display().to_string()), 0, "relative path");
         // an embedded image is part of the document and still drawn
         assert_eq!(centre_alpha(&format!("data:image/png;base64,{}", base64(&green_png()))), 255);
     }

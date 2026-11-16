@@ -231,8 +231,11 @@ pub fn fix_ext(args: &[String]) -> ExitCode {
 /// For each output path, the index of an earlier input that writes the same file (compared
 /// case-insensitively on Windows, where `A.webp` and `a.webp` are one file), else `None`.
 fn earlier_with_same_dest(dests: &[PathBuf]) -> Vec<Option<usize>> {
+    // `./a/p.png` and `a/p.png` are one file: compare absolute paths (lexically normalised on
+    // Windows: `.` and `..` resolved without touching the disk)
     let key = |p: &Path| {
-        let s = p.to_string_lossy();
+        let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        let s = abs.to_string_lossy();
         if cfg!(windows) { s.to_lowercase().replace('/', "\\") } else { s.into_owned() }
     };
     let mut first: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -262,5 +265,9 @@ mod tests {
         let expected_upper = if cfg!(windows) { Some(0) } else { None };
         assert_eq!(earlier_with_same_dest(&dests), [None, None, Some(0), expected_upper, None]);
         assert!(earlier_with_same_dest(&[]).is_empty());
+        // one file spelled two ways
+        let dests: Vec<PathBuf> = ["./out/p.png", "out/p.png", "out/sub/../p.png"].iter().map(PathBuf::from).collect();
+        let expected_dotdot = if cfg!(windows) { Some(0) } else { None };
+        assert_eq!(earlier_with_same_dest(&dests), [None, Some(0), expected_dotdot]);
     }
 }

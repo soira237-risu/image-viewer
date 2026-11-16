@@ -274,8 +274,9 @@ fn dim_table() -> &'static [u8; 256] {
 pub fn render(frame: &mut Frame, pages: &[Page<'_>], selection: Option<ScreenRect>, style: &Style) {
     frame.pixels.fill(pack(style.background));
     let mut previous = std::mem::take(&mut frame.resampled);
-    for page in pages {
-        if let Some(r) = draw_page(frame, &mut previous, page, selection, style) {
+    for (i, page) in pages.iter().enumerate() {
+        let last = i + 1 == pages.len();
+        if let Some(r) = draw_page(frame, &mut previous, page, last, selection, style) {
             frame.resampled.push(r);
         }
     }
@@ -296,6 +297,7 @@ fn draw_page(
     frame: &mut Frame,
     previous: &mut Vec<Resampled>,
     page: &Page<'_>,
+    last: bool,
     selection: Option<ScreenRect>,
     style: &Style,
 ) -> Option<Resampled> {
@@ -347,8 +349,9 @@ fn draw_page(
         // only what is applied after resampling changed (selection, tones, background)
         Some(i) => previous.swap_remove(i),
         None => {
-            // reuse an old region's allocation for the new one
-            let mut pixels = match previous.pop() {
+            // reuse an old region's allocation for the new one, but only for the last page: an
+            // earlier page could take the region a later page still matches
+            let mut pixels = match if last { previous.pop() } else { None } {
                 Some(r) => r.pixels,
                 // zeroed by the OS as pages are touched, not written twice
                 None => vec![0u8; ow * oh * 4],
@@ -765,5 +768,30 @@ mod tests {
         assert!(f.resampled[0].key.picture == other.id);
         f.keep_resampled(false);
         assert!(f.resampled.is_empty() && f.resizer.size_of_internal_buffers() == 0, "freed when no longer useful");
+    }
+
+    #[test]
+    fn a_new_first_page_does_not_take_the_second_pages_region() {
+        let img = noisy_alpha(50, 40);
+        let (a, b, c) = (Picture::new(&img, true), Picture::new(&img, true), Picture::new(&img, true));
+        let g = Geometry::new((50, 40), Orientation::Normal, &[]);
+        let page = |picture, x| Page {
+            picture,
+            uv: g.display_to_stored_uv(),
+            adjusts: &[],
+            dest: ScreenRect { x, y: 2.0, width: 25.0, height: 20.0 },
+        };
+        let mut f = Frame::new(60, 30);
+        f.keep_resampled(true);
+        render(&mut f, &[page(&a, 0.0), page(&b, 30.0)], None, &Style::default());
+        let second = f.resampled[1].pixels.as_ptr();
+        // the left page changes, the right one does not
+        render(&mut f, &[page(&c, 0.0), page(&b, 30.0)], None, &Style::default());
+        assert_eq!(f.resampled.len(), 2);
+        assert!(f.resampled[0].key.picture == c.id && f.resampled[1].key.picture == b.id);
+        assert_eq!(f.resampled[1].pixels.as_ptr(), second, "the unchanged page is not resampled again");
+        let mut fresh = Frame::new(60, 30);
+        render(&mut fresh, &[page(&c, 0.0), page(&b, 30.0)], None, &Style::default());
+        assert_eq!(f.pixels(), fresh.pixels());
     }
 }

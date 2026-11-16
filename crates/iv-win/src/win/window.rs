@@ -221,10 +221,15 @@ fn default_rect(style: WINDOW_STYLE) -> (i32, i32, i32, i32) {
 }
 
 /// The saved restored rectangle, if it still lands on a connected monitor well enough to use.
+/// The rectangle stays in workspace coordinates (what `SetWindowPlacement` takes); it is checked
+/// against the monitors in screen coordinates, which differ by the primary monitor's work-area
+/// offset when the taskbar sits at the top or the left.
 fn visible_placement(p: WindowPlacement) -> Option<RECT> {
     let r = RECT { left: p.x, top: p.y, right: p.x + p.width, bottom: p.y + p.height };
     unsafe {
-        let monitor = MonitorFromRect(&r, MONITOR_DEFAULTTONULL);
+        let (dx, dy) = workspace_offset();
+        let screen = RECT { left: r.left + dx, top: r.top + dy, right: r.right + dx, bottom: r.bottom + dy };
+        let monitor = MonitorFromRect(&screen, MONITOR_DEFAULTTONULL);
         if monitor.is_invalid() {
             return None;
         }
@@ -232,7 +237,19 @@ fn visible_placement(p: WindowPlacement) -> Option<RECT> {
         if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
             return None;
         }
-        reachable(r, mi.rcWork).then_some(r)
+        reachable(screen, mi.rcWork).then_some(r)
+    }
+}
+
+/// Screen position of the workspace origin: the primary monitor's work area minus the monitor.
+fn workspace_offset() -> (i32, i32) {
+    unsafe {
+        let primary = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(primary, &mut mi).as_bool() {
+            return (0, 0);
+        }
+        (mi.rcWork.left - mi.rcMonitor.left, mi.rcWork.top - mi.rcMonitor.top)
     }
 }
 

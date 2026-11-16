@@ -1496,7 +1496,11 @@ impl App {
     /// has succeeded. While a save is running, `then` waits for it instead.
     fn confirm_discard(&mut self, then: AfterSave) -> bool {
         if self.saving.is_some() {
-            self.after_save = Some(then);
+            // the latest request wins, except that a pending close is never dropped for a
+            // navigation asked for after it
+            if !matches!(self.after_save, Some(AfterSave::Quit)) {
+                self.after_save = Some(then);
+            }
             self.set_notice(self.t().continue_after_save.into());
             return false;
         }
@@ -1627,11 +1631,15 @@ impl App {
         self.pipeline.invalidate(&deleted);
         self.edits.clear();
         self.selection = None;
+        // the image after the deleted one, or the new last one when it was last (then read-ahead
+        // runs backwards, towards the images still ahead of the user)
+        let mut went_back = false;
         let next = match self.folder.as_mut() {
-            Some(folder) => folder
-                .remove(&deleted)
-                .or_else(|| folder.index_after(&deleted))
-                .map(|i| i.min(folder.len().saturating_sub(1))),
+            Some(folder) => folder.remove(&deleted).or_else(|| folder.index_after(&deleted)).map(|i| {
+                let last = folder.len().saturating_sub(1);
+                went_back = i > last;
+                i.min(last)
+            }),
             None => {
                 // the folder listing has not come back yet (it was for the deleted file and
                 // will be dropped as stale): list the folder now
@@ -1655,7 +1663,7 @@ impl App {
         match next_path {
             Some((i, next)) => {
                 self.index = Some(i);
-                self.direction = 1;
+                self.direction = if went_back { -1 } else { 1 };
                 self.request(next);
             }
             None => {
@@ -2101,6 +2109,13 @@ impl App {
             }
             WM_CLOSE => {
                 self.quit();
+                Some(LRESULT(0))
+            }
+            // logoff or shutdown ends the process without WM_CLOSE: keep the placement anyway
+            WM_ENDSESSION if wp.0 != 0 => {
+                if let Some(h) = self.hwnd {
+                    self.remember_placement(h);
+                }
                 Some(LRESULT(0))
             }
             super::WM_APP_WAKE => Some(LRESULT(0)), // the caller drains the queues

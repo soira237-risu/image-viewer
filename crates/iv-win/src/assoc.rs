@@ -2,7 +2,7 @@
 //! current user only (`HKEY_CURRENT_USER`: no administrator rights, nothing machine-wide).
 //!
 //! This module decides which registry values that takes and what undoing it removes; the
-//! Windows side (`win::registry`) only writes and deletes them. A program cannot make itself
+//! Windows side (`win::shell`) only writes and deletes them. A program cannot make itself
 //! the default viewer on Windows 10 and 11: the user picks it in Default apps, and registering
 //! is what makes it appear there.
 

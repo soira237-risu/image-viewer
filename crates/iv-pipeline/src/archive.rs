@@ -262,9 +262,13 @@ fn seven_z_read(archive: &Path, entry: &str, limit: u64, cancel: &CancelToken) -
             let bytes = match kept {
                 Some(bytes) => bytes,
                 None => {
-                    let bytes: Arc<[u8]> = read_entry(data, e.size(), limit)
-                        .map_err(|err| std::io::Error::other(format!("{name}: {err}")))?
-                        .into();
+                    let bytes: Arc<[u8]> = match read_entry(data, e.size(), limit) {
+                        Ok(bytes) => bytes.into(),
+                        Err(err) if is_target => return Err(std::io::Error::other(format!("{name}: {err}")).into()),
+                        // an oversized page passed on the way is not kept, and does not stop
+                        // the walk to the page that was asked for (the decoder skips its data)
+                        Err(_) => return Ok(true),
+                    };
                     let mut cache = seven_z_cache();
                     cache.select(&id);
                     cache.insert(name, bytes.clone());
