@@ -314,7 +314,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     }
                 }
                 (ID_DEFAULTS, BN_CLICKED) => {
-                    let d = Settings { window: current.window, ..Settings::default() };
+                    let d = Settings::default();
                     fill(&d);
                     changed(d);
                 }

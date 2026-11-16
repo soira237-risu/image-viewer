@@ -241,7 +241,7 @@ pub fn run(opts: Options) -> i32 {
     }
     controls::init_common_controls();
 
-    let saved_place = opts.settings.window;
+    let saved_place = opts.settings_path.as_deref().and_then(|p| WindowPlacement::load(&WindowPlacement::path_for(p)));
     let app = App::new(opts.keymap, opts.trace, opts.settings, opts.settings_path, opts.no_activate);
     APP.with(|a| *a.borrow_mut() = Some(app));
     // decoding starts now and overlaps window creation

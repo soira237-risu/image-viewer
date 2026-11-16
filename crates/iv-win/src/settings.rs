@@ -1,7 +1,11 @@
 //! User settings, kept in `settings.toml` next to `keymap.toml`. Every field has a default, so a
 //! missing or partial file works, and out-of-range values are clamped rather than rejected.
+//!
+//! `settings.toml` belongs to the user: only the settings window's Save writes it. Where the main
+//! window was when it closed is program state and lives in its own `window.toml` beside it, so
+//! closing the window never creates or rewrites the settings file.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::i18n::Language;
 
@@ -27,13 +31,11 @@ pub struct Settings {
     /// The plain mouse wheel moves to the previous / next image (Ctrl+wheel zooms); off: the
     /// wheel zooms at the cursor.
     pub wheel_navigates: bool,
-    /// Where the main window was when it last closed (written on close, not by the settings
-    /// window). Kept last: TOML needs plain values before tables.
-    pub window: Option<WindowPlacement>,
 }
 
 /// The main window's restored (not maximised, not full-screen) rectangle in workspace
-/// coordinates, as `GetWindowPlacement` reports it, and whether it was maximised.
+/// coordinates, as `GetWindowPlacement` reports it, and whether it was maximised. Saved in
+/// `window.toml` next to the settings file when the window closes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowPlacement {
     pub x: i32,
@@ -47,10 +49,38 @@ impl WindowPlacement {
     /// Smallest restored size worth bringing back; anything smaller is treated as broken.
     pub const MIN_SIZE: i32 = 120;
 
+    /// First line of the state file, so whoever opens it knows where the settings are.
+    const HEADER: &str = "# Written by image-viewer when its window closes. Settings are in settings.toml.\n";
+
     fn plausible(&self) -> bool {
         let size_ok = |v: i32| (Self::MIN_SIZE..=100_000).contains(&v);
         let pos_ok = |v: i32| (-100_000..=100_000).contains(&v);
         size_ok(self.width) && size_ok(self.height) && pos_ok(self.x) && pos_ok(self.y)
+    }
+
+    /// The state file that goes with the settings file at `settings_path`: `window.toml` in the
+    /// same folder.
+    pub fn path_for(settings_path: &Path) -> PathBuf {
+        settings_path.with_file_name("window.toml")
+    }
+
+    /// The placement saved at `path`. A missing, unreadable or broken file, or one with an
+    /// implausible size or position, gives `None`: the window then opens at its default place.
+    pub fn load(path: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
+        toml::from_str::<Self>(&text).ok().filter(Self::plausible)
+    }
+
+    /// Writes the placement to `path` (creating its folder) unless the file already holds it.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        if Self::load(path) == Some(*self) {
+            return Ok(());
+        }
+        let body = toml::to_string(self).map_err(|e| e.to_string())?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        std::fs::write(path, format!("{}{body}", Self::HEADER)).map_err(|e| format!("{}: {e}", path.display()))
     }
 }
 
@@ -66,7 +96,6 @@ impl Default for Settings {
             save_quality: 90,
             language: Language::Korean,
             wheel_navigates: false,
-            window: None,
         }
     }
 }
@@ -79,7 +108,6 @@ impl Settings {
         self.nearest_above_zoom =
             if self.nearest_above_zoom.is_finite() { self.nearest_above_zoom.clamp(1.0, 64.0) } else { 3.0 };
         self.save_quality = self.save_quality.clamp(1, 100);
-        self.window = self.window.filter(WindowPlacement::plausible);
         self
     }
 
@@ -101,21 +129,6 @@ impl Settings {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
-    }
-
-    /// Records the window placement in the file at `path`, leaving every other value as the
-    /// file has it: changes made in the settings window but not saved stay unsaved. A file that
-    /// does not parse is left alone rather than replaced by defaults.
-    pub fn save_window(path: &Path, placement: WindowPlacement) -> Result<(), String> {
-        let (mut on_disk, warning) = Settings::load(path);
-        if let Some(w) = warning {
-            return Err(w);
-        }
-        if on_disk.window == Some(placement) {
-            return Ok(());
-        }
-        on_disk.window = Some(placement);
-        on_disk.save(path)
     }
 }
 
@@ -156,34 +169,49 @@ mod tests {
     }
 
     #[test]
-    fn window_placement_is_saved_alone_and_round_trips() {
+    fn window_placement_has_its_own_file_and_never_touches_settings() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("settings.toml");
+        let settings = dir.path().join("cfg").join("settings.toml");
+        let path = WindowPlacement::path_for(&settings);
+        assert_eq!(path, dir.path().join("cfg").join("window.toml"));
         let place = WindowPlacement { x: -1800, y: 40, width: 1600, height: 1000, maximized: true };
-        // no file yet: defaults plus the placement
-        Settings::save_window(&path, place).unwrap();
-        let (s, warning) = Settings::load(&path);
+
+        // no files yet: only the state file appears, no settings.toml full of frozen defaults
+        assert_eq!(WindowPlacement::load(&path), None);
+        place.save(&path).unwrap();
+        assert_eq!(WindowPlacement::load(&path), Some(place));
+        assert!(!settings.exists(), "closing the window must not create settings.toml");
+
+        // a hand-edited settings file (comments, partial keys, unknown language) stays byte for byte
+        let hand = "# mine\nwrap = false # keep\nlanguage = \"fr\"\n";
+        std::fs::write(&settings, hand).unwrap();
+        let moved = WindowPlacement { x: 10, ..place };
+        moved.save(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), hand);
+        assert_eq!(WindowPlacement::load(&path), Some(moved));
+
+        // the same placement again does not rewrite the file
+        std::fs::write(&path, format!("# note\n{}", toml::to_string(&moved).unwrap())).unwrap();
+        moved.save(&path).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with("# note\n"));
+
+        // nonsense sizes and broken files are ignored instead of restoring a 1-pixel window,
+        // and the next save replaces them
+        std::fs::write(&path, "x = 0\ny = 0\nwidth = 3\nheight = 900\nmaximized = false\n").unwrap();
+        assert_eq!(WindowPlacement::load(&path), None);
+        std::fs::write(&path, "x = \"left\"").unwrap();
+        assert_eq!(WindowPlacement::load(&path), None);
+        place.save(&path).unwrap();
+        assert_eq!(WindowPlacement::load(&path), Some(place));
+
+        // a settings file that still holds a [window] table from a development build loads fine
+        std::fs::write(
+            &settings,
+            "wrap = false\n[window]\nx = 0\ny = 0\nwidth = 800\nheight = 600\nmaximized = false\n",
+        )
+        .unwrap();
+        let (s, warning) = Settings::load(&settings);
         assert!(warning.is_none());
-        assert_eq!(s, Settings { window: Some(place), ..Settings::default() });
-
-        // other values on disk are kept, and unsaved in-memory values are not written
-        std::fs::write(&path, "wrap = false\nwheel_navigates = true\n").unwrap();
-        Settings::save_window(&path, place).unwrap();
-        let s = Settings::load(&path).0;
-        assert!(!s.wrap && s.wheel_navigates);
-        assert_eq!(s.window, Some(place));
-
-        // a file without the table (older versions) still loads
-        std::fs::write(&path, "save_quality = 70\n").unwrap();
-        assert_eq!(Settings::load(&path).0.window, None);
-
-        // nonsense sizes are dropped instead of restoring a 1-pixel window
-        std::fs::write(&path, "[window]\nx = 0\ny = 0\nwidth = 3\nheight = 900\nmaximized = false\n").unwrap();
-        assert_eq!(Settings::load(&path).0.window, None);
-
-        // a broken file is not overwritten
-        std::fs::write(&path, "wrap = \"maybe\"").unwrap();
-        assert!(Settings::save_window(&path, place).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "wrap = \"maybe\"");
+        assert!(!s.wrap);
     }
 }

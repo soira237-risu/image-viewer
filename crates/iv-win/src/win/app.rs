@@ -873,7 +873,8 @@ impl App {
     }
 
     /// Writes where the window is (its restored rectangle and whether it is maximised) to the
-    /// settings file, so the next start opens it there. Full screen is not remembered: the
+    /// window state file next to the settings file (never the settings file itself), so the
+    /// next start opens it there. Full screen is not remembered: the
     /// placement from before it is.
     fn remember_placement(&self, hwnd: HWND) {
         let Some(path) = &self.settings_path else { return };
@@ -892,7 +893,7 @@ impl App {
             || placement.showCmd == SW_SHOWMINIMIZED.0 as u32 && placement.flags.contains(WPF_RESTORETOMAXIMIZED);
         let saved =
             WindowPlacement { x: r.left, y: r.top, width: r.right - r.left, height: r.bottom - r.top, maximized };
-        match Settings::save_window(path, saved) {
+        match saved.save(&WindowPlacement::path_for(path)) {
             Ok(()) => self.trace.mark(&format!("window placement saved: {saved:?}")),
             Err(e) => eprintln!("window placement not saved: {e}"),
         }
@@ -1020,9 +1021,7 @@ impl App {
             UiEvent::SettingsChanged(s) => {
                 let language_changed = s.language != self.settings.language;
                 let help_changed = language_changed || s.wheel_navigates != self.settings.wheel_navigates;
-                // the window placement is the app's own, not the settings window's
-                let window = self.settings.window;
-                self.settings = Settings { window, ..s.clamped() };
+                self.settings = s.clamped();
                 if language_changed {
                     let t = self.t();
                     panel::set_language(t);
