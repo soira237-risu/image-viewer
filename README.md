@@ -28,7 +28,7 @@ GitHub 릴리스에서 `image-viewer-<버전>-x86_64-windows.zip`을 받아 원�
 - 요구 사항: Windows 10 1703 이상 또는 Windows 11, 64비트(x64)
 - zip 내용: `image-viewer.exe`(뷰어), `iv.exe`(명령줄 도구: 일괄 변환·확장자 바로잡기·정보·속도 측정), `README.md`, `CHANGELOG.md`, `LICENSE`, `THIRD-PARTY-NOTICES.txt`·`RUST-STD-COPYRIGHT.html`(실행 파일에 들어 있는 오픈 소스 패키지의 라이선스)
 - 받은 파일 확인: 같은 이름의 `.sha256` 파일에 든 값과 `Get-FileHash <zip 파일>`의 값이 같아야 함
-- `…-symbols.zip`은 비정상 종료 기록(`crash.log`)을 분석할 때 쓰는 디버그 기호(.pdb). 뷰어를 쓰는 데는 필요 없음. 배포한 실행 파일에는 .pdb가 없어 `crash.log`의 뷰어 프레임은 이름 대신 `[image-viewer.exe+0x…]`(실행 파일 시작 주소로부터의 오프셋)로 남고, 보고서 머리의 `image:` 줄에 시작 주소·링크 시각·.pdb의 GUID가 있음. 같은 릴리스의 `image-viewer.exe`와 풀어 둔 기호 폴더로 `pwsh -File scripts/symbolize.ps1 -CrashLog <crash.log> -Exe <image-viewer.exe> -Symbols <기호 폴더>`를 실행하면 Windows의 `dbghelp.dll`로 각 프레임에 함수 이름과 파일:줄을 붙여 보여 줌 (디버거 설치 불필요, 다른 빌드의 crash.log면 경고)
+- `…-symbols.zip`은 비정상 종료 기록(`crash.log`)을 분석할 때 쓰는 디버그 기호(.pdb). 뷰어를 쓰는 데는 필요 없음. 배포한 실행 파일에는 .pdb가 없어 `crash.log`의 뷰어 프레임은 이름 대신 `[image-viewer.exe+0x…]`(실행 파일 시작 주소로부터의 오프셋)로 남고, 보고서 머리의 `image:` 줄에 시작 주소·링크 시각·.pdb의 GUID가 있음. 같은 릴리스의 `image-viewer.exe`와 풀어 둔 기호 폴더로 `pwsh -File scripts/symbolize.ps1 -CrashLog <crash.log> -Exe <image-viewer.exe> -Symbols <기호 폴더>`를 실행하면 Windows의 `dbghelp.dll`로 각 프레임에 함수 이름과 파일:줄을 붙여 보여 줌 (디버거 설치 불필요, 다른 빌드의 crash.log면 경고). `symbolize.ps1`은 배포 zip이 아니라 저장소에 있고, 프레임을 실행 파일 이름으로 찾으므로 `-Exe`에는 crash.log에 적힌 것과 같은 이름의 파일을 줄 것(이름을 바꿔 쓴 경우 그 이름으로 복사)
 - 기본 뷰어로 쓰려면 [기본 뷰어로 쓰기](#기본-뷰어로-쓰기) 참고. 지울 때는 등록을 해제(`image-viewer --unregister`)한 뒤 폴더를 지우고, 설정(`%APPDATA%\image-viewer`)과 기록(`%LOCALAPPDATA%\image-viewer`)도 필요 없으면 지움
 
 ### 선택 코덱 (HEIC·RAW)
@@ -92,7 +92,7 @@ cargo build --release
 | Shift+드래그, C 또는 Enter | 영역 선택, 선택 영역으로 자르기 |
 | Ctrl+Z / Ctrl+Y | 실행 취소 / 다시 실행 |
 | Ctrl+S / Ctrl+Shift+S | 저장 / 다른 이름으로 저장 |
-| Ctrl+E | 확장자 바로잡기 (내용은 WebP인데 이름이 `.jpg`이면 `.webp`로 이름만 바꿈, 같은 이름의 파일은 덮어쓰지 않음) |
+| Ctrl+E | 확장자 바로잡기 (내용은 WebP인데 이름이 `.jpg`이면 `.webp`로 이름만 바꿈, 같은 이름의 파일은 덮어쓰지 않음). 파일 복사·경로 복사와 마찬가지로 화면에 보이는 이미지에만 |
 | Delete | 휴지통으로 옮기기 (먼저 물음, 설정에서 끌 수 있음; 저장하지 않은 편집이 있으면 항상 물음). 화면에 보이는 이미지만 옮기고, 누르고 있어도 한 장만. 다음 이미지로 넘어감 (마지막이었으면 이전 이미지) |
 | Ctrl+C | 이미지 복사 (보이는 그대로: 편집 적용, 투명도 유지) |
 | Ctrl+Alt+C | 파일 복사 (탐색기에 붙여 넣으면 파일이 복사됨) |

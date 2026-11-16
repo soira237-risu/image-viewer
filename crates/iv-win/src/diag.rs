@@ -244,14 +244,16 @@ fn pe_headers(image: &[u8]) -> Option<Headers> {
 }
 
 /// The CodeView record in a loaded image's debug directory (`debug` from [`pe_headers`]).
-fn codeview(image: &[u8], (rva, len): (usize, usize)) -> Option<Pdb> {
-    let directory = image.get(rva..rva.checked_add(len)?)?;
+/// `read(rva, len)` gives that many bytes of the image, or `None` past its end: only the
+/// directory and the record are borrowed, never the whole image.
+fn codeview<'a>(read: impl Fn(usize, usize) -> Option<&'a [u8]>, (rva, len): (usize, usize)) -> Option<Pdb> {
+    let directory = read(rva, len)?;
     directory.as_chunks::<DEBUG_ENTRY_SIZE>().0.iter().find_map(|entry| {
         if u32_at(entry, 12)? != IMAGE_DEBUG_TYPE_CODEVIEW {
             return None;
         }
         let (size, at) = (u32_at(entry, 16)? as usize, u32_at(entry, 20)? as usize);
-        let data = image.get(at..at.checked_add(size)?)?;
+        let data = read(at, size)?;
         if data.get(..4)? != b"RSDS" {
             return None;
         }
@@ -277,9 +279,14 @@ pub fn this_image() -> Option<Image> {
     let base = std::ptr::with_exposed_provenance::<u8>((&raw const __ImageBase).expose_provenance());
     // SAFETY: the first page of a loaded image (its headers) is always mapped and readable
     let headers = pe_headers(unsafe { std::slice::from_raw_parts(base, 4096) })?;
-    // SAFETY: the whole of a loaded image (SizeOfImage bytes from its base) is mapped, and the
-    // parts read here (the debug directory and its CodeView record) are read-only data
-    let whole = unsafe { std::slice::from_raw_parts(base, headers.size) };
+    // only the ranges asked for are borrowed (the debug directory and its CodeView record): a
+    // slice over the whole image would alias the writable sections other threads may be writing
+    let read = |at: usize, len: usize| {
+        let end = at.checked_add(len)?;
+        // SAFETY: the whole of a loaded image (SizeOfImage bytes from its base) is mapped, and
+        // these two ranges are read-only data that nothing writes
+        (end <= headers.size).then(|| unsafe { std::slice::from_raw_parts(base.add(at), len) })
+    };
     let name = std::env::current_exe()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -289,7 +296,7 @@ pub fn this_image() -> Option<Image> {
         base: base as usize,
         size: headers.size,
         timestamp: headers.timestamp,
-        pdb: codeview(whole, headers.debug),
+        pdb: codeview(read, headers.debug),
     })
 }
 
@@ -416,6 +423,11 @@ pub fn install_panic_hook(language: Language, show: impl Fn(&str, &str) + Send +
 mod tests {
     use super::*;
 
+    /// Reads ranges of an image held in a buffer, the way `this_image` reads the loaded one.
+    fn within<'a>(image: &'a [u8]) -> impl Fn(usize, usize) -> Option<&'a [u8]> {
+        move |at, len| image.get(at..at.checked_add(len)?)
+    }
+
     #[test]
     fn the_log_is_appended_to_and_never_grows_past_its_limits() {
         let dir = tempfile::tempdir().unwrap();
@@ -498,7 +510,7 @@ mod tests {
         let image = synthetic_image(br"C:\build\image_viewer.pdb");
         let headers = pe_headers(&image).unwrap();
         assert_eq!(headers, Headers { size: 0x2000, timestamp: 0x6543_21ab, debug: (0x1000, 56) });
-        let pdb = codeview(&image, headers.debug).unwrap();
+        let pdb = codeview(within(&image), headers.debug).unwrap();
         assert_eq!(pdb.name, "image_viewer.pdb");
         assert_eq!(pdb.age, 3);
         assert_eq!(pdb.to_string(), "image_viewer.pdb {76543210-BA98-FEDC-0102-030405060708} age 3");
@@ -528,13 +540,13 @@ mod tests {
         assert_eq!(pe_headers(&not_pe), None);
         // a debug directory or CodeView record pointing past the image
         let headers = pe_headers(&image).unwrap();
-        assert_eq!(codeview(&image, (0x1ff0, 56)), None);
-        assert_eq!(codeview(&image[..0x1110], headers.debug), None);
-        assert_eq!(codeview(&image, (usize::MAX - 4, 56)), None);
+        assert_eq!(codeview(within(&image), (0x1ff0, 56)), None);
+        assert_eq!(codeview(within(&image[..0x1110]), headers.debug), None);
+        assert_eq!(codeview(within(&image), (usize::MAX - 4, 56)), None);
         // no terminating zero: the name runs to the end of the record
         let mut unterminated = image.clone();
         unterminated[0x1118 + 5] = b'!';
-        assert_eq!(codeview(&unterminated, headers.debug).unwrap().name, "x.pdb!");
+        assert_eq!(codeview(within(&unterminated), headers.debug).unwrap().name, "x.pdb!");
     }
 
     #[test]

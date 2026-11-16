@@ -111,7 +111,8 @@ strings! {
     // startup: settings and keymap files that could not be used
     settings_unreadable, keymap_warning, settings_backed_up,
     // deleting, the clipboard and Explorer
-    delete_confirm, delete_unsaved, deleted, delete_failed, archive_page_delete, delete_not_shown, copied_image,
+    delete_confirm, delete_unsaved, deleted, delete_failed, archive_page_delete, delete_not_shown, not_shown_yet,
+    copied_image,
     copied_file,
     copied_path, copy_not_loaded, clipboard_failed, archive_page_copy_file, show_in_folder_failed,
     // "Open with" registration and the About box
@@ -302,6 +303,7 @@ pub static KO: Strings = Strings {
     delete_failed: "{name}을(를) 휴지통으로 옮기지 못했습니다",
     archive_page_delete: "압축파일 안의 페이지는 지울 수 없습니다",
     delete_not_shown: "{name}이(가) 아직 화면에 나오지 않아 휴지통으로 옮기지 않았습니다",
+    not_shown_yet: "{name}이(가) 아직 화면에 나오지 않았습니다",
     copied_image: "이미지를 복사했습니다 ({width}×{height})",
     copied_file: "파일을 복사했습니다",
     copied_path: "경로를 복사했습니다",
@@ -450,6 +452,7 @@ pub static EN: Strings = Strings {
     delete_failed: "{name} was not moved to the Recycle Bin",
     archive_page_delete: "pages inside an archive cannot be deleted",
     delete_not_shown: "{name} is not on screen yet, so it was not moved to the Recycle Bin",
+    not_shown_yet: "{name} is not on screen yet",
     copied_image: "copied the image ({width}×{height})",
     copied_file: "copied the file",
     copied_path: "copied the path",

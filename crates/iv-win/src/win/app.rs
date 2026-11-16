@@ -756,6 +756,17 @@ impl App {
         matches!((&self.current, &self.display), (Some(c), Some(d)) if d.path == c.path)
     }
 
+    /// Whether a command on the current file acts on what the user sees: the image on screen, or
+    /// a file that cannot be shown at all (the title bar names it). Otherwise says so in a notice.
+    fn file_in_view(&mut self, path: &Path) -> bool {
+        let unreadable = self.error.is_some() && self.display.is_none();
+        if self.current_shown() || unreadable {
+            return true;
+        }
+        self.set_notice(fill(self.t().not_shown_yet, &[("name", &file_name(path))]));
+        false
+    }
+
     fn update_title(&self) {
         let Some(hwnd) = self.hwnd else { return };
         let t = self.t();
@@ -1550,6 +1561,9 @@ impl App {
         if iv_pipeline::archive::split(&old).is_some() {
             return self.set_notice(self.t().archive_page_rename.into());
         }
+        if !self.file_in_view(&old) {
+            return;
+        }
         let t = self.t();
         match iv_pipeline::export::fix_extension(&iv_codec::default_registry(), &old) {
             Ok(None) => self.set_notice(t.extension_ok.into()),
@@ -1751,6 +1765,9 @@ impl App {
         if iv_pipeline::archive::split(&path).is_some() {
             return self.set_notice(t.archive_page_copy_file.into());
         }
+        if !self.file_in_view(&path) {
+            return;
+        }
         match shell::copy_file(hwnd, &path) {
             Ok(()) => self.set_notice(t.copied_file.into()),
             Err(e) => self.set_notice(fill(t.clipboard_failed, &[("error", &e)])),
@@ -1761,6 +1778,9 @@ impl App {
     /// itself opens: the archive's path followed by the page's name.
     fn copy_path(&mut self) {
         let (Some(hwnd), Some(path)) = (self.hwnd, self.current_file()) else { return };
+        if !self.file_in_view(&path) {
+            return;
+        }
         let t = self.t();
         match shell::copy_text(hwnd, &path.to_string_lossy()) {
             Ok(()) => self.set_notice(t.copied_path.into()),
