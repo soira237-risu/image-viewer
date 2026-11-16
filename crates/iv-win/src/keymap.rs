@@ -130,6 +130,7 @@ const DEFAULTS: &[(&str, Command)] = &[
     ("Ctrl+O", Command::FileOpen),
     ("Ctrl+S", Command::FileSave),
     ("Ctrl+Shift+S", Command::FileSaveAs),
+    ("Ctrl+E", Command::FileFixExtension),
     ("R", Command::EditRotateCw),
     ("Ctrl+R", Command::EditRotateCw),
     ("L", Command::EditRotateCcw),
@@ -212,7 +213,7 @@ impl Keymap {
     /// Applies overrides from TOML text. Returns one warning per entry that could not be used;
     /// valid entries still apply.
     pub fn apply_toml(&mut self, text: &str) -> Result<Vec<String>, String> {
-        let file: KeymapFile = toml::from_str(text).map_err(|e| e.to_string())?;
+        let file: KeymapFile = toml::from_str(text).map_err(|e| crate::settings::toml_error(text, &e))?;
         let mut warnings = Vec::new();
         let mut entries: Vec<_> = file.bindings.into_iter().collect();
         entries.sort(); // deterministic warning order
@@ -302,7 +303,8 @@ mod tests {
         // a bad entry leaves the default in place
         assert_eq!(map.lookup(&Chord::parse("Ctrl+O").unwrap()), Some(Command::FileOpen));
         assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(map.apply_toml("not toml [").is_err());
+        let broken = map.apply_toml("[bindings]\n\"Q\" = \"app.quit\"\nnot toml [").unwrap_err();
+        assert!(broken.starts_with("line 3: ") && !broken.contains('\n'), "one line for the title bar: {broken}");
     }
 
     #[test]

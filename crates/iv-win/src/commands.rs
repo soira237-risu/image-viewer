@@ -7,6 +7,8 @@ pub enum Command {
     FileOpen,
     FileSave,
     FileSaveAs,
+    /// Rename the file so its extension matches its content (a WebP named `.jpg`).
+    FileFixExtension,
     EditRotateCw,
     EditRotateCcw,
     EditFlipH,
@@ -40,10 +42,11 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 26] = [
+    pub const ALL: [Command; 27] = [
         Command::FileOpen,
         Command::FileSave,
         Command::FileSaveAs,
+        Command::FileFixExtension,
         Command::EditRotateCw,
         Command::EditRotateCcw,
         Command::EditFlipH,
@@ -74,6 +77,7 @@ impl Command {
             Command::FileOpen => "file.open",
             Command::FileSave => "file.save",
             Command::FileSaveAs => "file.save_as",
+            Command::FileFixExtension => "file.fix_extension",
             Command::EditRotateCw => "edit.rotate_cw",
             Command::EditRotateCcw => "edit.rotate_ccw",
             Command::EditFlipH => "edit.flip_h",

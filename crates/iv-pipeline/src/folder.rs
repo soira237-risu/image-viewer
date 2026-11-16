@@ -77,6 +77,15 @@ impl FolderList {
         &self.files
     }
 
+    /// `old` was renamed to `new` on disk: the list follows, keeping its natural order. Returns
+    /// the new entry's index, or `None` when `old` is not in the list.
+    pub fn rename(&mut self, old: &Path, new: &Path) -> Option<usize> {
+        let i = self.files.iter().position(|f| f == old)?;
+        self.files[i] = new.to_path_buf();
+        self.files.sort_by(|a, b| natural_cmp(&name_of(a), &name_of(b)));
+        self.files.iter().position(|f| f == new)
+    }
+
     /// Index of `path` in the list: the exact path, else the same file name (case-insensitively
     /// on Windows).
     pub fn position(&self, path: &Path) -> Option<usize> {
@@ -152,6 +161,23 @@ mod tests {
         let inside = FolderList::scan(&sub).unwrap();
         let names: Vec<_> = inside.files().iter().map(|p| name_of(p)).collect();
         assert_eq!(names, ["p1.png", "p2.png", "p10.png"]);
+    }
+
+    #[test]
+    fn a_renamed_entry_keeps_the_natural_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.jpg", "b.jpg", "c.png"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let mut list = FolderList::scan(dir.path()).unwrap();
+        // b.jpg became b.webp: still between a and c
+        assert_eq!(list.rename(&dir.path().join("b.jpg"), &dir.path().join("b.webp")), Some(1));
+        // a.jpg became z.png: moves to the end
+        assert_eq!(list.rename(&dir.path().join("a.jpg"), &dir.path().join("z.png")), Some(2));
+        let names: Vec<_> = list.files().iter().map(|p| name_of(p)).collect();
+        assert_eq!(names, ["b.webp", "c.png", "z.png"]);
+        assert_eq!(list.rename(&dir.path().join("gone.jpg"), &dir.path().join("x.jpg")), None);
+        assert_eq!(list.len(), 3);
     }
 
     #[test]

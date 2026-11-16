@@ -1,9 +1,10 @@
 //! Saving edits and converting formats: one path for the viewer's Save / Save As, batch
 //! conversion and `iv convert`.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use iv_codec::encode::{EncodeOptions, Encoders, Metadata, prepare};
 use iv_codec::{Registry, exif_edit};
@@ -38,15 +39,34 @@ pub enum ExportOutcome {
     },
 }
 
+/// Numbers the temporary files of one process, so two writes never share one.
+static TEMP_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// A new temporary file next to `dest` that no other writer uses: the name carries the process
+/// id and a per-process serial number, and the file must not exist yet.
+fn create_temp(dir: &Path, name: &str) -> std::io::Result<(PathBuf, File)> {
+    loop {
+        let serial = TEMP_SERIAL.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".{name}.{}-{serial}.tmp", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(f) => return Ok((tmp, f)),
+            // left behind by a killed process that had the same id: take the next number
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Writes `dest` so that it is either fully the new content or untouched: the data goes to a
-/// temporary file in the same folder, is flushed to disk, then renamed over `dest`. A failure in
-/// `write` leaves no temporary file and the old `dest` intact.
+/// temporary file of its own in the same folder, is flushed to disk, then renamed over `dest`.
+/// A failure in `write` leaves no temporary file and the old `dest` intact. Concurrent writes
+/// to the same `dest` (two saves, a batch conversion with two inputs for one output) each use
+/// their own temporary file, so `dest` ends up as one complete result, never a mix.
 pub fn write_atomic(dest: &Path, write: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<()> {
     let dir = dest.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = dest.file_name().ok_or_else(|| Error::Io(std::io::Error::other("destination has no file name")))?;
-    let tmp = dir.join(format!(".{}.{}.tmp", name.to_string_lossy(), std::process::id()));
+    let (tmp, mut f) = create_temp(dir, &name.to_string_lossy())?;
     let result = (|| {
-        let mut f = File::create(&tmp)?;
         write(&mut f)?;
         f.flush()?;
         f.sync_all()?;

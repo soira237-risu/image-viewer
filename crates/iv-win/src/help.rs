@@ -7,10 +7,11 @@ use crate::keymap::{Chord, Keymap};
 use crate::wheel::{WheelUse, wheel_use};
 
 /// Commands in the order the help lists them: files, browsing, view, editing, windows.
-const ORDER: [Command; 26] = [
+const ORDER: [Command; 27] = [
     Command::FileOpen,
     Command::FileSave,
     Command::FileSaveAs,
+    Command::FileFixExtension,
     Command::NavNext,
     Command::NavPrev,
     Command::NavFirst,

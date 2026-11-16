@@ -39,11 +39,11 @@ fn main() {
     let trace = Trace::new(start, trace_enabled);
 
     let keymap_path = keymap_path.or_else(|| config_dir().map(|d| d.join("keymap.toml")));
-    let (keymap, warnings) = match keymap_path {
+    let (keymap, keymap_warnings) = match keymap_path {
         Some(path) => Keymap::load(&path),
         None => (Keymap::defaults(), Vec::new()),
     };
-    for w in warnings {
+    for w in &keymap_warnings {
         eprintln!("keymap: {w}");
     }
     let settings_path = settings_path.or_else(|| config_dir().map(|d| d.join("settings.toml")));
@@ -51,8 +51,17 @@ fn main() {
         Some(p) => Settings::load(p),
         None => (Settings::default(), None),
     };
-    if let Some(w) = warning {
+    if let Some(w) = &warning {
         eprintln!("settings: {w}");
     }
-    std::process::exit(run(Options { file, keymap, settings, settings_path, trace, no_activate }));
+    std::process::exit(run(Options {
+        file,
+        keymap,
+        keymap_warnings,
+        settings,
+        settings_warning: warning,
+        settings_path,
+        trace,
+        no_activate,
+    }));
 }

@@ -44,7 +44,11 @@ thread_local! {
 pub struct Options {
     pub file: Option<PathBuf>,
     pub keymap: Keymap,
+    /// Entries of the keymap file that could not be used (shown once in the title bar).
+    pub keymap_warnings: Vec<String>,
     pub settings: Settings,
+    /// Why the settings file could not be read (its defaults are in use).
+    pub settings_warning: Option<String>,
     pub settings_path: Option<PathBuf>,
     pub trace: Trace,
     pub no_activate: bool,
@@ -242,7 +246,9 @@ pub fn run(opts: Options) -> i32 {
     controls::init_common_controls();
 
     let saved_place = opts.settings_path.as_deref().and_then(|p| WindowPlacement::load(&WindowPlacement::path_for(p)));
-    let app = App::new(opts.keymap, opts.trace, opts.settings, opts.settings_path, opts.no_activate);
+    let mut app = App::new(opts.keymap, opts.trace, opts.settings, opts.settings_path, opts.no_activate);
+    // without a console these would go unseen: the title bar says them until the first command
+    app.startup_warnings(opts.settings_warning, &opts.keymap_warnings);
     APP.with(|a| *a.borrow_mut() = Some(app));
     // decoding starts now and overlaps window creation
     if let Some(file) = opts.file {

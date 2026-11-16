@@ -17,6 +17,7 @@ const ITEMS: &[Option<Command>] = &[
     Some(Command::FileOpen),
     Some(Command::FileSave),
     Some(Command::FileSaveAs),
+    Some(Command::FileFixExtension),
     None,
     Some(Command::NavNext),
     Some(Command::NavPrev),
@@ -78,6 +79,7 @@ fn flags_for(cmd: Command, s: &MenuState) -> MENU_ITEM_FLAGS {
     let enabled = match cmd {
         Command::FileSave => s.edited,
         Command::FileSaveAs
+        | Command::FileFixExtension
         | Command::EditRotateCw
         | Command::EditRotateCcw
         | Command::EditFlipH

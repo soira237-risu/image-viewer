@@ -67,8 +67,53 @@ pub fn in_place_format(encoders: &Encoders, format: FormatId) -> Option<FormatId
     encoders.for_format(format).map(|_| format)
 }
 
+/// Whether Save may write the edits over the file itself, and if not, why it asks for a new
+/// name instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InPlace {
+    /// Write over the file in this format: what its content is, whatever its extension says.
+    Write(FormatId),
+    /// A page inside a ZIP or 7z: there is no file of its own to write.
+    ArchivePage,
+    /// More than one frame: saving keeps only the first, which would destroy the animation.
+    Animated,
+    /// Nothing can write the format (HEIC, RAW, …).
+    NotWritable,
+}
+
+impl InPlace {
+    /// Why the save goes to Save As instead, in the UI language; `None` for [`InPlace::Write`].
+    pub fn reason(self, t: &Strings) -> Option<&'static str> {
+        match self {
+            InPlace::Write(_) => None,
+            InPlace::ArchivePage => Some(t.archive_page_save_as),
+            InPlace::Animated => Some(t.animated_save_as),
+            InPlace::NotWritable => Some(t.format_not_writable),
+        }
+    }
+}
+
+/// How the image at `path` can be saved in place. `format` is the format its content was
+/// identified as (not the extension's), `animated` whether it has more than one frame.
+pub fn in_place(encoders: &Encoders, path: &Path, format: FormatId, animated: bool) -> InPlace {
+    if iv_pipeline::archive::split(path).is_some() {
+        InPlace::ArchivePage
+    } else if animated {
+        InPlace::Animated
+    } else {
+        in_place_format(encoders, format).map_or(InPlace::NotWritable, InPlace::Write)
+    }
+}
+
+/// The file name's extension names another format than the content's (a WebP called `.jpg`);
+/// an extension that names no format is not a mismatch.
+pub fn extension_mismatch(path: &Path, content: FormatId) -> bool {
+    path.extension().and_then(|e| e.to_str()).and_then(FormatId::from_extension).is_some_and(|f| f != content)
+}
+
 /// Builds the request for saving `source` with `ops` to `dest`; the format follows `dest`'s
-/// extension. `quality` applies to formats that have a quality option (JPEG, WebP, AVIF).
+/// extension (Save As). `quality` applies to formats that have a quality option (JPEG, WebP,
+/// AVIF).
 pub fn save_request(
     encoders: &Encoders,
     source: &Path,
@@ -78,6 +123,20 @@ pub fn save_request(
 ) -> Result<ExportRequest, SaveError> {
     let ext = dest.extension().and_then(|e| e.to_str()).unwrap_or_default().to_string();
     let format = FormatId::from_extension(&ext).ok_or(SaveError::UnknownExtension(ext))?;
+    save_request_as(encoders, source, ops, dest, format, quality)
+}
+
+/// Builds the request for saving `source` with `ops` to `dest` as `format`, whatever `dest`'s
+/// extension says: Save keeps the file's own (content) format, so a WebP named `.jpg` stays
+/// WebP and keeps its transparency and lossless pixels.
+pub fn save_request_as(
+    encoders: &Encoders,
+    source: &Path,
+    ops: &[Op],
+    dest: PathBuf,
+    format: FormatId,
+    quality: u8,
+) -> Result<ExportRequest, SaveError> {
     let Some(encoder) = encoders.for_format(format) else {
         return Err(SaveError::NotWritable(format));
     };
@@ -206,5 +265,48 @@ mod tests {
         assert!(save_request(&enc, Path::new("a.jpg"), &[], PathBuf::from("out.xyz"), 90).is_err());
         assert_eq!(in_place_format(&enc, FormatId::Heif), None);
         assert_eq!(in_place_format(&enc, FormatId::Png), Some(FormatId::Png));
+    }
+
+    #[test]
+    fn saving_in_place_keeps_the_content_format_not_the_extension() {
+        let enc = Encoders::default();
+        let dir = tempfile::tempdir().unwrap();
+        // WebP bytes named .jpg: written back as WebP (alpha and lossless pixels survive)
+        let webp_as_jpg = dir.path().join("x.jpg");
+        let InPlace::Write(format) = in_place(&enc, &webp_as_jpg, FormatId::Webp, false) else { panic!() };
+        let r = save_request_as(&enc, &webp_as_jpg, &[Op::rotate_cw()], webp_as_jpg.clone(), format, 80).unwrap();
+        assert_eq!((r.format, r.dest.as_path()), (FormatId::Webp, webp_as_jpg.as_path()));
+        // a PNG with an unknown extension still saves (the extension is never consulted)
+        let odd = dir.path().join("x.dat");
+        assert_eq!(in_place(&enc, &odd, FormatId::Png, false), InPlace::Write(FormatId::Png));
+        assert_eq!(save_request_as(&enc, &odd, &[], odd.clone(), FormatId::Png, 80).unwrap().format, FormatId::Png);
+        assert!(extension_mismatch(&webp_as_jpg, FormatId::Webp));
+        assert!(!extension_mismatch(Path::new("a.JPEG"), FormatId::Jpeg));
+        assert!(!extension_mismatch(&odd, FormatId::Png), "an unknown extension is not a mismatch");
+        // a JPEG named .heic is writable: its content is JPEG
+        assert_eq!(in_place(&enc, &dir.path().join("x.heic"), FormatId::Jpeg, false), InPlace::Write(FormatId::Jpeg));
+        assert_eq!(in_place(&enc, &dir.path().join("x.heic"), FormatId::Heif, false), InPlace::NotWritable);
+    }
+
+    #[test]
+    fn animations_and_archive_pages_are_never_saved_in_place() {
+        use crate::i18n::{EN, KO};
+        let enc = Encoders::default();
+        let dir = tempfile::tempdir().unwrap();
+        // GIF, WebP and PNG can all be written, but only as one frame
+        for f in [FormatId::Gif, FormatId::Webp, FormatId::Png] {
+            assert_eq!(in_place(&enc, &dir.path().join("a.gif"), f, true), InPlace::Animated);
+        }
+        // a page inside a real archive has no file of its own
+        let cbz = dir.path().join("book.cbz");
+        std::fs::write(&cbz, b"PK").unwrap();
+        let page = iv_pipeline::archive::entry_path(&cbz, "p/001.png");
+        assert_eq!(in_place(&enc, &page, FormatId::Png, false), InPlace::ArchivePage);
+        assert_eq!(in_place(&enc, &page, FormatId::Gif, true), InPlace::ArchivePage);
+        // every refusal says why, in both languages
+        for kind in [InPlace::ArchivePage, InPlace::Animated, InPlace::NotWritable] {
+            assert!(kind.reason(&KO).is_some_and(|s| !s.is_empty()) && kind.reason(&EN).is_some());
+        }
+        assert_eq!(InPlace::Write(FormatId::Png).reason(&EN), None);
     }
 }

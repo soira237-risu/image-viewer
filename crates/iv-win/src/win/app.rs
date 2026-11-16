@@ -6,13 +6,14 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use iv_codec::Decoded;
 use iv_codec::encode::Encoders;
 use iv_core::{FormatId, ImageBuf, ImageInfo, Orientation};
 use iv_ops::{EditStack, Geometry, Op, Rect};
-use iv_pipeline::export::{ExportOutcome, export};
+use iv_pipeline::export::{ExportOutcome, ExportRequest, export};
 use iv_pipeline::{FolderList, Pipeline, PipelineConfig, PipelineEvent, prefetch_order, step};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient};
@@ -26,7 +27,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use super::dialogs::{self, Answer, Filter};
 use super::{UiEvent, help, keys, menu, panel, settings_window, wake, wide};
 use crate::commands::Command;
-use crate::edit::{in_place_format, save_request, selection_on_screen, selection_rect};
+use crate::edit::{
+    InPlace, extension_mismatch, in_place, save_request, save_request_as, selection_on_screen, selection_rect,
+};
 use crate::i18n::{Strings, fill};
 use crate::keymap::{Chord, Keymap};
 use crate::panel::{PanelAction, PanelContext, PanelState, typed_resize};
@@ -156,6 +159,26 @@ impl Playback {
     }
 }
 
+/// A save running on its own thread. Until its result arrives nothing may change what it
+/// writes or race it: edits, another save and renaming are refused, and moving to another
+/// image or quitting waits for it ([`AfterSave`]).
+struct SaveJob {
+    source: PathBuf,
+    /// The edits being written; they leave the edit stack only if it still holds exactly these
+    /// when the save succeeds.
+    ops: Vec<Op>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// What the user asked for while a save was running (or by answering Yes to "save changes?"):
+/// done once the save has succeeded, dropped if it failed (the edits are still unsaved).
+#[derive(Clone, Debug, PartialEq)]
+enum AfterSave {
+    Navigate(Command),
+    Open(PathBuf),
+    Quit,
+}
+
 /// Window placement saved while in full screen.
 struct Restore {
     style: isize,
@@ -199,7 +222,9 @@ pub struct App {
     first_frame_logged: bool,
     no_activate: bool,
     edits: EditStack,
-    saving: bool,
+    saving: Option<SaveJob>,
+    /// Waiting for the running save to succeed.
+    after_save: Option<AfterSave>,
     encoders: Encoders,
     /// Two-page view: `Some(right_to_left)` when on.
     spread: Option<bool>,
@@ -273,7 +298,8 @@ impl App {
             first_frame_logged: false,
             no_activate,
             edits: EditStack::new(),
-            saving: false,
+            saving: None,
+            after_save: None,
             encoders: Encoders::default(),
             spread: None,
             panel: PanelState { quality: settings.save_quality, ..PanelState::default() },
@@ -289,6 +315,17 @@ impl App {
 
     pub fn trace(&self, what: &str) {
         self.trace.mark(what);
+    }
+
+    /// Problems with the settings or keymap file, found before the window existed. They stay
+    /// in the title bar until the first command (no timer runs before the window exists).
+    pub fn startup_warnings(&mut self, settings: Option<String>, keymap: &[String]) {
+        let t = self.t();
+        let mut parts: Vec<String> = settings.iter().map(|e| fill(t.settings_unreadable, &[("error", e)])).collect();
+        parts.extend(keymap.iter().map(|e| fill(t.keymap_warning, &[("error", e)])));
+        if !parts.is_empty() {
+            self.notice = Some(parts.join(" · "));
+        }
     }
 
     /// The window exists now.
@@ -353,7 +390,7 @@ impl App {
     /// Opens a file (or an archive's or a folder's first image) and lists its folder in the
     /// background.
     pub fn open(&mut self, path: PathBuf) {
-        if !self.confirm_discard() {
+        if !self.confirm_discard(AfterSave::Open(path.clone())) {
             return;
         }
         self.trace.mark(&format!("open {}", path.display()));
@@ -511,7 +548,7 @@ impl App {
         };
         let Some(target) = target else { return };
         let Some(path) = folder.get(target).map(Path::to_path_buf) else { return };
-        if !self.confirm_discard() {
+        if !self.confirm_discard(AfterSave::Navigate(cmd)) {
             return;
         }
         self.direction = if matches!(cmd, Command::NavPrev | Command::NavFirst) { -1 } else { 1 };
@@ -718,8 +755,13 @@ impl App {
                             (None, _) => format!("{} · {}", info.format, t.loading),
                         };
                         let edited = if self.edits.is_empty() { "" } else { "*" };
-                        let saving = if self.saving { format!(" · {}", t.saving) } else { String::new() };
-                        format!("{position}{name}{edited} — {w}×{h}{zoom} — {state}{saving}")
+                        let saving = if self.saving.is_some() { format!(" · {}", t.saving) } else { String::new() };
+                        let mismatch = if extension_mismatch(&cur.path, info.format) {
+                            format!(" · {}", t.extension_mismatch)
+                        } else {
+                            String::new()
+                        };
+                        format!("{position}{name}{edited} — {w}×{h}{zoom} — {state}{mismatch}{saving}")
                     }
                 }
             }
@@ -809,20 +851,21 @@ impl App {
         self.clear_notice();
         match cmd {
             Command::FileOpen => self.open_dialog(),
-            Command::FileSave => self.save_in_place(),
-            Command::FileSaveAs => self.save_as(),
+            Command::FileSave => self.save_in_place(None),
+            Command::FileSaveAs => self.save_as(None),
+            Command::FileFixExtension => self.fix_extension(),
             Command::EditRotateCw => self.edit(Op::rotate_cw()),
             Command::EditRotateCcw => self.edit(Op::rotate_ccw()),
             Command::EditFlipH => self.edit(Op::flip_h()),
             Command::EditFlipV => self.edit(Op::flip_v()),
             Command::EditCrop => self.crop_to_selection(),
             Command::EditUndo => {
-                if self.edits.undo() {
+                if !self.busy_saving() && self.edits.undo() {
                     self.after_edit_change();
                 }
             }
             Command::EditRedo => {
-                if self.edits.redo() {
+                if !self.busy_saving() && self.edits.redo() {
                     self.after_edit_change();
                 }
             }
@@ -862,7 +905,7 @@ impl App {
 
     /// Closes the window unless unsaved edits make the user change their mind.
     pub fn quit(&mut self) {
-        if self.confirm_discard() {
+        if self.confirm_discard(AfterSave::Quit) {
             if let Some(h) = self.hwnd {
                 self.remember_placement(h);
                 unsafe {
@@ -1056,7 +1099,12 @@ impl App {
     fn save_settings(&mut self) {
         let Some(path) = self.settings_path.clone() else { return };
         match self.settings.save(&path) {
-            Ok(()) => self.trace.mark(&format!("settings saved to {}", path.display())),
+            Ok(None) => self.trace.mark(&format!("settings saved to {}", path.display())),
+            // the file it replaced could not be read (the warning at startup): say where it went
+            Ok(Some(kept)) => {
+                self.trace.mark(&format!("settings saved to {}; old file kept as {}", path.display(), kept.display()));
+                self.set_notice(fill(self.t().settings_backed_up, &[("name", &file_name(&kept))]));
+            }
             Err(e) => self.set_notice(fill(self.t().settings_error, &[("error", &e)])),
         }
     }
@@ -1067,7 +1115,8 @@ impl App {
             size: if shown { self.geometry().map(|g| g.size) } else { None },
             can_undo: self.edits.can_undo(),
             can_redo: self.edits.can_redo(),
-            edited: !self.edits.is_empty(),
+            // Save is greyed out while the edits are being saved
+            edited: !self.edits.is_empty() && self.saving.is_none(),
         }
     }
 
@@ -1088,6 +1137,8 @@ impl App {
         let size = self.panel_context().size;
         self.clear_notice();
         match action {
+            // the slider springs back (sync_panel below) to the adjustment being saved
+            PanelAction::Adjust(_) if self.busy_saving() => {}
             PanelAction::Adjust(a) => {
                 self.panel.adjust = a;
                 if self.spread.is_some() {
@@ -1100,8 +1151,8 @@ impl App {
             PanelAction::Edit(op) => self.edit(op),
             PanelAction::Undo => self.run_command(Command::EditUndo, false),
             PanelAction::Redo => self.run_command(Command::EditRedo, false),
-            PanelAction::Save => self.save_in_place(),
-            PanelAction::SaveAs => self.save_as(),
+            PanelAction::Save => self.save_in_place(None),
+            PanelAction::SaveAs => self.save_as(None),
             PanelAction::Quality(q) => {
                 self.panel.quality = q;
                 self.settings.save_quality = q;
@@ -1195,6 +1246,9 @@ impl App {
     }
 
     fn edit(&mut self, op: Op) {
+        if self.busy_saving() {
+            return;
+        }
         if self.spread.is_some() {
             self.set_notice(self.t().edit_single_page.into());
             return;
@@ -1212,23 +1266,61 @@ impl App {
         }
     }
 
-    /// Saves the edits over the current file in its own format.
-    fn save_in_place(&mut self) {
+    /// A save is running: says so and returns `true`, so the caller leaves alone what the save
+    /// is writing.
+    fn busy_saving(&mut self) -> bool {
+        if self.saving.is_some() {
+            self.set_notice(self.t().save_busy.into());
+        }
+        self.saving.is_some()
+    }
+
+    /// Saves the edits over the current file in the format of its content (a WebP named `.jpg`
+    /// stays WebP). An animation, a page inside an archive or a format nothing can write goes
+    /// to Save As instead, with the reason in the title bar. `then` runs once the save has
+    /// succeeded.
+    fn save_in_place(&mut self, then: Option<AfterSave>) {
+        if self.busy_saving() {
+            return;
+        }
         let Some(cur) = &self.current else { return };
+        let Some(info) = &cur.info else { return };
         if self.edits.is_empty() {
             return;
         }
-        match cur.info.as_ref().and_then(|i| in_place_format(&self.encoders, i.format)) {
-            Some(_) => {
-                let dest = cur.path.clone();
-                self.start_save(dest);
+        let animated =
+            info.frame_count.is_some_and(|n| n > 1) || cur.full.as_ref().is_some_and(|d| d.animation.is_some());
+        let target = in_place(&self.encoders, &cur.path, info.format, animated);
+        self.trace.mark(&format!("save in place: {target:?}"));
+        match target {
+            InPlace::Write(format) => {
+                let req = save_request_as(
+                    &self.encoders,
+                    &cur.path,
+                    self.edits.active(),
+                    cur.path.clone(),
+                    format,
+                    self.panel.quality,
+                );
+                match req {
+                    Ok(req) => self.start_save(req, then),
+                    Err(e) => self.set_notice(e.message(self.t())),
+                }
             }
-            // e.g. HEIC or RAW: nothing to write them with
-            None => self.save_as(),
+            refused => {
+                if let Some(reason) = refused.reason(self.t()) {
+                    self.set_notice(reason.into());
+                }
+                self.save_as(then);
+            }
         }
     }
 
-    fn save_as(&mut self) {
+    /// Asks for a file name and saves there; the format follows the name's extension.
+    fn save_as(&mut self, then: Option<AfterSave>) {
+        if self.busy_saving() {
+            return;
+        }
         let (Some(cur), Some(hwnd)) = (&self.current, self.hwnd) else { return };
         let encoders: Vec<_> = self.encoders.all().map(|e| e.info().format).collect();
         let filters: Vec<Filter> = encoders
@@ -1245,56 +1337,91 @@ impl App {
         let stem = cur.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         // archive pages have no folder of their own on disk
         let dir = cur.path.parent().filter(|d| d.is_dir()).map(Path::to_path_buf);
-        if let Some(dest) = dialogs::save_file(hwnd, &filters, dir.as_deref(), &stem, index, ext) {
-            self.start_save(dest);
+        let Some(dest) = dialogs::save_file(hwnd, &filters, dir.as_deref(), &stem, index, ext) else { return };
+        let Some(cur) = &self.current else { return };
+        match save_request(&self.encoders, &cur.path, self.edits.active(), dest, self.panel.quality) {
+            Ok(req) => self.start_save(req, then),
+            Err(e) => self.set_notice(e.message(self.t())),
         }
     }
 
-    /// Exports on a worker thread; the result arrives as [`AppEvent::Saved`].
-    fn start_save(&mut self, dest: PathBuf) {
-        let Some(cur) = &self.current else { return };
-        if self.saving {
+    /// Exports on a worker thread; the result arrives as [`AppEvent::Saved`]. Until then the
+    /// save is isolated: see [`SaveJob`].
+    fn start_save(&mut self, req: ExportRequest, then: Option<AfterSave>) {
+        if self.saving.is_some() {
             return;
         }
-        let req = match save_request(&self.encoders, &cur.path, self.edits.active(), dest, self.panel.quality) {
-            Ok(r) => r,
-            Err(e) => return self.set_notice(e.message(self.t())),
-        };
-        self.saving = true;
-        self.update_title();
+        let ops = req.ops.clone();
+        let source = req.source.clone();
         let (tx, encoders) = (self.tx.clone(), self.encoders.clone());
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("save".into())
             .spawn(move || {
                 let result = export(&iv_codec::default_registry(), &encoders, &req).map_err(|e| e.to_string());
                 send(&tx, AppEvent::Saved { source: req.source, dest: req.dest, result });
             })
             .expect("spawn save thread");
+        self.trace.mark(&format!("saving {}", source.display()));
+        self.saving = Some(SaveJob { source, ops, thread: Some(thread) });
+        self.after_save = then;
+        self.sync_panel();
+        self.update_title();
     }
 
     fn handle_saved(&mut self, source: PathBuf, dest: PathBuf, result: Result<ExportOutcome, String>) {
-        self.saving = false;
+        let Some(mut job) = self.saving.take() else { return };
+        // the thread has sent its last word: this returns at once
+        if let Some(thread) = job.thread.take() {
+            let _ = thread.join();
+        }
+        let then = self.after_save.take();
         match result {
             Ok(outcome) => {
+                if then.is_some() {
+                    // "will continue when the save finishes": it is happening now
+                    self.clear_notice();
+                }
                 self.trace.mark(&format!("saved {} ({outcome:?})", dest.display()));
                 self.pipeline.invalidate(&dest);
+                // the edits are in the file now, unless the image or its edits changed since the
+                // save started: those are kept as unsaved edits
+                let unchanged = self.current.as_ref().is_some_and(|c| c.path == job.source)
+                    && self.edits.active() == job.ops.as_slice();
                 let saved_edits = self.edits.active().to_vec();
-                self.edits.clear();
-                if dest == source {
-                    // keep the old frame up until the new decode arrives, marked stale, and
-                    // drawn with the edits it was saved with: without them the old pixels would
-                    // be stretched into the edited (rotated, cropped) size
-                    if let Some(d) = self.display.as_mut().filter(|d| d.path == source) {
-                        d.kind = Shown::Preview;
-                        d.saved_edits = Some(saved_edits);
+                if unchanged {
+                    self.edits.clear();
+                }
+                if let ExportOutcome::Encoded { dropped_frames, .. } = outcome {
+                    if dropped_frames > 0 {
+                        self.set_notice(fill(self.t().first_frame_only, &[("count", &dropped_frames.to_string())]));
                     }
-                    self.current = None;
-                    self.request(source);
-                } else {
+                }
+                if dest == source {
+                    if unchanged {
+                        // keep the old frame up until the new decode arrives, marked stale, and
+                        // drawn with the edits it was saved with: without them the old pixels
+                        // would be stretched into the edited (rotated, cropped) size
+                        if let Some(d) = self.display.as_mut().filter(|d| d.path == source) {
+                            d.kind = Shown::Preview;
+                            d.saved_edits = Some(saved_edits);
+                        }
+                        self.current = None;
+                        self.request(source);
+                    }
+                } else if then.is_none() && unchanged {
                     self.open(dest);
+                }
+                if let Some(then) = then {
+                    self.trace.mark(&format!("after the save: {then:?}"));
+                    match then {
+                        AfterSave::Navigate(cmd) => self.navigate(cmd, false),
+                        AfterSave::Open(path) => self.open(path),
+                        AfterSave::Quit => self.quit(),
+                    }
                 }
             }
             Err(e) => {
+                // what was waiting for the save does not happen: the edits are still unsaved
                 eprintln!("save failed: {e}");
                 let message = fill(self.t().save_failed, &[("error", &e)]);
                 self.set_notice(message.clone());
@@ -1307,9 +1434,16 @@ impl App {
         self.update_title();
     }
 
-    /// Before the current image is replaced or the app closes: asks to save unsaved edits.
-    /// `true` means go ahead.
-    fn confirm_discard(&mut self) -> bool {
+    /// Before the current image is replaced or the app closes (`then` says which): asks to
+    /// save unsaved edits. `true` means go ahead now. On Yes the save runs like Save (in the
+    /// background, or through Save As when the file cannot take it) and `then` follows once it
+    /// has succeeded. While a save is running, `then` waits for it instead.
+    fn confirm_discard(&mut self, then: AfterSave) -> bool {
+        if self.saving.is_some() {
+            self.after_save = Some(then);
+            self.set_notice(self.t().continue_after_save.into());
+            return false;
+        }
         if self.edits.is_empty() {
             return true;
         }
@@ -1317,38 +1451,73 @@ impl App {
         let name = self.current.as_ref().map(|c| file_name(&c.path)).unwrap_or_default();
         match dialogs::ask_yes_no_cancel(hwnd, &fill(self.t().ask_save_changes, &[("name", &name)])) {
             Answer::Yes => {
-                let Some(cur) = &self.current else { return true };
-                let format_ok = cur.info.as_ref().and_then(|i| in_place_format(&self.encoders, i.format)).is_some();
-                if !format_ok {
-                    self.set_notice(self.t().format_not_writable.into());
-                    return false;
-                }
-                let t = self.t();
-                let saved =
-                    save_request(&self.encoders, &cur.path, self.edits.active(), cur.path.clone(), self.panel.quality)
-                        .map_err(|e| e.message(t))
-                        .and_then(|req| {
-                            export(&iv_codec::default_registry(), &self.encoders, &req)
-                                .map_err(|e| fill(t.save_failed, &[("error", &e.to_string())]))
-                        });
-                match saved {
-                    Ok(_) => {
-                        let path = cur.path.clone();
-                        self.pipeline.invalidate(&path);
-                        self.edits.clear();
-                        true
-                    }
-                    Err(message) => {
-                        self.set_notice(message);
-                        false
-                    }
-                }
+                self.save_in_place(Some(then));
+                false
             }
             Answer::No => {
                 self.edits.clear();
                 true
             }
             Answer::Cancel => false,
+        }
+    }
+
+    /// Renames the current file so its extension matches its content (a WebP named `.jpg`
+    /// becomes `.webp`). Never overwrites a file; edits and the view stay as they are.
+    fn fix_extension(&mut self) {
+        if self.busy_saving() {
+            return;
+        }
+        let Some(cur) = &self.current else { return };
+        let old = cur.path.clone();
+        if iv_pipeline::archive::split(&old).is_some() {
+            return self.set_notice(self.t().archive_page_rename.into());
+        }
+        let t = self.t();
+        match iv_pipeline::export::fix_extension(&iv_codec::default_registry(), &old) {
+            Ok(None) => self.set_notice(t.extension_ok.into()),
+            Ok(Some(new)) => {
+                self.trace.mark(&format!("renamed {} -> {}", old.display(), new.display()));
+                self.renamed(&old, &new);
+                self.set_notice(fill(t.extension_fixed, &[("name", &file_name(&new))]));
+            }
+            Err(iv_core::Error::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let target = old.with_extension(
+                    self.current.as_ref().and_then(|c| c.info.as_ref()).map_or("", |i| i.format.canonical_extension()),
+                );
+                self.set_notice(fill(t.extension_exists, &[("name", &file_name(&target))]));
+            }
+            Err(e) => self.set_notice(fill(t.extension_fix_failed, &[("error", &e.to_string())])),
+        }
+    }
+
+    /// The current file is now called `new`: everything that knew it by `old` follows.
+    fn renamed(&mut self, old: &Path, new: &Path) {
+        self.pipeline.invalidate(old);
+        if let Some(folder) = self.folder.as_mut() {
+            if let Some(i) = folder.rename(old, new) {
+                self.index = Some(i);
+            }
+        }
+        if let Some(d) = self.display.as_mut().filter(|d| d.path == old) {
+            d.path = new.to_path_buf();
+        }
+        let Some(cur) = self.current.as_mut() else { return };
+        cur.path = new.to_path_buf();
+        if cur.full.is_none() {
+            // still loading under the old name: ask again under the new one (edits stay)
+            self.request(new.to_path_buf());
+        }
+        self.update_title();
+    }
+}
+
+impl Drop for App {
+    /// A save the user asked for always finishes, even when the window closed under it (the
+    /// process would otherwise end and kill the save thread, leaving the file unsaved).
+    fn drop(&mut self) {
+        if let Some(thread) = self.saving.as_mut().and_then(|job| job.thread.take()) {
+            let _ = thread.join();
         }
     }
 }

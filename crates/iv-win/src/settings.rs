@@ -80,7 +80,7 @@ impl WindowPlacement {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        std::fs::write(path, format!("{}{body}", Self::HEADER)).map_err(|e| format!("{}: {e}", path.display()))
+        write_text(path, &format!("{}{body}", Self::HEADER))
     }
 }
 
@@ -116,20 +116,75 @@ impl Settings {
         match std::fs::read_to_string(path) {
             Ok(text) => match toml::from_str::<Settings>(&text) {
                 Ok(s) => (s.clamped(), None),
-                Err(e) => (Settings::default(), Some(format!("{}: {e}", path.display()))),
+                Err(e) => (Settings::default(), Some(format!("{}: {}", path.display(), toml_error(&text, &e)))),
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Settings::default(), None),
             Err(e) => (Settings::default(), Some(format!("{}: {e}", path.display()))),
         }
     }
 
-    pub fn save(&self, path: &Path) -> Result<(), String> {
+    /// Writes the settings to `path` atomically (a crash or a full disk leaves the old file
+    /// whole). A file there that cannot be read as settings (the one [`Settings::load`] warned
+    /// about, which the user may have edited by hand) is first kept beside it as
+    /// `settings.toml.bak` (or `.bak2`, … when taken); its new name is returned.
+    pub fn save(&self, path: &Path) -> Result<Option<PathBuf>, String> {
         let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+        let kept = keep_unreadable(path)?;
+        write_text(path, &text)?;
+        Ok(kept)
     }
+}
+
+/// A TOML parse error in one line (`line 3: missing comma …`), fit for the title bar; the
+/// error's own text spans several lines with a drawing of the spot.
+pub fn toml_error(text: &str, e: &toml::de::Error) -> String {
+    let message = e.message().trim().replace('\n', " ");
+    match e.span() {
+        Some(span) => {
+            let line = text.get(..span.start).unwrap_or(text).matches('\n').count() + 1;
+            format!("line {line}: {message}")
+        }
+        None => message,
+    }
+}
+
+/// Replaces `path` with `text` atomically.
+fn write_text(path: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    iv_pipeline::export::write_atomic(path, |f| f.write_all(text.as_bytes()))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Copies `path` to a free `<name>.bak`, `<name>.bak2`, … when it exists but does not parse as
+/// settings, so replacing it never destroys what the user wrote.
+fn keep_unreadable(path: &Path) -> Result<Option<PathBuf>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let readable = std::str::from_utf8(&bytes).is_ok_and(|text| toml::from_str::<Settings>(text).is_ok());
+    if readable {
+        return Ok(None);
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    for n in 1..1000 {
+        let suffix = if n == 1 { String::new() } else { n.to_string() };
+        let bak = path.with_file_name(format!("{name}.bak{suffix}"));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&bak) {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(&bytes).and_then(|()| f.sync_all()).map_err(|e| format!("{}: {e}", bak.display()))?;
+                return Ok(Some(bak));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", bak.display())),
+        }
+    }
+    Err(format!("{}: no free backup name", path.display()))
 }
 
 #[cfg(test)]
@@ -147,7 +202,7 @@ mod tests {
             language: Language::English,
             ..Default::default()
         };
-        s.save(&path).unwrap();
+        assert_eq!(s.save(&path).unwrap(), None, "nothing to keep when there is no file");
         assert_eq!(Settings::load(&path), (s.clone(), None));
 
         std::fs::write(&path, "wrap = false\n").unwrap();
@@ -166,6 +221,38 @@ mod tests {
         assert!(warning.is_some());
         s = Settings::load(&dir.path().join("none.toml")).0;
         assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn saving_over_an_unreadable_file_keeps_it_and_writes_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let broken = "# my colours\nbackground = [10, 20\nwrap = false\n";
+        std::fs::write(&path, broken).unwrap();
+        let (loaded, warning) = Settings::load(&path);
+        let warning = warning.expect("a broken file is reported");
+        // one line, with where the problem is: it is shown in the title bar
+        assert!(!warning.contains('\n') && warning.contains("settings.toml: line 3: "), "{warning}");
+        assert_eq!(loaded, Settings::default());
+
+        // the first save keeps the hand-edited file instead of silently replacing it
+        let kept = loaded.save(&path).unwrap().expect("the unreadable file is kept");
+        assert_eq!(kept, dir.path().join("settings.toml.bak"));
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), broken);
+        assert_eq!(Settings::load(&path), (Settings::default(), None));
+        // now the file is readable: later saves just replace it
+        assert_eq!(loaded.save(&path).unwrap(), None);
+
+        // broken again: an existing backup is never overwritten
+        std::fs::write(&path, "wrap = \"maybe\"").unwrap();
+        assert_eq!(loaded.save(&path).unwrap(), Some(dir.path().join("settings.toml.bak2")));
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), broken);
+
+        // only the settings, the two backups and no temporary file
+        let mut names: Vec<_> =
+            std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["settings.toml", "settings.toml.bak", "settings.toml.bak2"]);
     }
 
     #[test]

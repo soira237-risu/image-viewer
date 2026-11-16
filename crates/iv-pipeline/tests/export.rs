@@ -171,6 +171,54 @@ fn a_failed_write_leaves_the_original_untouched() {
 }
 
 #[test]
+fn overlapping_writes_to_one_file_never_share_a_temporary_file() {
+    // a second save of the same file starts while the first is still writing (a save running
+    // on a thread, or two batch inputs that map to one output)
+    let dir = tempfile::tempdir().unwrap();
+    let dest = write(dir.path(), "same.png", b"original");
+    let outer = write_atomic(&dest, |f| {
+        f.write_all(b"first save, ")?;
+        let inner = write_atomic(&dest, |g| g.write_all(b"second save"));
+        assert!(inner.is_ok(), "{inner:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"second save");
+        f.write_all(b"complete")
+    });
+    assert!(outer.is_ok(), "{outer:?}");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"first save, complete", "one whole result, not a mix");
+    let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert_eq!(names, ["same.png"], "no temporary file left behind");
+
+    // threads racing on one destination: every write succeeds and the file is one of them
+    let contents: Vec<Vec<u8>> = (0..8u8).map(|i| vec![i; 64 * 1024]).collect();
+    std::thread::scope(|s| {
+        for c in &contents {
+            let dest = &dest;
+            s.spawn(move || write_atomic(dest, |f| f.write_all(c)).unwrap());
+        }
+    });
+    let result = std::fs::read(&dest).unwrap();
+    assert!(contents.contains(&result), "the file is exactly one of the writes");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn saving_a_misnamed_file_in_its_content_format_keeps_alpha() {
+    // a PNG with transparency named .jpg, saved over itself as what it really is
+    let dir = tempfile::tempdir().unwrap();
+    let mut img = pattern();
+    img.put_pixel(0, 0, Rgba([1, 2, 3, 0]));
+    let src = write(dir.path(), "really-png.jpg", &encode(&img, ImageFormat::Png));
+    run(&request(&src, &src, FormatId::Png, vec![Op::flip_h()]));
+    let reg = default_registry();
+    let id = reg.identify(&Source::from_path(&src)).unwrap();
+    assert_eq!(id.format, FormatId::Png, "still PNG bytes under the old name");
+    let d = reg.decode(&Source::from_path(&src), &CancelToken::never()).unwrap();
+    assert!(d.info.has_alpha);
+    // flipped: the transparent pixel is now top right
+    assert_eq!(d.image.data()[(5 * 4) + 3], 0, "transparency kept");
+}
+
+#[test]
 fn animated_sources_report_dropped_frames() {
     let dir = tempfile::tempdir().unwrap();
     let mut gif = Vec::new();

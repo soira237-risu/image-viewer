@@ -130,13 +130,25 @@ pub fn convert(args: &[String]) -> ExitCode {
     }
 
     let paths = files::collect(&a.inputs);
-    let failed = AtomicUsize::new(0);
-    let started = Instant::now();
-    paths.par_iter().for_each(|path| {
-        let dest = match &a.out_dir {
+    let dests: Vec<PathBuf> = paths
+        .iter()
+        .map(|path| match &a.out_dir {
             Some(dir) => with_extension(&dir.join(path.file_name().unwrap_or_default()), a.format),
             None => with_extension(path, a.format),
-        };
+        })
+        .collect();
+    let earlier = earlier_with_same_dest(&dests);
+    let failed = AtomicUsize::new(0);
+    let started = Instant::now();
+    paths.par_iter().enumerate().for_each(|(i, path)| {
+        let dest = dests[i].clone();
+        // two inputs for one output (photo.jpg and photo.png -> photo.webp): only the first is
+        // converted, so the other is never silently lost or mixed into it
+        if let Some(first) = earlier[i] {
+            failed.fetch_add(1, Ordering::Relaxed);
+            println!("FAIL  {}: same output {} as {}", path.display(), dest.display(), paths[first].display());
+            return;
+        }
         // converting in place (same name, same format) also replaces the original: ask for it
         if dest.exists() && !a.overwrite {
             println!("skip  {} (exists; --overwrite to replace)", dest.display());
@@ -209,4 +221,41 @@ pub fn fix_ext(args: &[String]) -> ExitCode {
         }
     }
     if failed > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+/// For each output path, the index of an earlier input that writes the same file (compared
+/// case-insensitively on Windows, where `A.webp` and `a.webp` are one file), else `None`.
+fn earlier_with_same_dest(dests: &[PathBuf]) -> Vec<Option<usize>> {
+    let key = |p: &Path| {
+        let s = p.to_string_lossy();
+        if cfg!(windows) { s.to_lowercase().replace('/', "\\") } else { s.into_owned() }
+    };
+    let mut first: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    dests
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            first.get(&key(d)).copied().or_else(|| {
+                first.insert(key(d), i);
+                None
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inputs_that_share_an_output_are_found() {
+        let dests: Vec<PathBuf> =
+            ["out/photo.webp", "out/other.webp", "out/photo.webp", "out/PHOTO.webp", "out/x.webp"]
+                .iter()
+                .map(PathBuf::from)
+                .collect();
+        let expected_upper = if cfg!(windows) { Some(0) } else { None };
+        assert_eq!(earlier_with_same_dest(&dests), [None, None, Some(0), expected_upper, None]);
+        assert!(earlier_with_same_dest(&[]).is_empty());
+    }
 }

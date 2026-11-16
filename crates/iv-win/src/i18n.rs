@@ -82,7 +82,7 @@ macro_rules! strings {
 
 strings! {
     // commands (menu items, panel buttons)
-    open, save, save_as, rotate_cw, rotate_ccw, flip_h, flip_v, crop, undo, redo,
+    open, save, save_as, fix_extension, rotate_cw, rotate_ccw, flip_h, flip_v, crop, undo, redo,
     next, previous, first, last, fit, actual_size, zoom_in, zoom_out, fullscreen,
     two_pages, right_to_left, edit_panel, settings, help, escape, quit,
     // edit panel
@@ -100,6 +100,13 @@ strings! {
     cached, saving, no_images_inside, edit_single_page, format_not_writable, settings_error,
     panel_error, settings_window_error, help_window_error, cannot_open, unsupported_format, too_large,
     file_not_found, unknown_file_type, cannot_write_format,
+    // saving safely
+    archive_page_save_as, animated_save_as, first_frame_only, save_busy, continue_after_save,
+    // fixing a wrong extension
+    extension_mismatch, extension_fixed, extension_ok, extension_exists, extension_fix_failed,
+    archive_page_rename,
+    // startup: settings and keymap files that could not be used
+    settings_unreadable, keymap_warning, settings_backed_up,
 }
 
 impl Strings {
@@ -109,6 +116,7 @@ impl Strings {
             Command::FileOpen => self.open,
             Command::FileSave => self.save,
             Command::FileSaveAs => self.save_as,
+            Command::FileFixExtension => self.fix_extension,
             Command::EditRotateCw => self.rotate_cw,
             Command::EditRotateCcw => self.rotate_ccw,
             Command::EditFlipH => self.flip_h,
@@ -153,6 +161,7 @@ pub static KO: Strings = Strings {
     open: "열기…",
     save: "저장",
     save_as: "다른 이름으로 저장…",
+    fix_extension: "확장자 바로잡기",
     rotate_cw: "오른쪽으로 회전",
     rotate_ccw: "왼쪽으로 회전",
     flip_h: "좌우 뒤집기",
@@ -224,7 +233,7 @@ pub static KO: Strings = Strings {
     saving: "저장 중…",
     no_images_inside: "{name}: 이미지가 없습니다",
     edit_single_page: "편집은 한 쪽 보기에서만 됩니다 (D 키)",
-    format_not_writable: "이 형식으로는 저장할 수 없습니다. 다른 이름으로 저장을 사용하세요",
+    format_not_writable: "이 형식으로는 저장할 수 없어 다른 이름으로 저장합니다",
     settings_error: "설정: {error}",
     panel_error: "편집 패널을 만들 수 없습니다: {error}",
     settings_window_error: "설정 창을 만들 수 없습니다: {error}",
@@ -235,12 +244,27 @@ pub static KO: Strings = Strings {
     file_not_found: "{name}: 파일이 없습니다",
     unknown_file_type: "알 수 없는 파일 형식입니다: .{ext}",
     cannot_write_format: "{format} 형식으로는 저장할 수 없습니다",
+    archive_page_save_as: "압축파일 안의 페이지는 그 자리에 저장할 수 없어 다른 이름으로 저장합니다",
+    animated_save_as: "움직이는 이미지는 첫 프레임만 저장되므로 원본을 지키려고 다른 이름으로 저장합니다",
+    first_frame_only: "첫 프레임만 저장했습니다 (나머지 {count}프레임은 저장하지 않음)",
+    save_busy: "저장하는 중입니다. 끝난 뒤에 다시 하세요",
+    continue_after_save: "저장이 끝나면 이어서 진행합니다",
+    extension_mismatch: "확장자가 내용과 다름",
+    extension_fixed: "이름을 {name}(으)로 바꿨습니다",
+    extension_ok: "확장자가 이미 내용과 맞습니다",
+    extension_exists: "{name} 파일이 이미 있어 이름을 바꾸지 않았습니다",
+    extension_fix_failed: "확장자를 바꾸지 못했습니다: {error}",
+    archive_page_rename: "압축파일 안의 페이지는 이름을 바꿀 수 없습니다",
+    settings_unreadable: "설정 파일을 읽지 못해 기본값을 씁니다 ({error})",
+    keymap_warning: "키맵: {error}",
+    settings_backed_up: "설정을 저장했습니다. 읽지 못한 예전 파일은 {name}(으)로 보관했습니다",
 };
 
 pub static EN: Strings = Strings {
     open: "Open…",
     save: "Save",
     save_as: "Save as…",
+    fix_extension: "Fix extension",
     rotate_cw: "Rotate right",
     rotate_ccw: "Rotate left",
     flip_h: "Flip horizontally",
@@ -312,7 +336,7 @@ pub static EN: Strings = Strings {
     saving: "saving…",
     no_images_inside: "{name}: no images inside",
     edit_single_page: "editing works in single-page view (press D)",
-    format_not_writable: "this format cannot be written; use Save As",
+    format_not_writable: "this format cannot be written; choose a new file",
     settings_error: "settings: {error}",
     panel_error: "cannot create the edit panel: {error}",
     settings_window_error: "cannot create the settings window: {error}",
@@ -323,6 +347,20 @@ pub static EN: Strings = Strings {
     file_not_found: "{name}: file not found",
     unknown_file_type: "unknown file type: .{ext}",
     cannot_write_format: "{format} files cannot be written",
+    archive_page_save_as: "pages inside an archive cannot be saved in place; choose a new file",
+    animated_save_as: "saving an animation keeps only its first frame; choose a new file to keep the original",
+    first_frame_only: "saved the first frame only ({count} more frames not saved)",
+    save_busy: "a save is in progress; try again when it finishes",
+    continue_after_save: "will continue when the save finishes",
+    extension_mismatch: "extension does not match the content",
+    extension_fixed: "renamed to {name}",
+    extension_ok: "the extension already matches the content",
+    extension_exists: "{name} already exists; nothing was renamed",
+    extension_fix_failed: "cannot fix the extension: {error}",
+    archive_page_rename: "pages inside an archive cannot be renamed",
+    settings_unreadable: "the settings file could not be read; using defaults ({error})",
+    keymap_warning: "keymap: {error}",
+    settings_backed_up: "settings saved; the unreadable old file was kept as {name}",
 };
 
 #[cfg(test)]
