@@ -25,7 +25,8 @@ In order, and it stops at the first failure:
 6. scripts/notices.ps1 writes THIRD-PARTY-NOTICES.txt; then the zips and the .sha256.
 
 Output in -OutDir (default target/dist): the zip, <zip>.sha256, the symbols zip (image_viewer.pdb
-and iv.pdb, for reading crash backtraces; not for users) and release-notes.md.
+and iv.pdb, for reading crash backtraces with scripts/symbolize.ps1; not for users) and
+release-notes.md.
 
 .EXAMPLE
 pwsh -File scripts/package.ps1 -Jobs 3

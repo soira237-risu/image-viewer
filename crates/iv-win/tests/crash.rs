@@ -43,6 +43,11 @@ fn crashes_are_reported_and_contained_panics_only_logged() {
     assert!(report.contains("invariant broken in the window's thread"), "{report}");
     assert!(report.contains("crash.rs:"), "with its location: {report}");
     assert!(report.contains("backtrace"), "{report}");
+    // what the symbols file needs: the build, where it was loaded, and frames as offsets into it
+    let exe = std::env::current_exe().unwrap();
+    let exe = exe.file_name().unwrap().to_string_lossy();
+    assert!(report.contains(&format!("image: {exe} at 0x")) && report.contains(".pdb {"), "{report}");
+    assert!(report.contains(&format!("  [{exe}+0x")), "frame offsets: {report}");
     assert!(!report.contains("bad huffman table") && !report.contains("helper went away"), "{report}");
 
     let log = std::fs::read_to_string(dir.path().join(LOG_FILE)).unwrap();

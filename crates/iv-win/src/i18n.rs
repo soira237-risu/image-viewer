@@ -118,7 +118,7 @@ strings! {
     registered, unregistered, register_failed, default_apps_failed, image_type_name, archive_type_name,
     app_description, about_text,
     // failures without a console to report them: the folder listing, the window, a crash
-    folder_list_failed, window_failed, crash_title, crash_message,
+    folder_list_failed, window_failed, crash_title, crash_message, crash_unsaved, crash_no_folder,
     // what logoff or shutdown would lose (shown by Windows)
     shutdown_saving, shutdown_unsaved,
 }
@@ -324,6 +324,8 @@ pub static KO: Strings = Strings {
     window_failed: "창을 만들지 못했습니다: {error}",
     crash_title: "이미지 뷰어 오류",
     crash_message: "문제가 생겨 이미지 뷰어를 닫습니다.\n\n자세한 내용을 다음 파일에 남겼습니다:\n{path}",
+    crash_unsaved: "문제가 생겨 이미지 뷰어를 닫습니다.\n\n오류 기록(crash.log)을 저장하지 못했습니다: {error}\n\n{detail}",
+    crash_no_folder: "기록할 폴더가 없음(%LOCALAPPDATA%가 설정되지 않음)",
     shutdown_saving: "{name} 저장 중",
     shutdown_unsaved: "{name}에 저장하지 않은 편집이 있습니다",
 };
@@ -470,6 +472,8 @@ pub static EN: Strings = Strings {
     window_failed: "cannot create the window: {error}",
     crash_title: "image-viewer error",
     crash_message: "image-viewer ran into a problem and has to close.\n\nThe details were written to:\n{path}",
+    crash_unsaved: "image-viewer ran into a problem and has to close.\n\nThe crash report (crash.log) could not be saved: {error}\n\n{detail}",
+    crash_no_folder: "no folder to write it to (%LOCALAPPDATA% is not set)",
     shutdown_saving: "saving {name}",
     shutdown_unsaved: "{name} has unsaved edits",
 };

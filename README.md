@@ -28,7 +28,7 @@ GitHub 릴리스에서 `image-viewer-<버전>-x86_64-windows.zip`을 받아 원�
 - 요구 사항: Windows 10 1703 이상 또는 Windows 11, 64비트(x64)
 - zip 내용: `image-viewer.exe`(뷰어), `iv.exe`(명령줄 도구: 일괄 변환·확장자 바로잡기·정보·속도 측정), `README.md`, `CHANGELOG.md`, `LICENSE`, `THIRD-PARTY-NOTICES.txt`·`RUST-STD-COPYRIGHT.html`(실행 파일에 들어 있는 오픈 소스 패키지의 라이선스)
 - 받은 파일 확인: 같은 이름의 `.sha256` 파일에 든 값과 `Get-FileHash <zip 파일>`의 값이 같아야 함
-- `…-symbols.zip`은 비정상 종료 기록(`crash.log`)을 분석할 때 쓰는 디버그 기호(.pdb). 뷰어를 쓰는 데는 필요 없음
+- `…-symbols.zip`은 비정상 종료 기록(`crash.log`)을 분석할 때 쓰는 디버그 기호(.pdb). 뷰어를 쓰는 데는 필요 없음. 배포한 실행 파일에는 .pdb가 없어 `crash.log`의 뷰어 프레임은 이름 대신 `[image-viewer.exe+0x…]`(실행 파일 시작 주소로부터의 오프셋)로 남고, 보고서 머리의 `image:` 줄에 시작 주소·링크 시각·.pdb의 GUID가 있음. 같은 릴리스의 `image-viewer.exe`와 풀어 둔 기호 폴더로 `pwsh -File scripts/symbolize.ps1 -CrashLog <crash.log> -Exe <image-viewer.exe> -Symbols <기호 폴더>`를 실행하면 Windows의 `dbghelp.dll`로 각 프레임에 함수 이름과 파일:줄을 붙여 보여 줌 (디버거 설치 불필요, 다른 빌드의 crash.log면 경고)
 - 기본 뷰어로 쓰려면 [기본 뷰어로 쓰기](#기본-뷰어로-쓰기) 참고. 지울 때는 등록을 해제(`image-viewer --unregister`)한 뒤 폴더를 지우고, 설정(`%APPDATA%\image-viewer`)과 기록(`%LOCALAPPDATA%\image-viewer`)도 필요 없으면 지움
 
 ### 선택 코덱 (HEIC·RAW)
@@ -68,7 +68,7 @@ cargo build --release
 ### 릴리스 만들기
 
 1. `Cargo.toml`의 `version`을 올리고 `CHANGELOG.md`에 `## [버전]` 절을 씀 (그 절이 릴리스 설명이 됨)
-2. `v<버전>` 태그를 push → [`.github/workflows/release.yml`](.github/workflows/release.yml)이 테스트, 패키지, GitHub 릴리스(zip·`.sha256`·symbols zip)까지 진행. 수동 실행(workflow_dispatch)은 릴리스를 만들지 않고 결과물만 작업 아티팩트로 남김
+2. `v<버전>` 태그를 push → [`.github/workflows/release.yml`](.github/workflows/release.yml)이 테스트, 패키지, GitHub 릴리스(zip·`.sha256`·symbols zip)까지 진행. 수동 실행(workflow_dispatch)은 태그를 골라 실행해도 릴리스를 만들지 않고(태그·버전 일치만 확인) 결과물만 작업 아티팩트로 남김. 게시는 태그 push 이벤트에서만
 
 같은 과정을 로컬에서: `pwsh -File scripts/package.ps1 -Jobs 3` → `target/dist/`. [scripts/package.ps1](scripts/package.ps1)이 순서대로 확인하고 하나라도 어긋나면 멈춤:
 
@@ -121,7 +121,7 @@ cargo build --release
 설정은 F2 또는 `%APPDATA%\image-viewer\settings.toml` (`--settings <파일>`로 다른 파일 지정).
 설정 파일이나 키맵 파일을 읽지 못하면 시작할 때 제목 표시줄에 이유(파일·줄 번호)가 첫 명령 전까지 표시됨. 읽지 못한 설정 파일은 설정 창에서 저장할 때 `settings.toml.bak`(있으면 `.bak2`, …)으로 보관한 뒤 새로 씀. 설정 파일은 임시 파일에 쓴 뒤 바꿔치기하므로 저장 도중 꺼져도 망가지지 않음.
 창 위치·크기·최대화 상태는 닫을 때 설정 파일 옆의 `window.toml`에 따로 기록되어 다음 실행 때 그대로 열림 (`settings.toml`은 설정 창에서 저장할 때만 쓰므로 직접 고친 값·주석은 그대로 남음) (전체 화면은 기억하지 않음, 연결이 끊긴 모니터 위치는 무시). 처음 열 때는 주 모니터 배율에 맞춘 1280×800(논리 픽셀) 크기로 가운데에 열림.
-오류 기록: 콘솔 없이 실행되므로 열기·저장·폴더 읽기 실패 같은 진단 내용은 `%LOCALAPPDATA%\image-viewer\image-viewer.log`에도 남음 (무언가 기록할 때만 생김, 256 KiB를 넘으면 다음 실행에서 비우고 새로 씀, 한 번 실행에 128 KiB까지). 뷰어가 비정상 종료하면 `crash.log`(같은 폴더, 마지막 한 건만 보관)에 위치·백트레이스를 쓰고 그 경로를 알리는 창을 띄움. 손상된 파일 때문에 디코더가 패닉해도 그 이미지만 "열 수 없습니다"로 실패하고 뷰어는 계속 동작함.
+오류 기록: 콘솔 없이 실행되므로 열기·저장·폴더 읽기 실패 같은 진단 내용은 `%LOCALAPPDATA%\image-viewer\image-viewer.log`에도 남음 (무언가 기록할 때만 생김, 256 KiB를 넘으면 다음 실행에서 비우고 새로 씀, 한 번 실행에 128 KiB까지). 뷰어가 비정상 종료하면 `crash.log`(같은 폴더, 마지막 한 건만 보관)에 위치·백트레이스(프레임 주소와 실행 파일 기준 오프셋, 실행 파일의 시작 주소·.pdb 식별자)를 쓰고 그 경로를 알리는 창을 띄움. 기록을 쓰지 못하면(폴더 없음·디스크 가득 참·권한 없음) 창은 파일을 남겼다고 하지 않고 그 이유와 패닉 메시지·위치를 보여 줌. 손상된 파일 때문에 디코더가 패닉해도 그 이미지만 "열 수 없습니다"로 실패하고 뷰어는 계속 동작함.
 
 ### 기본 뷰어로 쓰기
 
