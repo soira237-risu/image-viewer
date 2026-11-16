@@ -379,6 +379,60 @@ fn a_new_image_does_not_wait_for_an_abandoned_decode() {
 }
 
 #[test]
+fn a_held_key_keeps_every_image_it_passes_while_decoding_one_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = write_pngs(dir.path(), 1);
+    let passed: Vec<PathBuf> = (0..3)
+        .map(|i| {
+            let p = dir.path().join(format!("quick{i}.png"));
+            std::fs::copy(&files[0], &p).unwrap();
+            p
+        })
+        .collect();
+    // free prefetch workers that could take the newer requests beside the slow decode
+    let (p, rx, gate) = gated_pipeline("quick", u64::MAX, 3);
+
+    p.request_quick(&passed[0]);
+    gate.wait_for(1);
+    // key repeats while the first image is still decoding
+    p.request_quick(&passed[1]);
+    p.request_quick(&passed[2]);
+    p.request_quick(&files[0]);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(gate.waiting.load(Ordering::Acquire), 1, "one quick-browse image decodes at a time");
+    assert_eq!(p.stats().in_flight, 1, "{:?}", p.stats());
+
+    gate.open();
+    // the image decoding when the key moved on is still shown, then the newest one
+    ready_for(&rx, &passed[0]);
+    ready_for(&rx, &files[0]);
+    settle(&p);
+    assert!(p.cached(&passed[0]).is_some(), "the passed image was kept");
+    let more = readies(&rx);
+    assert!(!more.contains(&passed[1]) && !more.contains(&passed[2]), "skipped requests are not decoded: {more:?}");
+}
+
+#[test]
+fn quick_browsing_does_not_wait_for_an_abandoned_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = write_pngs(dir.path(), 2);
+    let stuck = dir.path().join("hold.png");
+    std::fs::copy(&files[0], &stuck).unwrap();
+    let (p, rx, gate) = gated_pipeline("hold", u64::MAX, 1);
+
+    p.request(&stuck, &[]);
+    gate.wait_for(1);
+    // a single key press leaves `stuck` (cancelled, still in its decoder), then the key is held
+    p.request(&files[0], &[]);
+    ready_for(&rx, &files[0]);
+    p.request_quick(&files[1]);
+    ready_for(&rx, &files[1]);
+    gate.open();
+    settle(&p);
+    assert!(p.cached(&stuck).is_none(), "the abandoned decode stays abandoned");
+}
+
+#[test]
 fn going_back_to_an_image_whose_decode_was_cancelled_loads_it() {
     let dir = tempfile::tempdir().unwrap();
     let files = write_pngs(dir.path(), 1);

@@ -111,11 +111,12 @@ struct State {
     reserved_bytes: u64,
     tick: u64,
     shutdown: bool,
-    /// Foreground decodes running, oldest first. A cancelled one may still be finishing on one
-    /// worker while the newest runs on another.
-    foreground_running: Vec<PathBuf>,
-    /// Quick browsing: the running foreground decode is allowed to finish and is announced even
-    /// if the user has already moved past it, so held keys show images as fast as they decode.
+    /// Foreground decodes running, oldest first, with their tokens. A cancelled one may still be
+    /// finishing on one worker while the newest runs on another.
+    foreground_running: Vec<(PathBuf, CancelToken)>,
+    /// Quick browsing: running foreground decodes are allowed to finish and are announced even
+    /// if the user has already moved past them, so held keys show images as fast as they decode.
+    /// Only one of them runs at a time (see [`State::foreground_may_start`]).
     quick: bool,
 }
 
@@ -176,6 +177,15 @@ impl State {
         }
     }
 
+    /// Whether a queued foreground job may start now. Normally always. While quick browsing, only
+    /// once no live (uncancelled) foreground decode is running: that decode is kept and shown when
+    /// it ends, and the newest request starts right after it. Starting the next one beside it
+    /// would split the CPU between images the user is flipping past and could show them out of
+    /// order. A cancelled decode that is still finishing does not hold the next one back.
+    fn foreground_may_start(&self) -> bool {
+        !self.quick || self.foreground_running.iter().all(|(_, t)| t.is_cancelled())
+    }
+
     fn stats(&self) -> Stats {
         Stats {
             cached: self.cache.len(),
@@ -201,15 +211,16 @@ impl Shared {
             }
             // a prefetch worker takes the image on screen first: the foreground worker may still
             // be finishing a decode the user has already left (decoders only stop between stages)
+            let foreground = if st.foreground_may_start() { st.foreground.pop_front() } else { None };
             let job = match kind {
-                Kind::Foreground => st.foreground.pop_front(),
-                Kind::Prefetch => st.foreground.pop_front().or_else(|| st.background.pop_front()),
+                Kind::Foreground => foreground,
+                Kind::Prefetch => foreground.or_else(|| st.background.pop_front()),
             };
             if let Some(job) = job {
                 let token = CancelToken::new();
                 st.in_flight.insert(job.path.clone(), token.clone());
                 if job.kind == Kind::Foreground {
-                    st.foreground_running.push(job.path.clone());
+                    st.foreground_running.push((job.path.clone(), token.clone()));
                 }
                 return Some((job, token));
             }
@@ -237,6 +248,7 @@ impl Shared {
 
     fn run(&self, job: Job, cancel: CancelToken) {
         let started = Instant::now();
+        let kind = job.kind;
         let mut reserved = 0;
         // Decoders and archive readers run on untrusted files: a panic in one of them fails this
         // image, and the worker, its bookkeeping below and every later image carry on.
@@ -269,7 +281,7 @@ impl Shared {
                 st.in_flight.remove(&job.path);
             }
             if job.kind == Kind::Foreground {
-                if let Some(i) = st.foreground_running.iter().position(|p| *p == job.path) {
+                if let Some(i) = st.foreground_running.iter().position(|(_, t)| t.same(&cancel)) {
                     st.foreground_running.remove(i);
                 }
             }
@@ -310,7 +322,9 @@ impl Shared {
                 }
             }
         };
-        if reserved > 0 {
+        // freed budget lets a waiting prefetch start; a finished foreground decode lets the next
+        // quick-browse image start
+        if reserved > 0 || kind == Kind::Foreground {
             self.wake.notify_all();
         }
         if let Some(e) = event {
@@ -374,9 +388,10 @@ impl Pipeline {
         self.request_inner(current, prefetch, false)
     }
 
-    /// Quick browsing (a navigation key is held): no prefetching, and the image the foreground
-    /// worker is decoding is finished and announced instead of cancelled. The newest request is
-    /// decoded next, so the screen keeps up with the key at whatever pace decoding allows.
+    /// Quick browsing (a navigation key is held): no prefetching, and the image being decoded is
+    /// finished and announced instead of cancelled. One image decodes at a time and the newest
+    /// request is decoded next, so the screen keeps up with the key at whatever pace decoding
+    /// allows.
     pub fn request_quick(&self, current: &Path) -> Option<Arc<Decoded>> {
         self.request_inner(current, &[], true)
     }
@@ -388,10 +403,11 @@ impl Pipeline {
         st.plan.push(current.to_path_buf());
         st.plan.extend(prefetch.iter().filter(|p| p.as_path() != current).cloned());
 
-        // the newest foreground decode is the one quick browsing keeps
-        let keep_running = if quick { st.foreground_running.last().cloned() } else { None };
+        // quick browsing keeps every running foreground decode: each is an image flipped past that
+        // is shown when it ends (at most one of them is live, see `foreground_may_start`)
         for (path, token) in &st.in_flight {
-            if !st.plan.contains(path) && Some(path) != keep_running.as_ref() {
+            let kept = quick && st.foreground_running.iter().any(|(_, t)| t.same(token));
+            if !st.plan.contains(path) && !kept {
                 token.cancel();
             }
         }
