@@ -8,6 +8,7 @@ mod error;
 mod format;
 mod image;
 mod info;
+pub mod panic;
 mod source;
 
 pub use cancel::CancelToken;

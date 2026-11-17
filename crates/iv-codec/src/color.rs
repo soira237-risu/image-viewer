@@ -55,30 +55,43 @@ fn convert(img: &ImageBuf, src: &ColorProfile, dst: &ColorProfile) -> Result<Ima
         PixelFormat::Rgba16 => {
             let t = src.create_transform_16bit(Layout::Rgba, dst, Layout::Rgba, opts).map_err(|e| e.to_string())?;
             let input: &[u16] = bytemuck::cast_slice(img.data());
-            let mut out = vec![0u16; input.len()];
-            t.transform(input, &mut out).map_err(|e| e.to_string())?;
-            ImageBuf::new(img.width(), img.height(), PixelFormat::Rgba16, bytemuck::cast_slice(&out).to_vec())
-                .map_err(|e| e.to_string())
+            let mut result = Ok(());
+            let out = ImageBuf::with_samples::<u16>(img.width(), img.height(), PixelFormat::Rgba16, |out| {
+                result = t.transform(input, out).map_err(|e| e.to_string());
+            })
+            .map_err(|e| e.to_string())?;
+            result.map(|()| out)
         }
         PixelFormat::RgbaF32 => Err("float".into()),
     }
 }
 
-/// Converts `decoded` (all frames) from its embedded ICC profile to sRGB in place.
-pub fn to_srgb(decoded: &mut Decoded) -> Result<(), Skipped> {
-    let Some(icc) = decoded.info.icc_profile.clone() else { return Err(Skipped::NoProfile) };
-    if decoded.image.format() == PixelFormat::RgbaF32 {
+/// The profile `icc` and sRGB, when pixels of `format` described by `icc` need converting;
+/// `None` when they are sRGB already.
+fn conversion(icc: &[u8], format: PixelFormat) -> Result<Option<(ColorProfile, ColorProfile)>, Skipped> {
+    if format == PixelFormat::RgbaF32 {
         return Err(Skipped::FloatPixels);
     }
-    let src = ColorProfile::new_from_slice(&icc).map_err(|e| Skipped::Unreadable(e.to_string()))?;
+    let src = ColorProfile::new_from_slice(icc).map_err(|e| Skipped::Unreadable(e.to_string()))?;
     if src.color_space != DataColorSpace::Rgb {
         return Err(Skipped::NotRgb);
     }
     let dst = ColorProfile::new_srgb();
-    if is_identity(&src, &dst) {
-        // already sRGB: the pixels are display-ready as decoded
-        return Ok(());
-    }
+    Ok((!is_identity(&src, &dst)).then_some((src, dst)))
+}
+
+/// `img`, described by the ICC profile `icc`, converted to sRGB; `None` when it is sRGB already.
+/// For saving to a format that cannot hold the profile.
+pub fn image_to_srgb(img: &ImageBuf, icc: &[u8]) -> Result<Option<ImageBuf>, Skipped> {
+    let Some((src, dst)) = conversion(icc, img.format())? else { return Ok(None) };
+    convert(img, &src, &dst).map(Some).map_err(Skipped::Unreadable)
+}
+
+/// Converts `decoded` (all frames) from its embedded ICC profile to sRGB in place.
+pub fn to_srgb(decoded: &mut Decoded) -> Result<(), Skipped> {
+    let Some(icc) = decoded.info.icc_profile.clone() else { return Err(Skipped::NoProfile) };
+    // already sRGB: the pixels are display-ready as decoded
+    let Some((src, dst)) = conversion(&icc, decoded.image.format())? else { return Ok(()) };
     decoded.image = convert(&decoded.image, &src, &dst).map_err(Skipped::Unreadable)?;
     if let Some(anim) = decoded.animation.as_mut() {
         for (i, frame) in anim.frames.iter_mut().enumerate() {

@@ -32,6 +32,11 @@ impl CancelToken {
     pub fn check(&self) -> Result<()> {
         if self.is_cancelled() { Err(Error::Cancelled) } else { Ok(()) }
     }
+
+    /// Whether both are clones of the same token.
+    pub fn same(&self, other: &CancelToken) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 #[cfg(test)]

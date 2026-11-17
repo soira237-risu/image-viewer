@@ -4,6 +4,7 @@
 mod builtin {
     pub mod avif;
     pub(crate) mod exif;
+    pub(crate) mod heif;
     pub mod image_rs;
     pub mod jpeg;
     pub mod jxl;
@@ -24,7 +25,7 @@ use std::sync::Arc;
 pub use builtin::avif::Rav1dAvifDecoder;
 pub use builtin::image_rs::ImageRsDecoder;
 pub use builtin::jpeg::ZuneJpegDecoder;
-pub use builtin::jxl::JxlOxideDecoder;
+pub use builtin::jxl::{JxlOxideDecoder, header_orientation as jxl_orientation, rebuild_jpeg as jpeg_from_jxl};
 pub use builtin::svg::SvgDecoder;
 #[cfg(windows)]
 pub use builtin::wic::WicDecoder;

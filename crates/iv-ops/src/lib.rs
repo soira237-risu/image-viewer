@@ -6,4 +6,4 @@ mod geometry;
 mod op;
 
 pub use geometry::Geometry;
-pub use op::{Adjust, EditStack, Op, Rect};
+pub use op::{Adjust, EditStack, Op, Rect, ToneTable};

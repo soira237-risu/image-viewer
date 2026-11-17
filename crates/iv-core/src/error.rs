@@ -14,6 +14,11 @@ pub enum Error {
     #[error("no decoder could open this {format} image: {reason}")]
     NoDecoder { format: FormatId, reason: String },
 
+    /// The format needs an optional system codec that is not installed (HEIF/HEVC or camera RAW
+    /// through Windows Imaging Component: Microsoft Store extensions).
+    #[error("the Windows codec for {format} is not installed")]
+    CodecMissing { format: FormatId },
+
     /// A codec recognised the data but failed while decoding it.
     #[error("{codec} failed to decode: {message}")]
     Decode { codec: &'static str, message: String },
@@ -25,6 +30,10 @@ pub enum Error {
     /// The operation was cancelled through a [`crate::CancelToken`].
     #[error("operation cancelled")]
     Cancelled,
+
+    /// Third-party code panicked (see [`crate::panic::catch`]); the panic was contained.
+    #[error("{what} crashed: {message}")]
+    Panicked { what: &'static str, message: String },
 }
 
 impl Error {

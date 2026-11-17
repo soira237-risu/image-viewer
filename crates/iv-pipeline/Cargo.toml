@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 iv-core.workspace = true
@@ -12,10 +13,10 @@ iv-codec.workspace = true
 iv-ops.workspace = true
 zip.workspace = true
 sevenz-rust2.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 moxcms.workspace = true
 zip.workspace = true
-sevenz-rust2 = { workspace = true, features = ["compress"] }
 image.workspace = true
 tempfile.workspace = true

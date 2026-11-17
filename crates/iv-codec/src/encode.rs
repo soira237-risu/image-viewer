@@ -15,6 +15,8 @@ use image::codecs::tiff::TiffEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::{DynamicImage, ImageEncoder, RgbImage, RgbaImage};
 use iv_core::{Error, FormatId, ImageBuf, PixelFormat, Result};
+// links the libjxl that gamut-jxl calls
+use iv_libjxl as _;
 
 /// What a value of an option may be.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,6 +103,9 @@ pub struct EncoderInfo {
     pub supports_alpha: bool,
     pub supports_16bit: bool,
     pub lossy: bool,
+    /// Writes [`Metadata::icc`] into the file. Where it cannot, a caller that keeps metadata
+    /// converts the pixels to sRGB first, so the file looks as the original did.
+    pub embeds_icc: bool,
 }
 
 pub trait Encoder: Send + Sync {
@@ -108,6 +113,15 @@ pub trait Encoder: Send + Sync {
     fn options(&self) -> &'static [OptionSpec];
     /// Encodes `img` (already prepared by [`prepare`]) with metadata where supported.
     fn encode(&self, img: &DynamicImage, opts: &EncodeOptions, meta: &Metadata) -> Result<Vec<u8>>;
+    /// Stores the JPEG file `jpeg` without decoding it, when the format can hold a JPEG's DCT
+    /// coefficients as they are (JPEG XL, which can also give the original file back). Metadata
+    /// is whatever segments `jpeg` has. `None` when this format cannot, or `opts` ask for a
+    /// pixel encode; an error when the encoder refuses this particular JPEG (the caller then
+    /// encodes the pixels instead).
+    fn recompress_jpeg(&self, jpeg: &[u8], opts: &EncodeOptions) -> Option<Result<Vec<u8>>> {
+        let _ = (jpeg, opts);
+        None
+    }
 }
 
 fn err(id: &'static str, e: impl std::fmt::Display) -> Error {
@@ -117,28 +131,40 @@ fn err(id: &'static str, e: impl std::fmt::Display) -> Error {
 /// Converts pixels to what the encoder accepts: 16-bit only where supported, alpha dropped when
 /// the image is opaque (smaller files) and composited over `background` when the format has no
 /// alpha.
+///
+/// Each result is made in one pass straight from `img`'s pixels: no intermediate full copy.
 pub fn prepare(img: &ImageBuf, info: &EncoderInfo, background: [u8; 3]) -> DynamicImage {
     let (w, h) = (img.width(), img.height());
     let opaque = img.is_opaque();
     if img.format() == PixelFormat::Rgba16 && info.supports_16bit {
-        let px: Vec<u16> = bytemuck::cast_slice(img.data()).to_vec();
-        let rgba = image::ImageBuffer::from_raw(w, h, px).expect("buffer matches size");
-        let d = DynamicImage::ImageRgba16(rgba);
-        return if opaque || !info.supports_alpha { DynamicImage::ImageRgb16(d.to_rgb16()) } else { d };
+        let px: &[u16] = bytemuck::cast_slice(img.data());
+        if opaque || !info.supports_alpha {
+            let rgb: Vec<u16> = px.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
+            return DynamicImage::ImageRgb16(image::ImageBuffer::from_raw(w, h, rgb).expect("buffer matches size"));
+        }
+        return DynamicImage::ImageRgba16(
+            image::ImageBuffer::from_raw(w, h, px.to_vec()).expect("buffer matches size"),
+        );
     }
-    let rgba = RgbaImage::from_raw(w, h, img.to_rgba8().into_owned()).expect("buffer matches size");
+    // 8-bit (16-bit and float rounded down to it), read without a converted copy when it already is
+    let rgba = img.to_rgba8();
     if opaque {
-        return DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(rgba).to_rgb8());
+        let rgb: Vec<u8> = rgba.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
+        return DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, rgb).expect("buffer matches size"));
     }
     if info.supports_alpha {
-        return DynamicImage::ImageRgba8(rgba);
+        return DynamicImage::ImageRgba8(RgbaImage::from_raw(w, h, rgba.into_owned()).expect("buffer matches size"));
     }
-    let flat = RgbImage::from_fn(w, h, |x, y| {
-        let p = rgba.get_pixel(x, y).0;
-        let a = p[3] as u32;
-        image::Rgb([0, 1, 2].map(|c| ((p[c] as u32 * a + background[c] as u32 * (255 - a) + 127) / 255) as u8))
-    });
-    DynamicImage::ImageRgb8(flat)
+    let flat: Vec<u8> = rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|p| {
+            let a = p[3] as u32;
+            [0, 1, 2].map(|c| ((p[c] as u32 * a + background[c] as u32 * (255 - a) + 127) / 255) as u8)
+        })
+        .collect();
+    DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, flat).expect("buffer matches size"))
 }
 
 fn write_with(enc: impl ImageEncoder, img: &DynamicImage, meta: &Metadata, id: &'static str) -> Result<()> {
@@ -154,8 +180,8 @@ fn write_with(enc: impl ImageEncoder, img: &DynamicImage, meta: &Metadata, id: &
 }
 
 macro_rules! info {
-    ($id:literal, $fmt:expr, alpha: $a:expr, deep: $d:expr, lossy: $l:expr) => {
-        EncoderInfo { id: $id, format: $fmt, supports_alpha: $a, supports_16bit: $d, lossy: $l }
+    ($id:literal, $fmt:expr, alpha: $a:expr, deep: $d:expr, lossy: $l:expr, icc: $i:expr) => {
+        EncoderInfo { id: $id, format: $fmt, supports_alpha: $a, supports_16bit: $d, lossy: $l, embeds_icc: $i }
     };
 }
 
@@ -258,35 +284,143 @@ impl Encoder for Avif {
     }
 }
 
+/// JPEG XL through the reference libjxl (`gamut-jxl`, linked statically by `iv-libjxl`).
+///
+/// Defaults follow libjxl's `cjxl`: quality 90 (distance 1.0, "visually lossless"), effort 7,
+/// and a JPEG source without pixel edits recompressed losslessly instead of decoded
+/// ([`Encoder::recompress_jpeg`]). Quality 100 is mathematically lossless, as in `cjxl`.
 struct Jxl(EncoderInfo);
+
+const JXL_OPTIONS: &[OptionSpec] = &[
+    OptionSpec { key: "quality", label: "Quality", kind: OptionKind::Int { min: 1, max: 100, default: 90 } },
+    OptionSpec { key: "lossless", label: "Lossless", kind: OptionKind::Bool { default: false } },
+    OptionSpec {
+        key: "effort",
+        label: "Effort (1 fast – 9 small)",
+        kind: OptionKind::Int { min: 1, max: 9, default: 7 },
+    },
+    OptionSpec { key: "lossless_jpeg", label: "Recompress JPEG losslessly", kind: OptionKind::Bool { default: true } },
+];
+
+/// libjxl's `JxlEncoderDistanceFromQuality`: the Butteraugli distance for a JPEG-like quality.
+/// 100 gives 0, which libjxl (and [`Jxl`]) treats as lossless; 90 gives 1.0, 30 gives 6.4, and
+/// below 30 the curve rises to 25 (the largest distance) at 0.
+pub fn jxl_distance_from_quality(quality: f32) -> f32 {
+    if quality >= 100.0 {
+        0.0
+    } else if quality >= 30.0 {
+        0.1 + (100.0 - quality) * 0.09
+    } else {
+        53.0 / 3000.0 * quality * quality - 23.0 / 20.0 * quality + 25.0
+    }
+}
+
+impl Jxl {
+    fn effort(opts: &EncodeOptions) -> gamut_jxl::Effort {
+        let level = opts.get(JXL_OPTIONS, "effort").clamp(1, 9) as u8;
+        gamut_jxl::Effort::from_level(level).expect("1..=9 is a libjxl effort")
+    }
+}
+
+/// The ICC profile in `meta` when it is of colour space `space` (`b"RGB "`, `b"GRAY"`).
+fn icc_of<'a>(meta: &'a Metadata, space: &[u8; 4]) -> Option<&'a [u8]> {
+    meta.icc.as_deref().filter(|p| p.len() >= 128 && &p[16..20] == space)
+}
+
+/// Whether every pixel of `img` (as [`prepare`] makes it: RGB or RGBA, 8 or 16 bits) is gray.
+fn all_gray(img: &DynamicImage) -> bool {
+    fn equal<T: PartialEq>(px: &[T], channels: usize) -> bool {
+        px.chunks_exact(channels).all(|p| p[0] == p[1] && p[1] == p[2])
+    }
+    match img {
+        DynamicImage::ImageRgb8(i) => equal(i.as_raw(), 3),
+        DynamicImage::ImageRgba8(i) => equal(i.as_raw(), 4),
+        DynamicImage::ImageRgb16(i) => equal(i.as_raw(), 3),
+        DynamicImage::ImageRgba16(i) => equal(i.as_raw(), 4),
+        _ => false,
+    }
+}
+
+/// The first channel and, with `alpha`, the last of each pixel of `px` (`channels` samples each).
+fn gray_samples<T: Copy>(px: &[T], channels: usize, alpha: bool) -> Vec<T> {
+    let mut out = Vec::with_capacity(px.len() / channels * (1 + alpha as usize));
+    for p in px.chunks_exact(channels) {
+        out.push(p[0]);
+        if alpha {
+            out.push(p[channels - 1]);
+        }
+    }
+    out
+}
+
 impl Encoder for Jxl {
     fn info(&self) -> &EncoderInfo {
         &self.0
     }
     fn options(&self) -> &'static [OptionSpec] {
-        &[]
+        JXL_OPTIONS
     }
-    fn encode(&self, img: &DynamicImage, _: &EncodeOptions, _: &Metadata) -> Result<Vec<u8>> {
-        use zune_core::bit_depth::BitDepth;
-        use zune_core::colorspace::ColorSpace;
-        use zune_core::options::EncoderOptions;
-        let (w, h) = (img.width() as usize, img.height() as usize);
-        let (bytes, colorspace, depth): (Vec<u8>, ColorSpace, BitDepth) = match img {
-            DynamicImage::ImageRgb8(i) => (i.as_raw().clone(), ColorSpace::RGB, BitDepth::Eight),
-            DynamicImage::ImageRgba8(i) => (i.as_raw().clone(), ColorSpace::RGBA, BitDepth::Eight),
-            DynamicImage::ImageRgb16(i) => {
-                (bytemuck::cast_slice(i.as_raw()).to_vec(), ColorSpace::RGB, BitDepth::Sixteen)
-            }
-            DynamicImage::ImageRgba16(i) => {
-                (bytemuck::cast_slice(i.as_raw()).to_vec(), ColorSpace::RGBA, BitDepth::Sixteen)
-            }
-            other => (other.to_rgba8().into_raw(), ColorSpace::RGBA, BitDepth::Eight),
+    fn encode(&self, img: &DynamicImage, opts: &EncodeOptions, meta: &Metadata) -> Result<Vec<u8>> {
+        use gamut_core::{
+            Dimensions, EncodeImage, Gray8, Gray16, GrayAlpha8, GrayAlpha16, ImageRef, Rgb8, Rgb16, Rgba8, Rgba16,
         };
+        use gamut_jxl::{ColorSpec, Container, Distance, JxlEncoder};
+        let id = self.0.id;
+        let quality = opts.get(JXL_OPTIONS, "quality");
+        let distance = jxl_distance_from_quality(quality as f32);
+        let mut enc = if opts.get(JXL_OPTIONS, "lossless") == 1 || distance <= 0.0 {
+            JxlEncoder::lossless()
+        } else {
+            JxlEncoder::lossy(Distance::new(distance).map_err(|e| err(id, e))?)
+        };
+        enc = enc.with_effort(Self::effort(opts));
+        // A gray profile (a gray source) describes gray samples: the image is written as gray
+        // with it, so tones under a non-sRGB curve stay as they were. Pixels an edit coloured,
+        // and a CMYK profile left over from the source, describe nothing that is written: the
+        // RGB pixels go out as sRGB.
+        let gray_icc = icc_of(meta, b"GRAY").filter(|_| all_gray(img));
+        if let Some(icc) = icc_of(meta, b"RGB ").or(gray_icc) {
+            enc = enc.with_color(ColorSpec::Icc(icc.to_vec()));
+        }
+        // EXIF lives in a box of the container; without it the bare codestream is smaller
+        if let Some(exif) = meta.exif.as_deref().filter(|e| !e.is_empty()) {
+            enc = enc.with_container(Container::IsoBmff).with_exif(exif);
+        }
+        let dims = Dimensions::new(img.width(), img.height()).map_err(|e| err(id, e))?;
+        let encoded = match img {
+            DynamicImage::ImageRgb8(i) if gray_icc.is_some() => {
+                ImageRef::<Gray8>::new(&gray_samples(i.as_raw(), 3, false), dims).and_then(|r| enc.encode_to_vec(r))
+            }
+            DynamicImage::ImageRgba8(i) if gray_icc.is_some() => {
+                ImageRef::<GrayAlpha8>::new(&gray_samples(i.as_raw(), 4, true), dims).and_then(|r| enc.encode_to_vec(r))
+            }
+            DynamicImage::ImageRgb16(i) if gray_icc.is_some() => {
+                ImageRef::<Gray16>::new(&gray_samples(i.as_raw(), 3, false), dims).and_then(|r| enc.encode_to_vec(r))
+            }
+            DynamicImage::ImageRgba16(i) if gray_icc.is_some() => {
+                ImageRef::<GrayAlpha16>::new(&gray_samples(i.as_raw(), 4, true), dims)
+                    .and_then(|r| enc.encode_to_vec(r))
+            }
+            DynamicImage::ImageRgb8(i) => ImageRef::<Rgb8>::new(i.as_raw(), dims).and_then(|r| enc.encode_to_vec(r)),
+            DynamicImage::ImageRgba8(i) => ImageRef::<Rgba8>::new(i.as_raw(), dims).and_then(|r| enc.encode_to_vec(r)),
+            DynamicImage::ImageRgb16(i) => ImageRef::<Rgb16>::new(i.as_raw(), dims).and_then(|r| enc.encode_to_vec(r)),
+            DynamicImage::ImageRgba16(i) => {
+                ImageRef::<Rgba16>::new(i.as_raw(), dims).and_then(|r| enc.encode_to_vec(r))
+            }
+            other => {
+                let rgba = other.to_rgba8();
+                ImageRef::<Rgba8>::new(rgba.as_raw(), dims).and_then(|r| enc.encode_to_vec(r))
+            }
+        };
+        encoded.map_err(|e| err(id, e))
+    }
+    fn recompress_jpeg(&self, jpeg: &[u8], opts: &EncodeOptions) -> Option<Result<Vec<u8>>> {
+        if opts.get(JXL_OPTIONS, "lossless_jpeg") == 0 {
+            return None;
+        }
         let mut out = Vec::new();
-        zune_jpegxl::JxlSimpleEncoder::new(&bytes, EncoderOptions::new(w, h, colorspace, depth))
-            .encode(&mut out)
-            .map_err(|e| err(self.0.id, format!("{e:?}")))?;
-        Ok(out)
+        let result = gamut_jxl::JxlEncoder::lossless().with_effort(Self::effort(opts)).recompress_jpeg(jpeg, &mut out);
+        Some(result.map(|_| out).map_err(|e| err(self.0.id, e)))
     }
 }
 
@@ -325,15 +459,15 @@ pub struct Encoders {
 impl Default for Encoders {
     fn default() -> Self {
         let list: Vec<Arc<dyn Encoder>> = vec![
-            Arc::new(Jpeg(info!("jpeg", FormatId::Jpeg, alpha: false, deep: false, lossy: true))),
-            Arc::new(Png(info!("png", FormatId::Png, alpha: true, deep: true, lossy: false))),
-            Arc::new(Webp(info!("webp", FormatId::Webp, alpha: true, deep: false, lossy: true))),
-            Arc::new(Avif(info!("avif", FormatId::Avif, alpha: true, deep: false, lossy: true))),
-            Arc::new(Jxl(info!("jxl", FormatId::Jxl, alpha: true, deep: true, lossy: false))),
-            Arc::new(Plain(info!("tiff", FormatId::Tiff, alpha: true, deep: true, lossy: false))),
-            Arc::new(Plain(info!("bmp", FormatId::Bmp, alpha: true, deep: false, lossy: false))),
-            Arc::new(Plain(info!("qoi", FormatId::Qoi, alpha: true, deep: false, lossy: false))),
-            Arc::new(Plain(info!("gif", FormatId::Gif, alpha: true, deep: false, lossy: true))),
+            Arc::new(Jpeg(info!("jpeg", FormatId::Jpeg, alpha: false, deep: false, lossy: true, icc: true))),
+            Arc::new(Png(info!("png", FormatId::Png, alpha: true, deep: true, lossy: false, icc: true))),
+            Arc::new(Webp(info!("webp", FormatId::Webp, alpha: true, deep: false, lossy: true, icc: true))),
+            Arc::new(Avif(info!("avif", FormatId::Avif, alpha: true, deep: false, lossy: true, icc: false))),
+            Arc::new(Jxl(info!("jxl", FormatId::Jxl, alpha: true, deep: true, lossy: true, icc: true))),
+            Arc::new(Plain(info!("tiff", FormatId::Tiff, alpha: true, deep: true, lossy: false, icc: true))),
+            Arc::new(Plain(info!("bmp", FormatId::Bmp, alpha: true, deep: false, lossy: false, icc: false))),
+            Arc::new(Plain(info!("qoi", FormatId::Qoi, alpha: true, deep: false, lossy: false, icc: false))),
+            Arc::new(Plain(info!("gif", FormatId::Gif, alpha: true, deep: false, lossy: true, icc: false))),
         ];
         Self { list }
     }

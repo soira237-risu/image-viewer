@@ -126,25 +126,106 @@ fn open(src: &Source, format: FormatId) -> Result<impl ImageDecoder> {
     reader.into_decoder().map_err(err)
 }
 
-/// Converts to the pipeline's RGBA layouts, keeping 16-bit and float precision.
+/// Converts to the pipeline's RGBA layouts, keeping 16-bit and float precision. Deep pixels
+/// are written straight into the image's one buffer (no RGBA copy of the decoder's pixels to
+/// copy again).
 pub(crate) fn to_image_buf(img: DynamicImage) -> Result<ImageBuf> {
-    let (w, h) = (img.width(), img.height());
-    match img.color() {
-        ColorType::Rgb16 | ColorType::Rgba16 | ColorType::L16 | ColorType::La16 => {
-            ImageBuf::byte_len(w, h, PixelFormat::Rgba16)?;
-            let raw = img.into_rgba16().into_raw();
-            ImageBuf::new(w, h, PixelFormat::Rgba16, bytemuck::cast_slice::<u16, u8>(&raw).to_vec())
-        }
-        ColorType::Rgb32F | ColorType::Rgba32F => {
-            ImageBuf::byte_len(w, h, PixelFormat::RgbaF32)?;
-            let raw = img.into_rgba32f().into_raw();
-            ImageBuf::new(w, h, PixelFormat::RgbaF32, bytemuck::cast_slice::<f32, u8>(&raw).to_vec())
-        }
-        _ => {
-            ImageBuf::byte_len(w, h, PixelFormat::Rgba8)?;
-            ImageBuf::new(w, h, PixelFormat::Rgba8, img.into_rgba8().into_raw())
+    /// Copies `src` pixels of `C` channels into RGBA samples, `opaque` as alpha when `C` < 4.
+    fn widen<T: Copy, const C: usize>(src: &[T], out: &mut [T], opaque: T) {
+        for (o, p) in out.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<C>().0) {
+            o.copy_from_slice(&match C {
+                1 => [p[0], p[0], p[0], opaque],
+                2 => [p[0], p[0], p[0], p[1]],
+                3 => [p[0], p[1], p[2], opaque],
+                _ => [p[0], p[1], p[2], p[3]],
+            });
         }
     }
+    let (w, h) = (img.width(), img.height());
+    match img {
+        DynamicImage::ImageLuma16(b) => {
+            ImageBuf::with_samples(w, h, PixelFormat::Rgba16, |o| widen::<u16, 1>(&b, o, u16::MAX))
+        }
+        DynamicImage::ImageLumaA16(b) => {
+            ImageBuf::with_samples(w, h, PixelFormat::Rgba16, |o| widen::<u16, 2>(&b, o, u16::MAX))
+        }
+        DynamicImage::ImageRgb16(b) => {
+            ImageBuf::with_samples(w, h, PixelFormat::Rgba16, |o| widen::<u16, 3>(&b, o, u16::MAX))
+        }
+        DynamicImage::ImageRgba16(b) => {
+            ImageBuf::with_samples(w, h, PixelFormat::Rgba16, |o| widen::<u16, 4>(&b, o, u16::MAX))
+        }
+        DynamicImage::ImageRgb32F(b) => {
+            ImageBuf::with_samples(w, h, PixelFormat::RgbaF32, |o| widen::<f32, 3>(&b, o, 1.0))
+        }
+        DynamicImage::ImageRgba32F(b) => {
+            ImageBuf::with_samples(w, h, PixelFormat::RgbaF32, |o| widen::<f32, 4>(&b, o, 1.0))
+        }
+        other => {
+            ImageBuf::byte_len(w, h, PixelFormat::Rgba8)?;
+            ImageBuf::new(w, h, PixelFormat::Rgba8, other.into_rgba8().into_raw())
+        }
+    }
+}
+
+/// Widens `buf`, whose first `pixels * C * S` bytes hold pixels of `C` channels of `S`-byte
+/// native-endian samples (grey, grey+alpha, RGB or RGBA), to RGBA in place. `opaque` is the
+/// alpha value given to pixels without alpha. Works backwards: pixel `i` lands at or after its
+/// source, and only after every later pixel has moved out of the way.
+fn widen_to_rgba<const C: usize, const S: usize>(buf: &mut [u8], opaque: [u8; S]) {
+    if C == 4 {
+        return;
+    }
+    let pixels = buf.len() / (4 * S);
+    for i in (0..pixels).rev() {
+        let mut px = [[0u8; S]; 4];
+        for (c, sample) in px.iter_mut().enumerate().take(C) {
+            sample.copy_from_slice(&buf[(i * C + c) * S..(i * C + c + 1) * S]);
+        }
+        let out: [[u8; S]; 4] = match C {
+            1 => [px[0], px[0], px[0], opaque],
+            2 => [px[0], px[0], px[0], px[1]],
+            _ => [px[0], px[1], px[2], opaque],
+        };
+        for (c, sample) in out.iter().enumerate() {
+            buf[(i * 4 + c) * S..(i * 4 + c + 1) * S].copy_from_slice(sample);
+        }
+    }
+}
+
+/// Decodes a still image straight into the pipeline's RGBA layout: one buffer of the output's
+/// size, reserved fallibly (a failed reservation is [`Error::TooLarge`] instead of an abort),
+/// filled by the decoder and widened to RGBA in place. Converting through a `DynamicImage`
+/// would hold the decoded and the converted image at once, plus a third copy for 16-bit and
+/// float pixels.
+fn decode_rgba(dec: impl ImageDecoder, width: u32, height: u32) -> Result<ImageBuf> {
+    use PixelFormat::{Rgba8, Rgba16, RgbaF32};
+    let color = dec.color_type();
+    let (out_format, widen): (PixelFormat, fn(&mut [u8])) = match color {
+        ColorType::L8 => (Rgba8, |b| widen_to_rgba::<1, 1>(b, [u8::MAX])),
+        ColorType::La8 => (Rgba8, |b| widen_to_rgba::<2, 1>(b, [u8::MAX])),
+        ColorType::Rgb8 => (Rgba8, |b| widen_to_rgba::<3, 1>(b, [u8::MAX])),
+        ColorType::Rgba8 => (Rgba8, |_| {}),
+        ColorType::L16 => (Rgba16, |b| widen_to_rgba::<1, 2>(b, u16::MAX.to_ne_bytes())),
+        ColorType::La16 => (Rgba16, |b| widen_to_rgba::<2, 2>(b, u16::MAX.to_ne_bytes())),
+        ColorType::Rgb16 => (Rgba16, |b| widen_to_rgba::<3, 2>(b, u16::MAX.to_ne_bytes())),
+        ColorType::Rgba16 => (Rgba16, |_| {}),
+        ColorType::Rgb32F => (RgbaF32, |b| widen_to_rgba::<3, 4>(b, 1f32.to_ne_bytes())),
+        ColorType::Rgba32F => (RgbaF32, |_| {}),
+        _ => return to_image_buf(DynamicImage::from_decoder(dec).map_err(err)?),
+    };
+    let out_len = ImageBuf::byte_len(width, height, out_format)?;
+    let in_len = dec.total_bytes();
+    let pixels = width as u64 * height as u64;
+    if in_len != pixels * color.bytes_per_pixel() as u64 {
+        return Err(Error::decode(ID, format!("decoder reports {in_len} bytes for {width}x{height} {color:?}")));
+    }
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(out_len as usize).map_err(|_| Error::TooLarge { width, height, bytes: out_len })?;
+    buf.resize(out_len as usize, 0);
+    dec.read_image(&mut buf[..in_len as usize]).map_err(err)?;
+    widen(&mut buf);
+    ImageBuf::new(width, height, out_format, buf)
 }
 
 /// Upper bound for the pixels of all frames of one animation. Longer animations are shown as
@@ -231,9 +312,7 @@ impl Decoder for ImageRsDecoder {
             _ => PixelFormat::Rgba8,
         };
         ImageBuf::byte_len(info.width, info.height, out_format)?;
-        let img = DynamicImage::from_decoder(dec).map_err(err)?;
-        cancel.check()?;
-        let image = to_image_buf(img)?;
+        let image = decode_rgba(dec, info.width, info.height)?;
         cancel.check()?;
         Ok(Decoded::still(info, image))
     }

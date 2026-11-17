@@ -42,7 +42,17 @@ fn system_fonts() -> Arc<usvg::fontdb::Database> {
 }
 
 fn parse(bytes: &[u8]) -> Result<usvg::Tree> {
-    let mut opt = usvg::Options::default();
+    let mut opt = usvg::Options {
+        // Only images embedded as `data:` URLs are drawn. By default usvg reads any other href
+        // as a file path: an SVG from the internet could pull local files into the picture, or
+        // make Windows connect to an SMB share (`\\host\x.png`) and send the user's credentials,
+        // and prefetching would do that without the file even being opened.
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+            resolve_string: Box::new(|_, _| None),
+        },
+        ..usvg::Options::default()
+    };
     // SVGZ is gzip; look for text in the decompressed form only when cheap to tell
     let has_text = bytes.windows(5).any(|w| w == b"<text") || bytes.starts_with(&[0x1F, 0x8B]);
     if has_text {
@@ -139,5 +149,57 @@ mod tests {
         let half = px(900, 256);
         assert_eq!(&half[..3], &[0, 0, 255], "straight colour, not darkened by premultiplication");
         assert!((half[3] as i32 - 128).abs() <= 1, "{half:?}");
+    }
+
+    fn green_png() -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 255, 0, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    fn base64(bytes: &[u8]) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut s = String::new();
+        for c in bytes.chunks(3) {
+            let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+            for i in 0..4 {
+                s.push(if i <= c.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+            }
+        }
+        s
+    }
+
+    /// Alpha at the centre of an SVG whose only content is `<image href="{href}">`.
+    fn centre_alpha(href: &str) -> u8 {
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1024" height="1024">
+                <image x="0" y="0" width="1024" height="1024" xlink:href="{href}"/>
+            </svg>"#
+        );
+        let d = SvgDecoder::default()
+            .decode(&Source::from_bytes("a.svg", svg.into_bytes()), FormatId::Svg, &CancelToken::never())
+            .unwrap();
+        d.image.data()[((512 * 1024 + 512) * 4 + 3) as usize]
+    }
+
+    #[test]
+    fn external_image_files_are_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("secret.png");
+        std::fs::write(&png, green_png()).unwrap();
+        // absolute path, file URL and a relative name resolved from the working directory
+        assert_eq!(centre_alpha(&png.display().to_string()), 0, "absolute path");
+        assert_eq!(centre_alpha(&format!("file:///{}", png.display().to_string().replace('\\', "/"))), 0);
+        // relative to the working directory (the temp folder can be on another drive, as on CI,
+        // so this file goes in a short-lived folder under the working directory)
+        let cwd = std::env::current_dir().unwrap();
+        let local = tempfile::tempdir_in(&cwd).unwrap();
+        std::fs::write(local.path().join("secret.png"), green_png()).unwrap();
+        let rel = local.path().join("secret.png").strip_prefix(&cwd).unwrap().to_path_buf();
+        assert!(rel.is_relative() && rel.is_file());
+        assert_eq!(centre_alpha(&rel.display().to_string()), 0, "relative path");
+        // an embedded image is part of the document and still drawn
+        assert_eq!(centre_alpha(&format!("data:image/png;base64,{}", base64(&green_png()))), 255);
     }
 }

@@ -6,6 +6,7 @@
 //! iv formats                          formats and the decoders registered for them
 //! iv convert --to <format> ...         convert / batch-convert, with optional rotate, flip, downscale
 //! iv fix-ext [--dry-run] <file|dir>... rename files whose extension does not match their content
+//! iv --version                        the version
 //! ```
 
 mod bench;
@@ -23,7 +24,8 @@ fn usage() -> ExitCode {
   iv bench [--runs N] <file|dir>...
   iv formats
   {}
-  iv fix-ext [--dry-run] <file|dir>...",
+  iv fix-ext [--dry-run] <file|dir>...
+  iv --version",
         convert::CONVERT_USAGE
     );
     ExitCode::from(2)
@@ -41,6 +43,10 @@ fn main() -> ExitCode {
         "formats" => formats(),
         "convert" => convert::convert(rest),
         "fix-ext" => convert::fix_ext(rest),
+        "--version" | "-V" => {
+            println!("iv {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         _ => usage(),
     }
 }
@@ -50,7 +56,8 @@ fn probe(inputs: &[String]) -> ExitCode {
     let paths = files::collect(inputs);
     let mut failed = 0;
     for path in &paths {
-        let line = iv_pipeline::archive::source_for(path)
+        // decoder panics are contained by the registry; an archive reader's here
+        let line = iv_core::panic::catch("archive reader", || iv_pipeline::archive::source_for(path))
             .and_then(|src| reg.identify(&src).and_then(|id| reg.probe(&src).map(|info| (id, info))));
         match line {
             Ok((id, info)) => {

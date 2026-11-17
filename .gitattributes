@@ -4,3 +4,10 @@
 *.webp binary
 *.gif binary
 *.ico binary
+*.avif binary
+*.heic binary
+*.jxl binary
+*.cb7 binary
+*.7z binary
+*.zip binary
+*.cbz binary

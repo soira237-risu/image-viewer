@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use iv_core::panic::catch;
 use iv_core::{CancelToken, Error, FormatId, ImageBuf, ImageInfo, Result, Source};
 
 use crate::decoder::{Decoded, Decoder};
@@ -26,7 +27,9 @@ impl Identified {
 ///
 /// Selection: identify the format (content first, extension as fallback), then try every
 /// decoder claiming that format in descending priority (registration order breaks ties). A
-/// decoder that errors falls through to the next; cancellation stops the chain at once.
+/// decoder that errors falls through to the next; cancellation stops the chain at once. A
+/// decoder that panics on a malformed file counts as one that errored ([`Error::Panicked`]), so
+/// the thread calling the registry survives it.
 #[derive(Default)]
 pub struct Registry {
     decoders: Vec<Arc<dyn Decoder>>,
@@ -100,7 +103,7 @@ impl Registry {
         let id = self.identify(src)?;
         let mut decoded = self.try_each(src, id.format, |d| d.decode(src, id.format, cancel))?;
         cancel.check()?;
-        decoded.color_managed = crate::color::to_srgb(&mut decoded).is_ok();
+        decoded.color_managed = catch("colour management", || Ok(crate::color::to_srgb(&mut decoded).is_ok()))?;
         Ok(decoded)
     }
 
@@ -109,10 +112,11 @@ impl Registry {
         let id = self.identify(src)?;
         for d in self.decoders_for(id.format) {
             cancel.check()?;
-            if !d.claims(src, id.format).unwrap_or(false) {
+            let codec = d.info().id;
+            if !catch(codec, || d.claims(src, id.format)).unwrap_or(false) {
                 continue;
             }
-            match d.preview(src, id.format, target_side, cancel) {
+            match catch(codec, || d.preview(src, id.format, target_side, cancel)) {
                 Ok(Some(img)) => return Ok(Some(img)),
                 Ok(None) => {}
                 Err(Error::Cancelled) => return Err(Error::Cancelled),
@@ -125,8 +129,14 @@ impl Registry {
 
     fn try_each<T>(&self, src: &Source, format: FormatId, mut f: impl FnMut(&dyn Decoder) -> Result<T>) -> Result<T> {
         let mut failures = Vec::new();
+        // a decoder that needs an uninstalled system codec names the real fix, so it wins over the
+        // others' failures; next, an image too large for one buffer is the reason it cannot be
+        // opened whatever the other decoders said
+        let mut codec_missing = false;
+        let mut too_large = None;
         for d in self.decoders_for(format) {
-            match d.claims(src, format) {
+            let codec = d.info().id;
+            match catch(codec, || d.claims(src, format)) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
@@ -134,13 +144,89 @@ impl Registry {
                     continue;
                 }
             }
-            match f(d.as_ref()) {
+            match catch(codec, || f(d.as_ref())) {
                 Ok(v) => return Ok(v),
                 Err(Error::Cancelled) => return Err(Error::Cancelled),
-                Err(e) => failures.push(format!("{}: {e}", d.info().id)),
+                Err(e) => {
+                    codec_missing |= matches!(e, Error::CodecMissing { .. });
+                    failures.push(format!("{}: {e}", d.info().id));
+                    if let Error::TooLarge { width, height, bytes } = e
+                        && too_large.is_none()
+                    {
+                        too_large = Some(Error::TooLarge { width, height, bytes });
+                    }
+                }
             }
+        }
+        if codec_missing {
+            return Err(Error::CodecMissing { format });
+        }
+        if let Some(e) = too_large {
+            return Err(e);
         }
         let reason = if failures.is_empty() { "no decoder registered".to_string() } else { failures.join("; ") };
         Err(Error::NoDecoder { format, reason })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decoder::DecoderInfo;
+
+    /// Fails every probe and decode with `error`.
+    struct Failing {
+        info: DecoderInfo,
+        error: MakeError,
+    }
+
+    impl Decoder for Failing {
+        fn info(&self) -> &DecoderInfo {
+            &self.info
+        }
+        fn probe(&self, _: &Source, _: FormatId) -> Result<ImageInfo> {
+            Err((self.error)())
+        }
+        fn decode(&self, _: &Source, _: FormatId, _: &CancelToken) -> Result<Decoded> {
+            Err((self.error)())
+        }
+    }
+
+    /// Makes the error a decoder fails with.
+    type MakeError = fn() -> Error;
+
+    fn registry(errors: &[(&'static str, MakeError)]) -> Registry {
+        let mut reg = Registry::new();
+        for (i, (id, error)) in errors.iter().enumerate() {
+            let info = DecoderInfo { id, name: id, formats: &[FormatId::Png], priority: 100 - i as i32 };
+            reg.register(Arc::new(Failing { info, error: *error }));
+        }
+        reg
+    }
+
+    fn big() -> Error {
+        Error::TooLarge { width: 70_000, height: 70_000, bytes: 70_000 * 70_000 * 4 }
+    }
+
+    fn broken() -> Error {
+        Error::decode("other", "bad chunk")
+    }
+
+    #[test]
+    fn an_image_too_large_for_any_decoder_says_so() {
+        let src = Source::from_bytes("a.png", b"\x89PNG\r\n\x1a\n rest".to_vec());
+        let cancel = CancelToken::never();
+        // whichever decoder found it too large, and whatever the others said
+        for reg in [registry(&[("first", big), ("second", broken)]), registry(&[("first", broken), ("second", big)])] {
+            assert!(matches!(reg.probe(&src), Err(Error::TooLarge { width: 70_000, height: 70_000, .. })));
+            assert!(matches!(reg.decode(&src, &cancel), Err(Error::TooLarge { width: 70_000, .. })));
+            assert!(matches!(reg.decode_unmanaged(&src, &cancel), Err(Error::TooLarge { .. })));
+        }
+        // a missing system codec still names the real fix
+        let reg = registry(&[("first", big), ("second", || Error::CodecMissing { format: FormatId::Png })]);
+        assert!(matches!(reg.decode(&src, &cancel), Err(Error::CodecMissing { .. })));
+        // other failures stay a list of what each decoder said
+        let reg = registry(&[("first", broken)]);
+        assert!(matches!(reg.decode(&src, &cancel), Err(Error::NoDecoder { .. })));
     }
 }

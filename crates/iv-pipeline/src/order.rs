@@ -28,18 +28,20 @@ pub fn prefetch_order(index: usize, len: usize, direction: i32, count: usize, wr
     for _ in 0..len {
         for _ in 0..ahead_per_round {
             ahead += 1;
-            if let Some(i) = resolve(ahead * forward) {
-                if i != index && !out.contains(&i) {
-                    out.push(i);
-                }
+            if let Some(i) = resolve(ahead * forward)
+                && i != index
+                && !out.contains(&i)
+            {
+                out.push(i);
             }
         }
         for _ in 0..behind_per_round {
             behind += 1;
-            if let Some(i) = resolve(-behind * forward) {
-                if i != index && !out.contains(&i) {
-                    out.push(i);
-                }
+            if let Some(i) = resolve(-behind * forward)
+                && i != index
+                && !out.contains(&i)
+            {
+                out.push(i);
             }
         }
         if out.len() >= count || out.len() == len - 1 {

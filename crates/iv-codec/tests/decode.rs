@@ -72,7 +72,7 @@ fn jpeg_uses_zune_and_is_close_to_source() {
 
     // lossy: compare mean absolute error on colour channels; alpha must be opaque
     let mut err = 0u64;
-    for (got, want) in d.image.data().chunks_exact(4).zip(src.as_raw().chunks_exact(4)) {
+    for (got, want) in d.image.data().as_chunks::<4>().0.iter().zip(src.as_raw().as_chunks::<4>().0) {
         assert_eq!(got[3], 255);
         err += (0..3).map(|c| (got[c] as i32 - want[c] as i32).unsigned_abs() as u64).sum::<u64>();
     }
@@ -90,6 +90,42 @@ fn sixteen_bit_png_keeps_precision() {
     assert_eq!(d.info.bits_per_channel, 16);
     let got: &[u16] = bytemuck::cast_slice(d.image.data());
     assert_eq!(got, img.as_raw().as_slice());
+}
+
+/// Every stored colour layout comes out as the same RGBA the `image` crate's own conversion gives.
+#[test]
+fn every_colour_type_widens_to_rgba() {
+    let base = DynamicImage::ImageRgba16(image::ImageBuffer::from_fn(7, 5, |x, y| {
+        Rgba([x as u16 * 9000 + 11, y as u16 * 13000 + 5, (x * y) as u16 * 2000, 20000 + x as u16 * 6000])
+    }));
+    let cases = [
+        base.to_luma8().into(),
+        base.to_luma_alpha8().into(),
+        base.to_rgb8().into(),
+        base.to_rgba8().into(),
+        base.to_luma16().into(),
+        base.to_luma_alpha16().into(),
+        base.to_rgb16().into(),
+        DynamicImage::ImageRgba16(base.to_rgba16()),
+    ];
+    for img in cases {
+        let color = img.color();
+        let d = decode("c.png", encode(&img, ImageFormat::Png));
+        if color.bytes_per_pixel() / color.channel_count() == 1 {
+            assert_eq!(d.image.format(), PixelFormat::Rgba8, "{color:?}");
+            assert_eq!(d.image.data(), img.to_rgba8().as_raw().as_slice(), "{color:?}");
+        } else {
+            assert_eq!(d.image.format(), PixelFormat::Rgba16, "{color:?}");
+            let got: &[u16] = bytemuck::cast_slice(d.image.data());
+            assert_eq!(got, img.to_rgba16().as_raw().as_slice(), "{color:?}");
+        }
+    }
+    for img in [DynamicImage::ImageRgb32F(base.to_rgb32f()), DynamicImage::ImageRgba32F(base.to_rgba32f())] {
+        let d = decode("f.exr", encode(&img, ImageFormat::OpenExr));
+        assert_eq!(d.image.format(), PixelFormat::RgbaF32);
+        let got: &[f32] = bytemuck::cast_slice(d.image.data());
+        assert_eq!(got, img.to_rgba32f().as_raw().as_slice(), "{:?}", img.color());
+    }
 }
 
 #[test]
@@ -208,6 +244,83 @@ fn failing_decoder_falls_through_to_next_priority() {
     }
 }
 
+/// Panics in every entry point, like a third-party decoder hitting a malformed file.
+struct Panicking(DecoderInfo);
+
+impl Decoder for Panicking {
+    fn info(&self) -> &DecoderInfo {
+        &self.0
+    }
+    fn probe(&self, _: &Source, _: FormatId) -> Result<ImageInfo> {
+        panic!("index out of bounds in probe")
+    }
+    fn preview(&self, _: &Source, _: FormatId, _: u32, _: &CancelToken) -> Result<Option<ImageBuf>> {
+        panic!("index out of bounds in preview")
+    }
+    fn decode(&self, _: &Source, _: FormatId, _: &CancelToken) -> Result<Decoded> {
+        panic!("index out of bounds in decode")
+    }
+}
+
+#[test]
+fn panicking_decoder_is_an_error_and_falls_through() {
+    let info = |priority| DecoderInfo { id: "panics", name: "panics", formats: &[FormatId::Png], priority };
+    let png = encode(&DynamicImage::ImageRgba8(pattern(4, 4, true)), ImageFormat::Png);
+    let src = Source::from_bytes("a.png", png);
+
+    let mut reg = default_registry();
+    reg.register(Arc::new(Panicking(info(1000))));
+    let d = reg.decode(&src, &CancelToken::never()).unwrap();
+    assert_eq!(d.info.codec, "image-rs", "the next decoder took over");
+    assert_eq!(reg.probe(&src).unwrap().codec, "image-rs");
+    assert!(reg.preview(&src, 64, &CancelToken::never()).is_ok(), "a crashing preview is no preview");
+
+    let mut only = Registry::new();
+    only.register(Arc::new(Panicking(info(0))));
+    match only.decode(&src, &CancelToken::never()) {
+        Err(Error::NoDecoder { reason, .. }) => {
+            assert!(reason.contains("panics crashed: index out of bounds in decode"), "{reason}")
+        }
+        other => panic!("expected NoDecoder, got {other:?}"),
+    }
+}
+
+/// Needs a system codec that is not installed, like WIC without the HEIF extension.
+struct NoCodec(DecoderInfo);
+
+impl Decoder for NoCodec {
+    fn info(&self) -> &DecoderInfo {
+        &self.0
+    }
+    fn probe(&self, _: &Source, format: FormatId) -> Result<ImageInfo> {
+        Err(Error::CodecMissing { format })
+    }
+    fn decode(&self, _: &Source, format: FormatId, _: &CancelToken) -> Result<Decoded> {
+        Err(Error::CodecMissing { format })
+    }
+}
+
+#[test]
+fn missing_system_codec_is_reported_over_other_failures() {
+    let info = |id, priority| DecoderInfo { id, name: id, formats: &[FormatId::Png], priority };
+    let png = encode(&DynamicImage::ImageRgba8(pattern(4, 4, true)), ImageFormat::Png);
+    let src = Source::from_bytes("a.png", png);
+
+    // every decoder failed, one of them for want of a codec: that is the reason given
+    let mut reg = Registry::new();
+    reg.register(Arc::new(Broken(info("broken", 10))));
+    reg.register(Arc::new(NoCodec(info("no-codec", 5))));
+    match reg.decode(&src, &CancelToken::never()) {
+        Err(Error::CodecMissing { format }) => assert_eq!(format, FormatId::Png),
+        other => panic!("expected CodecMissing, got {other:?}"),
+    }
+
+    // a decoder that works still wins
+    let mut reg = default_registry();
+    reg.register(Arc::new(NoCodec(info("no-codec", 1000))));
+    assert_eq!(reg.decode(&src, &CancelToken::never()).unwrap().info.codec, "image-rs");
+}
+
 #[test]
 fn file_sources_decode_from_disk() {
     let dir = tempfile::tempdir().unwrap();
@@ -305,16 +418,13 @@ fn gif_decodes_exactly_when_the_palette_fits() {
     assert!(d.animation.is_none());
 }
 
-/// Lossless JPEG XL written by `zune-jpegxl`, decoded by jxl-oxide.
+/// Lossless JPEG XL written by libjxl (the JXL encoder), decoded by jxl-oxide.
 fn jxl_of(img: &RgbaImage) -> Vec<u8> {
-    use zune_core::bit_depth::BitDepth;
-    use zune_core::colorspace::ColorSpace;
-    use zune_core::options::EncoderOptions;
-    let (w, h) = img.dimensions();
-    let opts = EncoderOptions::new(w as usize, h as usize, ColorSpace::RGBA, BitDepth::Eight);
-    let mut out = Vec::new();
-    zune_jpegxl::JxlSimpleEncoder::new(img.as_raw(), opts).encode(&mut out).expect("jxl encode");
-    out
+    use iv_codec::encode::{EncodeOptions, Encoders, Metadata};
+    let encoders = Encoders::default();
+    let jxl = encoders.for_format(FormatId::Jxl).unwrap();
+    let opts = EncodeOptions::parse(jxl.options(), &["lossless=true".into()]).unwrap();
+    jxl.encode(&DynamicImage::ImageRgba8(img.clone()), &opts, &Metadata::default()).expect("jxl encode")
 }
 
 #[test]
@@ -326,6 +436,26 @@ fn jpeg_xl_lossless_round_trips_exactly() {
     assert_eq!(reg.identify(&src).unwrap().format, FormatId::Jxl);
     let d = reg.decode(&src, &CancelToken::never()).unwrap();
     assert_eq!(d.info.codec, "jxl-oxide");
+    assert_eq!(d.info.frame_count, Some(1), "the header says it is not animated");
+    assert_eq!(reg.probe(&src).unwrap().frame_count, Some(1));
     assert!(d.info.has_alpha);
     assert_exact(&d, &expected);
+}
+
+/// `testdata/jxl/float-hdr.jxl`: a 4×2 lossless JPEG XL with 32-bit float samples in linear
+/// sRGB, made with libjxl's own API (`JxlEncoderAddImageFrame`, `JXL_TYPE_FLOAT`), with values
+/// up to 12.0: what an HDR or float JPEG XL decodes to.
+#[test]
+fn a_float_jpeg_xl_decodes_as_float() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/jxl/float-hdr.jxl");
+    let reg = default_registry();
+    let src = Source::from_path(path);
+    let probed = reg.probe(&src).unwrap();
+    assert_eq!((probed.width, probed.height, probed.bits_per_channel), (4, 2, 32));
+    let d = reg.decode_unmanaged(&src, &CancelToken::never()).unwrap();
+    assert_eq!(d.info.bits_per_channel, 32);
+    assert_eq!(d.image.format(), iv_core::PixelFormat::RgbaF32);
+    let px: &[f32] = bytemuck::cast_slice(d.image.data());
+    // the second pixel was (1.0, 2.5, 4.0) in linear light: above 1.0 survives decoding
+    assert!(px[4..7].iter().any(|v| *v > 1.0), "{:?}", &px[4..8]);
 }
