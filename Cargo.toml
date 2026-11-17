@@ -8,6 +8,7 @@ edition = "2024"
 # the highest rust-version among the locked dependencies (avif-decode 3.0); scripts/package.ps1 checks it
 rust-version = "1.98"
 publish = false
+license = "MIT"
 
 [workspace.dependencies]
 iv-core = { path = "crates/iv-core" }

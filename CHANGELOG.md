@@ -51,4 +51,4 @@
 
 - C 런타임을 정적으로 링크: Visual C++ 재배포 패키지 없이 실행
 - 실행 파일에 빌드한 컴퓨터의 경로가 들어가지 않음, 매니페스트에 Windows 10/11 지원·모니터별 DPI 선언
-- 함께 들어 있는 오픈 소스 패키지의 라이선스: `THIRD-PARTY-NOTICES.txt`, `RUST-STD-COPYRIGHT.html`
+- 라이선스: MIT (`LICENSE`). 함께 들어 있는 오픈 소스 패키지의 라이선스: `THIRD-PARTY-NOTICES.txt`, `RUST-STD-COPYRIGHT.html`

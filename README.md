@@ -72,7 +72,7 @@ cargo build --release
 
 같은 과정을 로컬에서: `pwsh -File scripts/package.ps1 -Jobs 3` → `target/dist/`. [scripts/package.ps1](scripts/package.ps1)이 순서대로 확인하고 하나라도 어긋나면 멈춤:
 
-- 저장소 최상위에 `LICENSE` 파일이 있는지 (**아직 라이선스가 정해지지 않아 지금은 여기서 실패함**. 소유자가 라이선스를 고르고 `LICENSE`와 `Cargo.toml`의 `license`를 추가해야 릴리스 가능)
+- 저장소 최상위에 `LICENSE` 파일이 있는지 (MIT. zip에 그대로 들어감)
 - 태그와 `Cargo.toml` 버전이 같은지, `CHANGELOG.md`에 그 버전 절이 있는지, `rust-version`이 잠긴 의존성들의 최소 Rust 버전 이상인지
 - 깨끗한 릴리스 빌드(`target/package-build`, 성공·실패·Ctrl+C 어느 쪽으로 끝나도 지움. `-KeepBuild`면 남김): 빌드한 컴퓨터의 경로(사용자 폴더·Cargo 폴더·저장소 위치)를 `--remap-path-prefix`로 지움 (.pdb는 rustc가 원래 파일 이름만 넣음)
 - 두 실행 파일이 C 런타임 DLL(`VCRUNTIME140.dll` 등)을 가져다 쓰지 않는지, 빌드 경로가 들어 있지 않은지, 버전이 맞는지
@@ -139,3 +139,7 @@ cargo build --release
 ```
 
 키맵에서 휠에 명령을 묶으면 그 조합의 휠은 확대 대신 그 명령을 실행함 (한 칸에 한 번).
+
+## 라이선스
+
+[MIT](LICENSE). 실행 파일에 들어 있는 오픈 소스 패키지는 각자의 라이선스를 따르며, 배포 zip의 `THIRD-PARTY-NOTICES.txt`·`RUST-STD-COPYRIGHT.html`에 목록과 전문이 있음.
