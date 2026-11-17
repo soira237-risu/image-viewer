@@ -13,7 +13,10 @@ use iv_codec::encode::Encoders;
 use iv_core::{FormatId, ImageBuf, ImageInfo, Orientation};
 use iv_ops::{EditStack, Geometry, Op, Rect};
 use iv_pipeline::export::{ExportOutcome, ExportRequest, export};
-use iv_pipeline::{FolderList, Pipeline, PipelineConfig, PipelineEvent, prefetch_order, step};
+use iv_pipeline::{
+    AtEnd, FolderList, Move, Pipeline, PipelineConfig, PipelineEvent, SortKey, SortOrder, entry_index, prefetch_order,
+    siblings, step_or_cross,
+};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient};
 use windows::Win32::System::SystemServices::{MK_CONTROL, MK_SHIFT};
@@ -38,7 +41,7 @@ use crate::panel::{PanelAction, PanelContext, PanelState, typed_resize};
 use crate::raster::{self, Frame, Page, Picture, Style};
 use crate::settings::Settings;
 use crate::trace::Trace;
-use crate::view::{ScreenRect, ViewState, ZoomMode};
+use crate::view::{Fit, ScreenRect, ViewState, ZoomMode};
 use crate::wheel::{WheelSteps, WheelUse, wheel_use};
 
 const ZOOM_STEP: f64 = 1.25;
@@ -46,12 +49,29 @@ const ANIMATION_TIMER: usize = 1;
 /// Clears a notice from the title bar.
 const NOTICE_TIMER: usize = 2;
 const NOTICE_TIME_MS: u32 = 6000;
+/// One scroll step (an arrow key, a wheel notch) as a share of the window's height.
+const SCROLL_STEP: f64 = 0.125;
 
 #[derive(Debug)]
 pub enum AppEvent {
     Pipeline(PipelineEvent),
-    Folder { for_path: PathBuf, result: Result<FolderList, String> },
-    Saved { source: PathBuf, dest: PathBuf, result: Result<ExportOutcome, String> },
+    Folder {
+        for_path: PathBuf,
+        result: Result<FolderList, String>,
+    },
+    Saved {
+        source: PathBuf,
+        dest: PathBuf,
+        result: Result<ExportOutcome, String>,
+    },
+    /// The folder or archive beside the current one, looked for by [`App::find_neighbour`]
+    /// (search number `seq`): `None` when there is none with images that way.
+    Neighbour {
+        seq: u64,
+        forward: bool,
+        result: Option<FolderList>,
+        elapsed: Duration,
+    },
 }
 
 /// Sends `e` to the UI thread and wakes it.
@@ -204,6 +224,10 @@ pub struct App {
     direction: i32,
     /// A navigation key is being held: flip without prefetching.
     quick_browsing: bool,
+    /// The search for the next or previous folder (or archive) that is running, by number; a
+    /// result for any other number (superseded by opening or moving elsewhere) is dropped.
+    crossing: Option<u64>,
+    crossings_started: u64,
     /// Why the current file (or folder) cannot be shown; stays until another one is opened.
     error: Option<String>,
     /// A one-off message (a refused edit, a failed save): shown after the title, gone after a
@@ -244,15 +268,15 @@ fn file_name(p: &Path) -> String {
     p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
-/// The images around `path`: its folder, or the archive it is or is in. Listing an archive
-/// parses it, so a reader crashing on a malformed one is an error here like any other.
-fn list_folder(path: &Path) -> Result<FolderList, String> {
-    iv_core::panic::catch("archive reader", || FolderList::for_file(path).map_err(iv_core::Error::Io)).map_err(|e| {
-        match e {
+/// The images around `path` in `order`: its folder, or the archive it is or is in (in natural
+/// order). Listing an archive parses it, so a reader crashing on a malformed one is an error
+/// here like any other.
+fn list_folder(path: &Path, order: SortOrder) -> Result<FolderList, String> {
+    iv_core::panic::catch("archive reader", || FolderList::for_file_sorted(path, order).map_err(iv_core::Error::Io))
+        .map_err(|e| match e {
             iv_core::Error::Io(io) => io.to_string(),
             other => other.to_string(),
-        }
-    })
+        })
 }
 
 /// Two pages scaled to a common height: the combined size, and the share of its width taken by
@@ -300,6 +324,8 @@ impl App {
             index: None,
             direction: 0,
             quick_browsing: false,
+            crossing: None,
+            crossings_started: 0,
             error: None,
             notice: None,
             last_title: RefCell::new(String::new()),
@@ -360,6 +386,9 @@ impl App {
                     AppEvent::Pipeline(e) => self.handle_pipeline(e),
                     AppEvent::Folder { for_path, result } => self.handle_folder(for_path, result),
                     AppEvent::Saved { source, dest, result } => self.handle_saved(source, dest, result),
+                    AppEvent::Neighbour { seq, forward, result, elapsed } => {
+                        self.handle_neighbour(seq, forward, result, elapsed)
+                    }
                 }
             } else if let Some(e) = super::take_ui() {
                 self.handle_ui(e);
@@ -379,6 +408,12 @@ impl App {
         if let Some(d) = &mut self.display {
             d.view.set_viewport(vp);
         }
+        self.trace.mark(&format!(
+            "viewport {}x{}{}",
+            vp.0,
+            vp.1,
+            self.display.as_ref().map_or(String::new(), |d| format!(", image at {:?}", d.view.dest_rect()))
+        ));
         self.update_title();
         self.invalidate();
     }
@@ -410,12 +445,14 @@ impl App {
         self.folder = None;
         self.index = None;
         self.direction = 0;
+        self.crossing = None;
 
         // an archive or a folder: browse its images from the first
+        let order = self.settings.sort_order();
         let listing = if iv_pipeline::archive::is_archive(&path) && path.is_file() {
-            Some(list_folder(&path))
+            Some(list_folder(&path, order))
         } else if path.is_dir() {
-            Some(FolderList::scan(&path).map_err(|e| e.to_string()))
+            Some(FolderList::scan_sorted(&path, order).map_err(|e| e.to_string()))
         } else {
             None
         };
@@ -446,11 +483,12 @@ impl App {
     /// `path` is still the current image by then.
     fn scan_folder(&self, path: PathBuf) {
         let tx = self.tx.clone();
+        let order = self.settings.sort_order();
         std::thread::Builder::new()
             .name("folder-scan".into())
             .spawn(move || {
                 // listing an archive parses it: a reader crashing on a malformed one fails the listing
-                let result = list_folder(&path);
+                let result = list_folder(&path, order);
                 send(&tx, AppEvent::Folder { for_path: path, result });
             })
             .expect("spawn folder scan");
@@ -502,7 +540,9 @@ impl App {
             (Some(folder), Some(i)) if !self.quick_browsing => {
                 let n = self.settings.prefetch_count;
                 let count = if self.spread.is_some() { n * 2 } else { n };
-                prefetch_order(i, folder.len(), self.direction, count, self.settings.wrap)
+                // never across into another folder: that one is not known until stepping there
+                let wrap = self.settings.at_end == AtEnd::Wrap;
+                prefetch_order(i, folder.len(), self.direction, count, wrap)
                     .into_iter()
                     .filter_map(|j| folder.get(j).map(Path::to_path_buf))
                     .collect()
@@ -561,23 +601,126 @@ impl App {
         let (Some(folder), Some(index)) = (&self.folder, self.index) else { return };
         let len = folder.len();
         let stride = if self.spread.is_some() { 2 } else { 1 };
-        let target = match cmd {
-            Command::NavNext => step(index, len, stride, self.settings.wrap),
-            Command::NavPrev => step(index, len, -stride, self.settings.wrap),
-            Command::NavFirst => (index != 0).then_some(0),
-            Command::NavLast => (index + 1 != len).then(|| len - 1),
-            _ => None,
+        let at_end = self.settings.at_end;
+        let step = match cmd {
+            Command::NavNext => step_or_cross(index, len, stride, at_end, repeat),
+            Command::NavPrev => step_or_cross(index, len, -stride, at_end, repeat),
+            Command::NavFirst if index != 0 => Move::To(0),
+            Command::NavLast if index + 1 != len => Move::To(len - 1),
+            _ => Move::Stay,
         };
-        let Some(target) = target else { return };
+        let target = match step {
+            Move::To(target) => target,
+            Move::Cross { forward } => return self.find_neighbour(forward),
+            Move::Stay => return,
+        };
         let Some(path) = folder.get(target).map(Path::to_path_buf) else { return };
         if !self.confirm_discard(AfterSave::Navigate(cmd)) {
             return;
         }
+        // moved on within this folder: a folder search started before is no longer wanted
+        self.crossing = None;
         self.direction = if matches!(cmd, Command::NavPrev | Command::NavFirst) { -1 } else { 1 };
         self.index = Some(target);
         if repeat {
             self.quick_browsing = true;
         }
+        self.request(path);
+    }
+
+    /// Stepped past the end of the list (`forward`) or before its start with "go on to the next
+    /// folder" set: looks for the sibling folder or archive with images on a thread of its own
+    /// (it may list many folders or open many archives). [`Self::handle_neighbour`] takes the
+    /// answer. A press while a search runs is ignored.
+    fn find_neighbour(&mut self, forward: bool) {
+        let Some(folder) = &self.folder else { return };
+        if self.crossing.is_some() {
+            return;
+        }
+        self.crossings_started += 1;
+        let seq = self.crossings_started;
+        self.crossing = Some(seq);
+        let (current, archive, order) = (folder.dir().to_path_buf(), folder.is_archive(), self.settings.sort_order());
+        self.trace.mark(&format!(
+            "looking for the {} {} beside {}",
+            if forward { "next" } else { "previous" },
+            if archive { "archive" } else { "folder" },
+            current.display()
+        ));
+        let tx = self.tx.clone();
+        std::thread::Builder::new()
+            .name("neighbour-search".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let result = siblings::neighbour(&current, archive, forward, order);
+                send(&tx, AppEvent::Neighbour { seq, forward, result, elapsed: started.elapsed() });
+            })
+            .expect("spawn neighbour search");
+    }
+
+    /// The answer to [`Self::find_neighbour`]: shows the first image of the next folder (or the
+    /// last of the previous one) and names it, or says there is none and stays.
+    fn handle_neighbour(&mut self, seq: u64, forward: bool, result: Option<FolderList>, elapsed: Duration) {
+        if self.crossing != Some(seq) {
+            return; // the user opened or moved to something else meanwhile
+        }
+        self.crossing = None;
+        let archive = self.folder.as_ref().is_some_and(FolderList::is_archive);
+        self.trace.mark(&format!(
+            "neighbour search done in {:.1} ms: {}",
+            elapsed.as_secs_f64() * 1000.0,
+            result
+                .as_ref()
+                .map_or_else(|| "none".to_string(), |l| format!("{} ({} images)", l.dir().display(), l.len()))
+        ));
+        let Some(list) = result else {
+            let t = self.t();
+            let notice = match (archive, forward) {
+                (false, true) => t.no_next_folder,
+                (false, false) => t.no_previous_folder,
+                (true, true) => t.no_next_archive,
+                (true, false) => t.no_previous_archive,
+            };
+            return self.set_notice(notice.into());
+        };
+        // unsaved edits are asked about only now that there is somewhere to go
+        let cmd = if forward { Command::NavNext } else { Command::NavPrev };
+        if !self.confirm_discard(AfterSave::Navigate(cmd)) {
+            return;
+        }
+        self.enter_list(list, forward);
+    }
+
+    /// Makes `list` (a sibling folder or archive) the one being browsed, entered going
+    /// `forward` (at its first image) or back (at its last), and names it in a notice.
+    fn enter_list(&mut self, list: FolderList, forward: bool) {
+        let stride = if self.spread.is_some() { 2 } else { 1 };
+        let index = entry_index(list.len(), forward, stride);
+        let Some(path) = list.get(index).map(Path::to_path_buf) else { return };
+        let name = file_name(list.dir());
+        let entered = if list.is_archive() { self.t().entered_archive } else { self.t().entered_folder };
+        self.trace.mark(&format!("entered {} at [{}/{}]", list.dir().display(), index + 1, list.len()));
+        // encoded pages kept for quick page turns belong to the archive being left
+        iv_pipeline::archive::release_cache();
+        self.folder = Some(list);
+        self.index = Some(index);
+        self.direction = if forward { 1 } else { -1 };
+        self.request(path);
+        self.set_notice(fill(entered, &[("name", &name)]));
+    }
+
+    /// The sort setting changed: the open folder is sorted again and the image on screen stays
+    /// (the images around it, and so the prefetch, are new).
+    fn resort(&mut self) {
+        let order = self.settings.sort_order();
+        let Some(folder) = self.folder.as_mut() else { return };
+        if folder.is_archive() || folder.order() == order {
+            return;
+        }
+        folder.set_order(order);
+        let Some(path) = self.current.as_ref().map(|c| c.path.clone()) else { return };
+        self.index = folder.position(&path);
+        self.trace.mark(&format!("folder sorted by {order:?}: current at {:?}", self.index.map(|i| i + 1)));
         self.request(path);
     }
 
@@ -594,6 +737,7 @@ impl App {
     /// Puts the best image for the current request on screen if it is not there yet.
     fn sync_display(&mut self) {
         let viewport = self.viewport;
+        let open = self.settings.zoom_on_open;
         let Some(cur) = self.current.as_mut() else { return };
         let same_image = self.display.as_ref().is_some_and(|d| d.path == cur.path);
         let shown = self.display.as_ref().filter(|_| same_image).map(|d| d.kind);
@@ -648,7 +792,7 @@ impl App {
                 self.display = Some(Display {
                     path: cur.path.clone(),
                     kind,
-                    view: ViewState::new(size, viewport),
+                    view: ViewState::opened(size, viewport, open),
                     picture,
                     stored,
                     orientation: info.orientation,
@@ -739,7 +883,7 @@ impl App {
         self.display = Some(Display {
             path,
             kind: Shown::Full,
-            view: ViewState::new(info.display_size(), self.viewport),
+            view: ViewState::opened(info.display_size(), self.viewport, self.settings.zoom_on_open),
             picture: Picture::new(&decoded.image, info.has_alpha),
             stored: (info.width, info.height),
             orientation: info.orientation,
@@ -879,6 +1023,9 @@ impl App {
         match result {
             Ok(folder) => {
                 self.trace.mark(&format!("folder listed: {} images", folder.len()));
+                let mut folder = folder;
+                // the sort setting may have changed while the folder was being listed
+                folder.set_order(self.settings.sort_order());
                 self.index = folder.position(&for_path);
                 self.folder = Some(folder);
                 self.request(for_path);
@@ -931,6 +1078,13 @@ impl App {
             Command::ViewActualSize => self.with_view(|v| v.actual_size_at(center)),
             Command::ViewZoomIn => self.with_view(|v| v.zoom_by(ZOOM_STEP)),
             Command::ViewZoomOut => self.with_view(|v| v.zoom_by(1.0 / ZOOM_STEP)),
+            Command::ViewScrollUp | Command::ViewScrollDown => {
+                let step = f64::from(self.viewport.1) * SCROLL_STEP;
+                let dy = if cmd == Command::ViewScrollDown { step } else { -step };
+                self.with_view(|v| {
+                    v.scroll_by(dy);
+                });
+            }
             Command::AppSettings => self.toggle_settings(),
             Command::AppHelp => self.toggle_help(),
             Command::ViewToggleEditPanel => self.toggle_panel(),
@@ -1019,6 +1173,14 @@ impl App {
         ];
         if let Some(path) = dialogs::open_file(hwnd, &filters) {
             self.open(path);
+        }
+    }
+
+    /// Full screen at start (the `startup_window` setting).
+    pub fn start_fullscreen(&mut self) {
+        if self.fullscreen.is_none() {
+            self.trace.mark("full screen at start");
+            self.toggle_fullscreen();
         }
     }
 
@@ -1124,7 +1286,17 @@ impl App {
             UiEvent::SettingsChanged(s) => {
                 let language_changed = s.language != self.settings.language;
                 let help_changed = language_changed || s.wheel_navigates != self.settings.wheel_navigates;
+                let zoom_changed = s.zoom_on_open != self.settings.zoom_on_open;
+                let sort_changed = s.sort_order() != self.settings.sort_order();
                 self.settings = s.clamped();
+                if zoom_changed {
+                    // the image on screen shows the new way at once
+                    let open = self.settings.zoom_on_open;
+                    self.with_view(|v| v.set_open(open));
+                }
+                if sort_changed {
+                    self.resort();
+                }
                 if language_changed {
                     let t = self.t();
                     panel::set_language(t);
@@ -1649,10 +1821,12 @@ impl App {
                 return;
             }
         }
+        // where it sorted, for finding the image that followed it once it is gone
+        let key = SortKey::read(&path);
         match shell::recycle(hwnd, &path) {
             Ok(()) => {
                 self.trace.mark(&format!("moved to the Recycle Bin: {}", path.display()));
-                self.deleted(&path);
+                self.deleted(&path, &key);
                 self.set_notice(fill(t.deleted, &[("name", &name)]));
             }
             Err(e) => {
@@ -1665,8 +1839,9 @@ impl App {
     /// The current file is gone: it leaves the folder list and the cache, its edits are
     /// dropped, and the image that followed it (or the new last one) becomes current. An emptied
     /// folder leaves the window empty.
-    fn deleted(&mut self, path: &Path) {
+    fn deleted(&mut self, path: &Path, key: &SortKey) {
         let deleted = self.current.as_ref().map_or_else(|| path.to_path_buf(), |c| c.path.clone());
+        self.crossing = None;
         self.pipeline.invalidate(&deleted);
         self.edits.clear();
         self.selection = None;
@@ -1674,7 +1849,7 @@ impl App {
         // runs backwards, towards the images still ahead of the user)
         let mut went_back = false;
         let next = match self.folder.as_mut() {
-            Some(folder) => folder.remove(&deleted).or_else(|| folder.index_after(&deleted)).map(|i| {
+            Some(folder) => folder.remove(&deleted).or_else(|| folder.index_after_key(key)).map(|i| {
                 let last = folder.len().saturating_sub(1);
                 went_back = i > last;
                 i.min(last)
@@ -1683,9 +1858,9 @@ impl App {
                 // the folder listing has not come back yet (it was for the deleted file and
                 // will be dropped as stale): list the folder now
                 let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-                match FolderList::scan(dir) {
+                match FolderList::scan_sorted(dir, self.settings.sort_order()) {
                     Ok(list) => {
-                        let at = list.index_after(path);
+                        let at = list.index_after_key(key);
                         self.folder = Some(list);
                         at
                     }
@@ -1986,7 +2161,11 @@ impl App {
             can_redo: self.edits.can_redo(),
             edited: !self.edits.is_empty(),
             has_selection: self.selection.is_some(),
-            can_navigate: self.folder.as_ref().is_some_and(|f| f.len() > 1) && self.index.is_some(),
+            can_navigate: self.index.is_some()
+                && self
+                    .folder
+                    .as_ref()
+                    .is_some_and(|f| f.len() > 1 || self.settings.at_end == AtEnd::NextFolder && !f.is_empty()),
             has_path: self.current.is_some(),
             on_disk: self.current.as_ref().is_some_and(|c| iv_pipeline::archive::split(&c.path).is_none()),
             loaded: self.current.as_ref().is_some_and(|c| c.full.is_some()),
@@ -2003,7 +2182,21 @@ impl App {
         let delta = i32::from((wp.0 >> 16) as u16 as i16);
         let up = delta > 0;
         let chord = self.mouse_chord(if up { "WheelUp" } else { "WheelDown" }, wp);
-        match wheel_use(&self.keymap, up, chord.ctrl, chord.alt, chord.shift, self.settings.wheel_navigates) {
+        // a picture fitted to the width and taller than the window scrolls under the wheel
+        let scroll = self
+            .display
+            .as_ref()
+            .map(|d| &d.view)
+            .filter(|v| v.mode() == ZoomMode::Fit(Fit::Width) && v.scrolls_y())
+            .map(|v| v.can_scroll(!up));
+        let navigates = self.settings.wheel_navigates;
+        match wheel_use(&self.keymap, up, chord.ctrl, chord.alt, chord.shift, navigates, scroll) {
+            WheelUse::Scroll => {
+                let dy = -f64::from(delta) / f64::from(crate::wheel::NOTCH) * f64::from(self.viewport.1) * SCROLL_STEP;
+                self.with_view(|v| {
+                    v.scroll_by(dy);
+                });
+            }
             WheelUse::Command(cmd) => {
                 // one command per whole notch, so a precision wheel does not race through files
                 if self.wheel.push(delta, Instant::now()) != 0 {
@@ -2068,7 +2261,7 @@ impl App {
             }
             WM_LBUTTONDBLCLK => {
                 let p = point();
-                self.with_view(|v| if v.mode() == ZoomMode::Fit { v.actual_size_at(p) } else { v.fit() });
+                self.with_view(|v| if v.is_fitted() { v.actual_size_at(p) } else { v.fit() });
                 Some(LRESULT(0))
             }
             WM_MOUSEMOVE => {

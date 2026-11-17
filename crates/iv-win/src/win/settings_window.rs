@@ -1,5 +1,11 @@
-//! The settings window (F2): standard controls editing a copy of the settings. Every change is
-//! reported with the whole new value; the app applies what is live and saves on request.
+//! The settings window (F2): standard controls on four tabs, editing a copy of the settings.
+//! Every change is reported with the whole new value; the app applies what is live and saves on
+//! request.
+//!
+//! The tab control is only the strip of tab titles: each page's controls are children of the
+//! window itself, below the strip, and switching tabs shows one page's controls and hides the
+//! others. So the controls sit on the dialog background like everywhere else, and Tab moves
+//! only through the visible page (hidden controls are skipped) and the buttons at the bottom.
 
 use std::cell::{Cell, RefCell};
 
@@ -7,18 +13,27 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, CreateSolidBrush, DeleteObject, HBRUSH, HGDIOBJ};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemServices::SS_SUNKEN;
+use windows::Win32::UI::Controls::{
+    NMHDR, TCIF_TEXT, TCITEMW, TCM_GETCURSEL, TCM_GETITEMRECT, TCM_INSERTITEMW, TCM_SETCURSEL, TCM_SETITEMW,
+    TCN_SELCHANGE, WC_TABCONTROLW,
+};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, GetKeyState, SetFocus, VK_CONTROL, VK_NEXT, VK_PRIOR, VK_SHIFT, VK_TAB,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PCWSTR, w};
+use windows::core::{PCWSTR, PWSTR, w};
 
 use super::controls::{self, Builder};
 use super::{UiEvent, dialogs, post_ui, wide};
 use crate::i18n::{Language, Strings};
-use crate::settings::Settings;
+use crate::settings::{Choice, Settings, StartupWindow};
+use crate::view::ZoomOnOpen;
+use iv_pipeline::{AtEnd, SortBy};
 
 const ID_PREFETCH: i32 = 100;
 const ID_CACHE: i32 = 101;
-const ID_WRAP: i32 = 102;
+const ID_AT_END: i32 = 102;
 const ID_RTL: i32 = 103;
 const ID_NEAREST: i32 = 104;
 const ID_QUALITY: i32 = 105;
@@ -31,34 +46,121 @@ const ID_CONFIRM_DELETE: i32 = 111;
 const ID_REGISTER: i32 = 112;
 const ID_UNREGISTER: i32 = 113;
 const ID_DEFAULT_APPS: i32 = 114;
+const ID_ZOOM: i32 = 115;
+const ID_SORT: i32 = 116;
+const ID_DESCENDING: i32 = 117;
+const ID_STARTUP: i32 = 118;
+const ID_TABS: i32 = 119;
 const ID_CANCEL: i32 = 2;
 
-const WIDTH: i32 = 360;
-const HEIGHT: i32 = 446;
+/// Client size in 96-DPI units.
+const WIDTH: i32 = 440;
+const HEIGHT: i32 = 338;
+/// Where the label and value columns start, and how wide they are.
+const LABEL_X: i32 = 16;
+const LABEL_W: i32 = 200;
+const VALUE_X: i32 = 224;
+const VALUE_W: i32 = 200;
+/// A check box or note spanning both columns.
+const ROW_W: i32 = VALUE_X + VALUE_W - LABEL_X;
 
 /// A label in the current language, so controls can be relabelled when it changes.
 type Text = fn(&Strings) -> &'static str;
+/// The items of a drop-down list in the current language.
+type Items = fn(&Strings) -> Vec<&'static str>;
+
+/// The pages, in tab order.
+const GENERAL: usize = 0;
+const VIEW: usize = 1;
+const NAVIGATION: usize = 2;
+const SAVING: usize = 3;
+const TABS: [Text; 4] = [|s| s.tab_general, |s| s.tab_view, |s| s.tab_navigation, |s| s.tab_saving];
+
+fn zoom_items(s: &Strings) -> Vec<&'static str> {
+    ZoomOnOpen::ALL
+        .iter()
+        .map(|z| match z {
+            ZoomOnOpen::Fit => s.zoom_fit,
+            ZoomOnOpen::FitEnlarge => s.zoom_fit_enlarge,
+            ZoomOnOpen::FitWidth => s.zoom_fit_width,
+            ZoomOnOpen::ActualSize => s.zoom_actual_size,
+        })
+        .collect()
+}
+
+fn sort_items(s: &Strings) -> Vec<&'static str> {
+    SortBy::ALL
+        .iter()
+        .map(|b| match b {
+            SortBy::Name => s.sort_name,
+            SortBy::Modified => s.sort_modified,
+            SortBy::Size => s.sort_size,
+        })
+        .collect()
+}
+
+fn at_end_items(s: &Strings) -> Vec<&'static str> {
+    AtEnd::ALL
+        .iter()
+        .map(|a| match a {
+            AtEnd::Wrap => s.at_end_wrap,
+            AtEnd::Stop => s.at_end_stop,
+            AtEnd::NextFolder => s.at_end_next_folder,
+        })
+        .collect()
+}
+
+fn startup_items(s: &Strings) -> Vec<&'static str> {
+    StartupWindow::ALL
+        .iter()
+        .map(|w| match w {
+            StartupWindow::Remember => s.startup_remember,
+            StartupWindow::Maximized => s.startup_maximized,
+            StartupWindow::Fullscreen => s.startup_fullscreen,
+        })
+        .collect()
+}
+
+/// Language names are the same in every language.
+fn language_items(_: &Strings) -> Vec<&'static str> {
+    Language::ALL.iter().map(|l| l.native_name()).collect()
+}
 
 /// The program's version (from Cargo.toml).
 fn version_text(s: &Strings) -> String {
     crate::i18n::fill(s.version, &[("version", env!("CARGO_PKG_VERSION"))])
 }
 
+/// The tab that Ctrl+Tab (`back`: Ctrl+Shift+Tab) moves to from `current`, round the ends.
+pub fn next_tab(current: usize, back: bool) -> usize {
+    let n = TABS.len();
+    if back { (current + n - 1) % n } else { (current + 1) % n }
+}
+
 struct Window {
     hwnd: HWND,
+    tabs: HWND,
     language: HWND,
-    prefetch: HWND,
-    cache: HWND,
-    wrap: HWND,
-    rtl: HWND,
+    startup: HWND,
     wheel: HWND,
     confirm_delete: HWND,
-    nearest: HWND,
-    quality: HWND,
-    swatch: HWND,
     version: HWND,
+    zoom: HWND,
+    swatch: HWND,
+    nearest: HWND,
+    rtl: HWND,
+    sort: HWND,
+    descending: HWND,
+    at_end: HWND,
+    prefetch: HWND,
+    cache: HWND,
+    quality: HWND,
     /// Controls showing translated text.
     texts: Vec<(HWND, Text)>,
+    /// Drop-down lists whose items are translated.
+    combos: Vec<(HWND, Items)>,
+    /// Every control of a page, with its page.
+    pages: Vec<(HWND, usize)>,
     /// Every control, for laying the window out again on a DPI change.
     layout: controls::Layout,
 }
@@ -68,10 +170,65 @@ thread_local! {
     static VALUE: RefCell<Settings> = RefCell::new(Settings::default());
     static SYNCING: Cell<bool> = const { Cell::new(false) };
     static SWATCH_BRUSH: Cell<isize> = const { Cell::new(0) };
+    /// The page shown.
+    static PAGE: Cell<usize> = const { Cell::new(GENERAL) };
 }
 
 pub fn hwnd() -> Option<HWND> {
     WINDOW.with(|w| w.borrow().as_ref().map(|w| w.hwnd))
+}
+
+/// Replaces a drop-down list's items with `items`, selecting `selected`.
+fn set_items(combo: HWND, items: &[&str], selected: usize) {
+    unsafe {
+        SendMessageW(combo, CB_RESETCONTENT, None, None);
+        for item in items {
+            let text = wide(item);
+            SendMessageW(combo, CB_ADDSTRING, None, Some(LPARAM(text.as_ptr() as isize)));
+        }
+        SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(selected)), None);
+    }
+}
+
+fn selected(combo: HWND) -> Option<usize> {
+    usize::try_from(unsafe { SendMessageW(combo, CB_GETCURSEL, None, None).0 }).ok()
+}
+
+fn select(combo: HWND, index: usize) {
+    unsafe {
+        SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(index)), None);
+    }
+}
+
+fn set_tab_title(tabs: HWND, index: usize, title: &str, insert: bool) {
+    let mut text = wide(title);
+    let item = TCITEMW { mask: TCIF_TEXT, pszText: PWSTR(text.as_mut_ptr()), ..Default::default() };
+    let msg = if insert { TCM_INSERTITEMW } else { TCM_SETITEMW };
+    unsafe {
+        SendMessageW(tabs, msg, Some(WPARAM(index)), Some(LPARAM(&item as *const TCITEMW as isize)));
+    }
+}
+
+/// Makes the tab control exactly as tall as its row of titles (plus the line under it), so
+/// none of its empty body shows. The titles' height follows the font and so the DPI.
+fn fit_tabs(tabs: HWND) {
+    unsafe {
+        let mut item = RECT::default();
+        SendMessageW(tabs, TCM_GETITEMRECT, Some(WPARAM(0)), Some(LPARAM(&mut item as *mut RECT as isize)));
+        let mut r = RECT::default();
+        let _ = GetWindowRect(tabs, &mut r);
+        if item.bottom > 0 {
+            let _ = SetWindowPos(
+                tabs,
+                None,
+                0,
+                0,
+                r.right - r.left,
+                item.bottom + 2,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
 }
 
 fn create(owner: HWND, s: &Strings) -> windows::core::Result<Window> {
@@ -111,78 +268,177 @@ fn create(owner: HWND, s: &Strings) -> windows::core::Result<Window> {
         )?;
         let b = Builder::new(hwnd, dpi);
         let texts = RefCell::new(Vec::<(HWND, Text)>::new());
+        let combos = RefCell::new(Vec::<(HWND, Items)>::new());
+        let pages = RefCell::new(Vec::<(HWND, usize)>::new());
+        let page = Cell::new(GENERAL);
+        // every control below is on the page set last, unless it is added with `common`
+        let on_page = |h: HWND| {
+            pages.borrow_mut().push((h, page.get()));
+            h
+        };
         let keep = |h: HWND, text: Text| {
             texts.borrow_mut().push((h, text));
             h
         };
         let label = |text: Text, y| -> windows::core::Result<HWND> {
-            Ok(keep(b.add(w!("STATIC"), text(s), 0, 12, y + 3, 220, 18, 0)?, text))
+            Ok(on_page(keep(b.add(w!("STATIC"), text(s), 0, LABEL_X, y + 3, LABEL_W, 18, 0)?, text)))
         };
-        let field = |y, id, number: bool| {
+        let note = |text: Text, y| -> windows::core::Result<HWND> {
+            Ok(on_page(keep(b.add(w!("STATIC"), text(s), 0, LABEL_X, y, ROW_W, 18, 0)?, text)))
+        };
+        let field = |y, id, number: bool| -> windows::core::Result<HWND> {
             let mut style = ES_AUTOHSCROLL | WS_TABSTOP.0 as i32 | WS_BORDER.0 as i32;
             if number {
                 style |= ES_NUMBER;
             }
-            b.add(w!("EDIT"), "", style as u32, 240, y, 108, 24, id)
+            Ok(on_page(b.add(w!("EDIT"), "", style as u32, VALUE_X, y, 100, 24, id)?))
         };
         let check = |text: Text, y, id| -> windows::core::Result<HWND> {
             let style = (BS_AUTOCHECKBOX | WS_TABSTOP.0 as i32) as u32;
-            Ok(keep(b.add(w!("BUTTON"), text(s), style, 12, y, 336, 22, id)?, text))
+            Ok(on_page(keep(b.add(w!("BUTTON"), text(s), style, LABEL_X, y, ROW_W, 22, id)?, text)))
         };
         let button = |text: Text, x, y, w, id| -> windows::core::Result<HWND> {
             let style = (BS_PUSHBUTTON | WS_TABSTOP.0 as i32) as u32;
             Ok(keep(b.add(w!("BUTTON"), text(s), style, x, y, w, 26, id)?, text))
         };
-        label(|s| s.language, 10)?;
-        let combo_style = (CBS_DROPDOWNLIST | WS_TABSTOP.0 as i32 | WS_VSCROLL.0 as i32) as u32;
-        let language = b.add(w!("COMBOBOX"), "", combo_style, 240, 10, 108, 120, ID_LANGUAGE)?;
-        for l in Language::ALL {
-            let name = wide(l.native_name());
-            SendMessageW(language, CB_ADDSTRING, None, Some(LPARAM(name.as_ptr() as isize)));
+        let combo = |y, id, items: Items| -> windows::core::Result<HWND> {
+            let style = (CBS_DROPDOWNLIST | WS_TABSTOP.0 as i32 | WS_VSCROLL.0 as i32) as u32;
+            // the height is the open list's: room for every item
+            let h = on_page(b.add(w!("COMBOBOX"), "", style, VALUE_X, y, VALUE_W, 160, id)?);
+            set_items(h, &items(s), 0);
+            combos.borrow_mut().push((h, items));
+            Ok(h)
+        };
+
+        // the strip of tab titles; the pages lie below it
+        let tab_style = WS_TABSTOP.0 | WS_CLIPSIBLINGS.0;
+        let tabs = b.add(WC_TABCONTROLW, "", tab_style, 8, 8, WIDTH - 16, 30, ID_TABS)?;
+        for (i, title) in TABS.iter().enumerate() {
+            set_tab_title(tabs, i, title(s), true);
         }
-        label(|s| s.prefetch_count, 44)?;
-        let prefetch = field(44, ID_PREFETCH, true)?;
-        label(|s| s.cache_memory, 74)?;
-        let cache = field(74, ID_CACHE, true)?;
-        let wrap = check(|s| s.wrap, 104, ID_WRAP)?;
-        let rtl = check(|s| s.spread_rtl, 130, ID_RTL)?;
-        let wheel = check(|s| s.wheel_navigates, 156, ID_WHEEL)?;
-        let confirm_delete = check(|s| s.confirm_delete, 182, ID_CONFIRM_DELETE)?;
-        label(|s| s.sharp_pixels, 210)?;
-        let nearest = field(210, ID_NEAREST, false)?;
-        label(|s| s.save_quality_range, 240)?;
-        let quality = field(240, ID_QUALITY, true)?;
-        label(|s| s.background, 272)?;
-        let swatch = b.add(w!("STATIC"), "", SS_SUNKEN.0, 240, 270, 40, 24, 0)?;
-        button(|s| s.choose, 286, 269, 62, ID_COLOUR)?;
-        keep(b.add(w!("STATIC"), s.cache_note, 0, 12, 308, 336, 18, 0)?, |s| s.cache_note);
+        let top = 50;
+
+        page.set(GENERAL);
+        label(|s| s.language, top)?;
+        let language = combo(top, ID_LANGUAGE, language_items)?;
+        label(|s| s.startup_window, top + 32)?;
+        let startup = combo(top + 32, ID_STARTUP, startup_items)?;
+        let wheel = check(|s| s.wheel_navigates, top + 66, ID_WHEEL)?;
+        let confirm_delete = check(|s| s.confirm_delete, top + 92, ID_CONFIRM_DELETE)?;
         // registration acts at once (it is not a setting kept in the file)
-        keep(b.add(w!("STATIC"), s.open_with, 0, 12, 338, 336, 18, 0)?, |s| s.open_with);
-        button(|s| s.register, 12, 360, 100, ID_REGISTER)?;
-        button(|s| s.unregister, 118, 360, 100, ID_UNREGISTER)?;
-        button(|s| s.default_apps, 224, 360, 124, ID_DEFAULT_APPS)?;
-        let version = b.add(w!("STATIC"), &version_text(s), 0, 12, 409, 140, 18, 0)?;
-        button(|s| s.save, 156, 404, 92, ID_SAVE)?;
-        button(|s| s.defaults, 256, 404, 92, ID_DEFAULTS)?;
-        let texts = texts.into_inner();
-        let layout = b.finish();
-        Ok(Window {
+        note(|s| s.open_with, top + 128)?;
+        on_page(button(|s| s.register, LABEL_X, top + 150, 110, ID_REGISTER)?);
+        on_page(button(|s| s.unregister, LABEL_X + 116, top + 150, 110, ID_UNREGISTER)?);
+        on_page(button(|s| s.default_apps, LABEL_X + 232, top + 150, ROW_W - 232, ID_DEFAULT_APPS)?);
+        // the version, with room under it for checking for updates later
+        let version = on_page(b.add(w!("STATIC"), &version_text(s), 0, LABEL_X, top + 194, LABEL_W, 18, 0)?);
+
+        page.set(VIEW);
+        label(|s| s.zoom_on_open, top)?;
+        let zoom = combo(top, ID_ZOOM, zoom_items)?;
+        label(|s| s.background, top + 34)?;
+        let swatch = on_page(b.add(w!("STATIC"), "", SS_SUNKEN.0, VALUE_X, top + 32, 40, 24, 0)?);
+        on_page(button(|s| s.choose, VALUE_X + 48, top + 31, 90, ID_COLOUR)?);
+        label(|s| s.sharp_pixels, top + 66)?;
+        let nearest = field(top + 66, ID_NEAREST, false)?;
+        let rtl = check(|s| s.spread_rtl, top + 98, ID_RTL)?;
+
+        page.set(NAVIGATION);
+        label(|s| s.sort_by, top)?;
+        let sort = combo(top, ID_SORT, sort_items)?;
+        let descending = check(|s| s.sort_descending, top + 30, ID_DESCENDING)?;
+        note(|s| s.sort_note, top + 56)?;
+        label(|s| s.at_end, top + 86)?;
+        let at_end = combo(top + 86, ID_AT_END, at_end_items)?;
+        label(|s| s.prefetch_count, top + 120)?;
+        let prefetch = field(top + 120, ID_PREFETCH, true)?;
+        label(|s| s.cache_memory, top + 152)?;
+        let cache = field(top + 152, ID_CACHE, true)?;
+        note(|s| s.cache_note, top + 184)?;
+
+        page.set(SAVING);
+        label(|s| s.save_quality_range, top)?;
+        let quality = field(top, ID_QUALITY, true)?;
+
+        // on every page
+        button(|s| s.save, VALUE_X + VALUE_W - 188, HEIGHT - 38, 92, ID_SAVE)?;
+        button(|s| s.defaults, VALUE_X + VALUE_W - 92, HEIGHT - 38, 92, ID_DEFAULTS)?;
+
+        fit_tabs(tabs);
+        let window = Window {
             hwnd,
+            tabs,
             language,
-            prefetch,
-            cache,
-            wrap,
-            rtl,
+            startup,
             wheel,
             confirm_delete,
-            nearest,
-            quality,
-            swatch,
             version,
-            texts,
-            layout,
-        })
+            zoom,
+            swatch,
+            nearest,
+            rtl,
+            sort,
+            descending,
+            at_end,
+            prefetch,
+            cache,
+            quality,
+            texts: texts.into_inner(),
+            combos: combos.into_inner(),
+            pages: pages.into_inner(),
+            layout: b.finish(),
+        };
+        Ok(window)
     }
+}
+
+/// Shows page `index` (and its tab), hiding the others' controls. Focus on a control being
+/// hidden moves to the tab strip, so keys never go to a control that cannot be seen.
+fn show_page(index: usize) {
+    WINDOW.with(|w| {
+        let w = w.borrow();
+        let Some(w) = w.as_ref() else { return };
+        PAGE.with(|p| p.set(index));
+        unsafe {
+            if usize::try_from(SendMessageW(w.tabs, TCM_GETCURSEL, None, None).0).ok() != Some(index) {
+                SendMessageW(w.tabs, TCM_SETCURSEL, Some(WPARAM(index)), None);
+            }
+            // the page coming up first, so nothing in between is drawn without its controls
+            for (h, page) in &w.pages {
+                if *page == index {
+                    let _ = ShowWindow(*h, SW_SHOWNA);
+                }
+            }
+            let focus = GetFocus();
+            for (h, page) in &w.pages {
+                if *page != index {
+                    let _ = ShowWindow(*h, SW_HIDE);
+                    if focus == *h || IsChild(*h, focus).as_bool() {
+                        let _ = SetFocus(Some(w.tabs));
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Ctrl+Tab and Ctrl+PageDown go to the next tab, Ctrl+Shift+Tab and Ctrl+PageUp to the
+/// previous one, wherever the focus is in the window. Called for the window's messages before
+/// dialog navigation (which would take Ctrl+Tab as a plain Tab); `true` when it was handled.
+pub fn pre_translate(msg: &MSG) -> bool {
+    if msg.message != WM_KEYDOWN {
+        return false;
+    }
+    let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
+    let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
+    let back = match msg.wParam.0 as u16 {
+        k if k == VK_TAB.0 && ctrl => shift,
+        k if k == VK_NEXT.0 && ctrl => false,
+        k if k == VK_PRIOR.0 && ctrl => true,
+        _ => return false,
+    };
+    show_page(next_tab(PAGE.with(Cell::get), back));
+    true
 }
 
 fn set_swatch(colour: [u8; 3]) {
@@ -211,16 +467,17 @@ fn fill(s: &Settings) {
         SYNCING.with(|c| c.set(true));
         controls::set_text(w.prefetch, &s.prefetch_count.to_string());
         controls::set_text(w.cache, &s.cache_mib.to_string());
-        controls::set_checked(w.wrap, s.wrap);
         controls::set_checked(w.rtl, s.spread_right_to_left);
         controls::set_checked(w.wheel, s.wheel_navigates);
         controls::set_checked(w.confirm_delete, s.confirm_delete);
+        controls::set_checked(w.descending, s.sort_descending);
         controls::set_text(w.nearest, &format!("{}", s.nearest_above_zoom));
         controls::set_text(w.quality, &s.save_quality.to_string());
-        let index = Language::ALL.iter().position(|l| *l == s.language).unwrap_or(0);
-        unsafe {
-            SendMessageW(w.language, CB_SETCURSEL, Some(WPARAM(index)), None);
-        }
+        select(w.language, Language::ALL.iter().position(|l| *l == s.language).unwrap_or(0));
+        select(w.zoom, s.zoom_on_open.index());
+        select(w.sort, s.sort.index());
+        select(w.at_end, s.at_end.index());
+        select(w.startup, s.startup_window.index());
         SYNCING.with(|c| c.set(false));
     });
     set_swatch(s.background);
@@ -233,6 +490,7 @@ pub fn show(owner: HWND, s: &Settings, activate: bool) -> Result<(), String> {
         let w =
             create(owner, t).map_err(|e| crate::i18n::fill(t.settings_window_error, &[("error", &e.to_string())]))?;
         WINDOW.with(|c| *c.borrow_mut() = Some(w));
+        show_page(GENERAL);
     }
     VALUE.with(|v| *v.borrow_mut() = s.clone());
     fill(s);
@@ -258,16 +516,28 @@ pub fn set_quality(quality: u8) {
     });
 }
 
-/// Relabels the window (if it exists) in another language.
+/// Relabels the window (if it exists) in another language: title, tabs, labels and the items
+/// of the drop-down lists (keeping what is chosen).
 pub fn set_language(s: &Strings) {
     WINDOW.with(|w| {
         let w = w.borrow();
         let Some(w) = w.as_ref() else { return };
+        SYNCING.with(|c| c.set(true));
         controls::set_text(w.hwnd, s.settings);
+        for (i, title) in TABS.iter().enumerate() {
+            set_tab_title(w.tabs, i, title(s), false);
+        }
         for (h, text) in &w.texts {
             controls::set_text(*h, text(s));
         }
+        for (h, items) in &w.combos {
+            set_items(*h, &items(s), selected(*h).unwrap_or(0));
+        }
         controls::set_text(w.version, &version_text(s));
+        SYNCING.with(|c| c.set(false));
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(w.tabs), None, true);
+        }
     });
 }
 
@@ -277,6 +547,11 @@ pub fn hide() {
             let _ = ShowWindow(h, SW_HIDE);
         }
     }
+}
+
+/// The value chosen in a drop-down list of `T`s, or `prev` when nothing is.
+fn chosen<T: Choice>(combo: HWND, prev: T) -> T {
+    selected(combo).and_then(|i| T::ALL.get(i)).copied().unwrap_or(prev)
 }
 
 /// The fields as settings; a field that does not parse keeps its previous value.
@@ -298,14 +573,17 @@ fn read(prev: &Settings) -> Settings {
         if let Ok(v) = controls::text(w.nearest).trim().parse::<f32>() {
             s.nearest_above_zoom = v;
         }
-        s.wrap = controls::checked(w.wrap);
         s.spread_right_to_left = controls::checked(w.rtl);
         s.wheel_navigates = controls::checked(w.wheel);
         s.confirm_delete = controls::checked(w.confirm_delete);
-        let index = unsafe { SendMessageW(w.language, CB_GETCURSEL, None, None).0 };
-        if let Some(l) = usize::try_from(index).ok().and_then(|i| Language::ALL.get(i)) {
+        s.sort_descending = controls::checked(w.descending);
+        if let Some(l) = selected(w.language).and_then(|i| Language::ALL.get(i)) {
             s.language = *l;
         }
+        s.zoom_on_open = chosen(w.zoom, prev.zoom_on_open);
+        s.sort = chosen(w.sort, prev.sort);
+        s.at_end = chosen(w.at_end, prev.at_end);
+        s.startup_window = chosen(w.startup, prev.startup_window);
         s
     })
 }
@@ -353,14 +631,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             let current = VALUE.with(|v| v.borrow().clone());
             match (id, code) {
                 (ID_PREFETCH | ID_CACHE | ID_NEAREST | ID_QUALITY, EN_CHANGE)
-                | (ID_WRAP | ID_RTL | ID_WHEEL | ID_CONFIRM_DELETE, BN_CLICKED)
-                | (ID_LANGUAGE, CBN_SELCHANGE) => {
+                | (ID_RTL | ID_WHEEL | ID_CONFIRM_DELETE | ID_DESCENDING, BN_CLICKED)
+                | (ID_LANGUAGE | ID_ZOOM | ID_SORT | ID_AT_END | ID_STARTUP, CBN_SELCHANGE) => {
                     changed(read(&current));
                 }
                 (ID_COLOUR, BN_CLICKED) => {
                     if let Some(c) = dialogs::choose_color(hwnd, current.background) {
                         set_swatch(c);
-                        changed(Settings { background: c, ..current });
+                        let mut s = current;
+                        s.background = c;
+                        changed(s);
                     }
                 }
                 (ID_DEFAULTS, BN_CLICKED) => {
@@ -382,6 +662,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             LRESULT(0)
         }
+        WM_NOTIFY => {
+            let header = unsafe { &*(lp.0 as *const NMHDR) };
+            if header.idFrom == ID_TABS as usize && header.code == TCN_SELCHANGE {
+                let tabs = header.hwndFrom;
+                if let Ok(index) = usize::try_from(unsafe { SendMessageW(tabs, TCM_GETCURSEL, None, None).0 }) {
+                    show_page(index);
+                }
+            }
+            LRESULT(0)
+        }
         WM_CTLCOLORSTATIC => {
             let is_swatch = WINDOW.with(|w| w.borrow().as_ref().is_some_and(|w| w.swatch.0 as isize == lp.0));
             let brush = SWATCH_BRUSH.with(Cell::get);
@@ -399,11 +689,41 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 if let Some(w) = w.borrow().as_ref() {
                     SYNCING.with(|c| c.set(true));
                     w.layout.dpi_changed(hwnd, wp, lp);
+                    fit_tabs(w.tabs);
                     SYNCING.with(|c| c.set(false));
                 }
             });
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_tab_goes_round_the_tabs() {
+        assert_eq!(next_tab(GENERAL, false), VIEW);
+        assert_eq!(next_tab(VIEW, false), NAVIGATION);
+        assert_eq!(next_tab(NAVIGATION, false), SAVING);
+        assert_eq!(next_tab(SAVING, false), GENERAL);
+        assert_eq!(next_tab(GENERAL, true), SAVING);
+        assert_eq!(next_tab(SAVING, true), NAVIGATION);
+    }
+
+    #[test]
+    fn every_choice_has_a_label_in_both_languages() {
+        for s in [&crate::i18n::KO, &crate::i18n::EN] {
+            assert_eq!(zoom_items(s).len(), ZoomOnOpen::ALL.len());
+            assert_eq!(sort_items(s).len(), SortBy::ALL.len());
+            assert_eq!(at_end_items(s).len(), AtEnd::ALL.len());
+            assert_eq!(startup_items(s).len(), StartupWindow::ALL.len());
+            for items in [zoom_items(s), sort_items(s), at_end_items(s), startup_items(s)] {
+                let unique: std::collections::HashSet<_> = items.iter().collect();
+                assert_eq!(unique.len(), items.len(), "{items:?}");
+            }
+        }
     }
 }
