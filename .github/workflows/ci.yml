@@ -32,6 +32,11 @@ jobs:
       # rav1d (AV1 decoding) builds its assembly with NASM
       - uses: ilammy/setup-nasm@v1
 
+      # libjxl (JPEG XL encoding, crates/iv-libjxl) is built with CMake and the MSVC toolset; the
+      # Windows images have CMake on PATH, this only makes a missing one fail here, clearly
+      - name: CMake
+        run: cmake --version
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Format

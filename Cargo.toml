@@ -1,6 +1,14 @@
 [workspace]
 resolver = "3"
-members = ["crates/iv-core", "crates/iv-codec", "crates/iv-cli", "crates/iv-pipeline", "crates/iv-ops", "crates/iv-win"]
+members = [
+    "crates/iv-core",
+    "crates/iv-codec",
+    "crates/iv-cli",
+    "crates/iv-pipeline",
+    "crates/iv-ops",
+    "crates/iv-win",
+    "crates/iv-libjxl",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -40,7 +48,14 @@ webp = "0.3.1"
 rayon = "1.12"
 zip = { version = "9.5", default-features = false, features = ["deflate"] }
 sevenz-rust2 = { version = "0.25", default-features = false }
-zune-jpegxl = "0.5.2"
+# JPEG XL encoding through the reference libjxl 0.12, linked statically. Encoder only: decoding
+# stays with jxl-oxide, so the `decode` feature (the jxl-rs decoder) is left out. The library
+# itself is compiled by iv-libjxl from the source in jpegxl-src (see crates/iv-libjxl/build.rs and
+# GAMUT_JXL_SYS_SKIP_NATIVE in .cargo/config.toml).
+gamut-jxl = { version = "0.5.0", default-features = false, features = ["encode"] }
+gamut-core = "3"
+iv-libjxl = { path = "crates/iv-libjxl" }
+cmake = "0.1.58"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",

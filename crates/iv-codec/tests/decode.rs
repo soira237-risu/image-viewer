@@ -418,16 +418,13 @@ fn gif_decodes_exactly_when_the_palette_fits() {
     assert!(d.animation.is_none());
 }
 
-/// Lossless JPEG XL written by `zune-jpegxl`, decoded by jxl-oxide.
+/// Lossless JPEG XL written by libjxl (the JXL encoder), decoded by jxl-oxide.
 fn jxl_of(img: &RgbaImage) -> Vec<u8> {
-    use zune_core::bit_depth::BitDepth;
-    use zune_core::colorspace::ColorSpace;
-    use zune_core::options::EncoderOptions;
-    let (w, h) = img.dimensions();
-    let opts = EncoderOptions::new(w as usize, h as usize, ColorSpace::RGBA, BitDepth::Eight);
-    let mut out = Vec::new();
-    zune_jpegxl::JxlSimpleEncoder::new(img.as_raw(), opts).encode(&mut out).expect("jxl encode");
-    out
+    use iv_codec::encode::{EncodeOptions, Encoders, Metadata};
+    let encoders = Encoders::default();
+    let jxl = encoders.for_format(FormatId::Jxl).unwrap();
+    let opts = EncodeOptions::parse(jxl.options(), &["lossless=true".into()]).unwrap();
+    jxl.encode(&DynamicImage::ImageRgba8(img.clone()), &opts, &Metadata::default()).expect("jxl encode")
 }
 
 #[test]

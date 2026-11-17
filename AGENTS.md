@@ -7,7 +7,9 @@
 ## 빌드 환경
 
 - Rust stable (MSVC, 1.98 이상 — `Cargo.toml`의 `rust-version`), Visual Studio 2022 Build Tools, NASM (`rav1d` 어셈블리)
-- NASM이 PATH에 없으면 bash에서: `export PATH="$HOME/.cargo/bin:$(cygpath "$LOCALAPPDATA")/bin/NASM:$PATH"`
+- CMake: JPEG XL 인코더(libjxl, `crates/iv-libjxl`)를 빌드함. Build Tools에 들어 있지만 PATH에는 없음
+- NASM·CMake가 PATH에 없으면 bash에서: `export PATH="$HOME/.cargo/bin:$(cygpath "$LOCALAPPDATA")/bin/NASM:/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin:$PATH"`
+- libjxl은 `gamut-jxl-sys`가 아니라 `iv-libjxl`의 build.rs가 기본 MSVC 도구 집합으로 빌드함 (`gamut-jxl-sys`/`jpegxl-src`는 선택 구성 요소인 ClangCL 도구 집합을 요구함). 그래서 `.cargo/config.toml`의 `GAMUT_JXL_SYS_SKIP_NATIVE=1`과 그 빌드의 "will not link (check-only)" 경고는 정상
 - 메모리가 빠듯하면 `-j 3`처럼 병렬 작업 수를 줄일 것 (커밋 메모리 부족 시 rustc가 0xC0000409로 죽음)
 
 ## 표준 명령 — 항상 워크스페이스 전체 범위로

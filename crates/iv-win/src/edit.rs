@@ -146,9 +146,14 @@ pub fn extension_mismatch(path: &Path, content: FormatId) -> bool {
     path.extension().and_then(|e| e.to_str()).and_then(FormatId::from_extension).is_some_and(|f| f != content)
 }
 
+/// `a` and `b` name one file: the same path, or two spellings of an existing file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b || matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
+}
+
 /// Builds the request for saving `source` with `ops` to `dest`; the format follows `dest`'s
 /// extension (Save As). `quality` applies to formats that have a quality option (JPEG, WebP,
-/// AVIF).
+/// AVIF, JPEG XL).
 pub fn save_request(
     encoders: &Encoders,
     source: &Path,
@@ -175,12 +180,17 @@ pub fn save_request_as(
     let Some(encoder) = encoders.for_format(format) else {
         return Err(SaveError::NotWritable(format));
     };
-    let options = if encoder.options().iter().any(|o| o.key == "quality") {
-        EncodeOptions::parse(encoder.options(), &[format!("quality={}", quality.clamp(1, 100))])
-            .map_err(SaveError::Options)?
-    } else {
-        EncodeOptions::default()
-    };
+    let mut pairs = Vec::new();
+    if encoder.options().iter().any(|o| o.key == "quality") {
+        pairs.push(format!("quality={}", quality.clamp(1, 100)));
+    }
+    // A JPEG XL saved over itself is written losslessly: it may be a lossless original (or a
+    // recompressed JPEG), and Save must never quietly degrade it. Elsewhere the quality applies
+    // (a JPEG without pixel edits is still recompressed losslessly, see `export`).
+    if format == FormatId::Jxl && same_file(source, &dest) {
+        pairs.push("lossless=true".into());
+    }
+    let options = EncodeOptions::parse(encoder.options(), &pairs).map_err(SaveError::Options)?;
     Ok(ExportRequest {
         source: source.to_path_buf(),
         ops: ops.to_vec(),
@@ -428,5 +438,66 @@ mod tests {
         let decoded = registry.decode(&src, &CancelToken::never()).unwrap();
         let known = frames(&decoded.info, Some(&decoded));
         assert_eq!(in_place(&enc, &path, decoded.info.format, known), InPlace::Write(FormatId::Jxl));
+    }
+
+    #[test]
+    fn a_jpeg_xl_saved_over_itself_stays_lossless() {
+        use iv_codec::encode::{EncodeOptions, Metadata, prepare};
+        use iv_core::{CancelToken, ImageBuf, PixelFormat, Source};
+        use iv_pipeline::export::{ExportOutcome, export};
+        let enc = Encoders::default();
+        let jxl = enc.for_format(FormatId::Jxl).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("art.jxl");
+        // noisy pixels: any lossy encode changes them
+        let (w, h) = (24u32, 16u32);
+        let px: Vec<u8> = (0..w * h * 4)
+            .map(|i| if i % 4 == 3 { 255 } else { (i.wrapping_mul(2_654_435_761) >> 13) as u8 })
+            .collect();
+        let img = prepare(&ImageBuf::new(w, h, PixelFormat::Rgba8, px.clone()).unwrap(), jxl.info(), [255; 3]);
+        let lossless = EncodeOptions::parse(jxl.options(), &["lossless=true".into()]).unwrap();
+        std::fs::write(&path, jxl.encode(&img, &lossless, &Metadata::default()).unwrap()).unwrap();
+
+        // Save (in place), with the save quality at 50
+        let req = save_request_as(&enc, &path, &[Op::flip_h()], path.clone(), FormatId::Jxl, 50).unwrap();
+        let expected = EncodeOptions::parse(jxl.options(), &["quality=50".into(), "lossless=true".into()]).unwrap();
+        assert_eq!(req.options, expected);
+        assert!(matches!(export(&iv_codec::default_registry(), &enc, &req), Ok(ExportOutcome::Encoded { .. })));
+        let d = iv_codec::default_registry().decode(&Source::from_path(&path), &CancelToken::never()).unwrap();
+        let got = d.image.to_rgba8();
+        for (i, p) in got.as_chunks::<4>().0.iter().enumerate() {
+            let (x, y) = (i as u32 % w, i as u32 / w);
+            let s = ((y * w + (w - 1 - x)) * 4) as usize;
+            assert_eq!(p[..], px[s..s + 4], "pixel ({x}, {y}) of the flipped image");
+        }
+
+        // Save As to the same file, spelled another way: the same rule
+        let other_spelling = dir.path().join(".").join("art.jxl");
+        let req = save_request(&enc, &path, &[], other_spelling, 50).unwrap();
+        assert_eq!(req.options, expected);
+        // Save As to another file: the save quality
+        let req = save_request(&enc, &path, &[], dir.path().join("copy.jxl"), 50).unwrap();
+        assert_eq!(req.options, EncodeOptions::parse(jxl.options(), &["quality=50".into()]).unwrap());
+    }
+
+    #[test]
+    fn save_as_jpeg_xl_of_an_unedited_jpeg_recompresses_it() {
+        use iv_codec::encode::{EncodeOptions, Metadata, prepare};
+        use iv_core::{ImageBuf, PixelFormat};
+        use iv_pipeline::export::{ExportOutcome, export};
+        let enc = Encoders::default();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("photo.jpg");
+        let px: Vec<u8> =
+            (0..48 * 32u32).flat_map(|i| [(i % 48 * 5) as u8, (i / 48 * 7) as u8, (i % 251) as u8, 255]).collect();
+        let jpeg = enc.for_format(FormatId::Jpeg).unwrap();
+        let img = prepare(&ImageBuf::new(48, 32, PixelFormat::Rgba8, px).unwrap(), jpeg.info(), [255; 3]);
+        std::fs::write(&src, jpeg.encode(&img, &EncodeOptions::default(), &Metadata::default()).unwrap()).unwrap();
+        // the panel quality does not turn the lossless recompression into a pixel encode
+        for ops in [vec![], vec![Op::rotate_cw()]] {
+            let req = save_request(&enc, &src, &ops, dir.path().join("photo.jxl"), 60).unwrap();
+            let outcome = export(&iv_codec::default_registry(), &enc, &req).unwrap();
+            assert!(matches!(outcome, ExportOutcome::JpegRecompressed { .. }), "{ops:?}: {outcome:?}");
+        }
     }
 }

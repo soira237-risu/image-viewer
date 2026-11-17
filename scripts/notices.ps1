@@ -176,6 +176,37 @@ foreach ($id in ($shipped.Keys | Sort-Object { $packages[$_].name }, { $packages
     $rows += [pscustomobject]@{ Name = $p.name; Version = $p.version; License = $(if ($expr) { $expr } else { "see $($p.license_file)" }); Source = $source }
 }
 
+# C and C++ libraries compiled into the executables from the source of a build dependency, which
+# the walk above (normal dependencies only) does not reach: crates/iv-libjxl/build.rs builds
+# libjxl, and the libraries libjxl bundles, from the source in the jpegxl-src package.
+$nativeLibraries = @(
+    @{ Name = 'libjxl'; License = 'BSD-3-Clause'; Source = 'https://github.com/libjxl/libjxl'; Folder = 'libjxl' }
+    @{ Name = 'highway'; License = 'Apache-2.0 OR BSD-3-Clause'; Source = 'https://github.com/google/highway'; Folder = 'libjxl/third_party/highway' }
+    @{ Name = 'brotli'; License = 'MIT'; Source = 'https://github.com/google/brotli'; Folder = 'libjxl/third_party/brotli' }
+    @{ Name = 'skcms'; License = 'BSD-3-Clause'; Source = 'https://skia.googlesource.com/skcms'; Folder = 'libjxl/third_party/skcms' }
+)
+if ($meta.packages | Where-Object { $_.name -eq 'iv-libjxl' -and $null -eq $_.source }) {
+    $jpegxlSrc = @($meta.packages | Where-Object { $_.name -eq 'jpegxl-src' })
+    if ($jpegxlSrc.Count -ne 1) { $problems += "iv-libjxl builds libjxl from jpegxl-src, but Cargo.lock has $($jpegxlSrc.Count) of it" }
+    else {
+        $base = Split-Path $jpegxlSrc[0].manifest_path
+        foreach ($lib in $nativeLibraries) {
+            $label = "$($lib.Name) (C/C++, from jpegxl-src $($jpegxlSrc[0].version))"
+            $bad = @(Get-LicenseIds $lib.License | Where-Object { $_ -notin $allowed })
+            if ($bad) { $problems += "$label is licensed $($lib.License) ($($bad -join ', ') not in the allow-list)"; continue }
+            $folder = Join-Path $base $lib.Folder
+            $files = @(Get-ChildItem $folder -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $licenseFile })
+            if (-not $files) { $problems += "$label has no license file in $folder"; continue }
+            foreach ($f in $files | Sort-Object Name) {
+                $key = Get-Normalized (Get-Content -Raw -Encoding utf8 $f.FullName)
+                if (-not $texts.Contains($key)) { $texts[$key] = [System.Collections.Generic.List[string]]::new() }
+                $texts[$key].Add("$label ($($lib.Folder)/$($f.Name))")
+            }
+            $rows += [pscustomobject]@{ Name = $lib.Name; Version = "(libjxl $($jpegxlSrc[0].version))"; License = $lib.License; Source = $lib.Source }
+        }
+    }
+}
+
 if ($problems) {
     $problems | Sort-Object | ForEach-Object { Write-Host "notices: $_" }
     Write-Host "notices: $($problems.Count) package(s) need attention; nothing written"
@@ -189,10 +220,11 @@ $sb = [System.Text.StringBuilder]::new()
 $rule = '=' * 78
 [void]$sb.Append("image-viewer $version - third-party notices$nl$nl")
 [void]$sb.Append("image-viewer.exe and iv.exe contain the open-source packages listed below (Rust crates from$nl")
-[void]$sb.Append("crates.io, built from the versions in Cargo.lock), and the Rust standard library, whose notices$nl")
-[void]$sb.Append("are in RUST-STD-COPYRIGHT.html. Each package keeps its own license; the license texts follow$nl")
-[void]$sb.Append("the list. Source code of every package is available at the address given for it and at$nl")
-[void]$sb.Append("https://crates.io/crates/<name>/<version>.$nl$nl")
+[void]$sb.Append("crates.io, built from the versions in Cargo.lock, and the C/C++ libraries libjxl, highway,$nl")
+[void]$sb.Append("brotli and skcms, built from the libjxl source in the jpegxl-src crate), and the Rust standard$nl")
+[void]$sb.Append("library, whose notices are in RUST-STD-COPYRIGHT.html. Each package keeps its own license; the$nl")
+[void]$sb.Append("license texts follow the list. Source code of every package is available at the address given$nl")
+[void]$sb.Append("for it, and of every crate at https://crates.io/crates/<name>/<version>.$nl$nl")
 [void]$sb.Append("Compiler: $rustVersion$nl$nl")
 [void]$sb.Append("이 프로그램(image-viewer.exe, iv.exe)에는 아래의 오픈 소스 패키지와 Rust 표준 라이브러리가$nl")
 [void]$sb.Append("들어 있습니다. 각 패키지의 라이선스 전문은 목록 뒤에 있습니다.$nl$nl")

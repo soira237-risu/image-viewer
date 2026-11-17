@@ -100,3 +100,106 @@ impl Decoder for JxlOxideDecoder {
         Ok(Decoded::still(info, image))
     }
 }
+
+/// The JPEG file a JPEG XL was made from by lossless recompression, rebuilt from the DCT
+/// coefficients and the reconstruction data (`jbrd` box) it carries: the same bytes as the
+/// original. With it comes the orientation the JPEG XL is shown in (its own header, which libjxl
+/// took from the JPEG's EXIF). `Ok(None)` when the file carries no usable reconstruction data:
+/// it was encoded from pixels, or the data is damaged.
+pub fn rebuild_jpeg(src: &Source) -> Result<Option<(Vec<u8>, Orientation)>> {
+    let image = JxlImage::builder().read(src.reader()?).map_err(err)?;
+    if image.jpeg_reconstruction_status() != jxl_oxide::JpegReconstructionStatus::Available {
+        return Ok(None);
+    }
+    let mut jpeg = Vec::new();
+    // "Available" can still fail on inconsistent data: that is no reconstruction data either
+    if image.reconstruct_jpeg(&mut jpeg).is_err() {
+        return Ok(None);
+    }
+    Ok(Some((undouble_comment_markers(jpeg), Orientation::from_exif(image.image_header().metadata.orientation))))
+}
+
+/// Undoes a jxl-jbr 0.2.1 slip: it writes every comment (COM) segment as `FF FE FE <length>`,
+/// because libjxl keeps the marker byte at the start of a stored comment and jxl-jbr writes it
+/// once more before it. Any other part of the file is copied as it is. The extra byte is removed
+/// only where the segment read without it ends exactly at the next marker, so a comment whose
+/// length really starts with 0xFE (64 KiB long) is left alone.
+fn undouble_comment_markers(jpeg: Vec<u8>) -> Vec<u8> {
+    let be16 = |at: usize| jpeg.get(at..at + 2).map(|b| u16::from_be_bytes([b[0], b[1]]) as usize);
+    if !jpeg.starts_with(&[0xFF, 0xD8]) {
+        return jpeg;
+    }
+    let mut out = Vec::with_capacity(jpeg.len());
+    out.extend_from_slice(&[0xFF, 0xD8]);
+    let mut pos = 2;
+    while pos + 1 < jpeg.len() && jpeg[pos] == 0xFF {
+        let marker = jpeg[pos + 1];
+        match marker {
+            // fill byte before a marker
+            0xFF => {
+                out.push(0xFF);
+                pos += 1;
+                continue;
+            }
+            // end of image: the rest (and anything appended after it) as it is
+            0xD9 => break,
+            0x01 | 0xD0..=0xD7 => {
+                out.extend_from_slice(&jpeg[pos..pos + 2]);
+                pos += 2;
+                continue;
+            }
+            _ => {}
+        }
+        if marker == 0xFE
+            && jpeg.get(pos + 2) == Some(&0xFE)
+            && let Some(len) = be16(pos + 3).filter(|l| *l >= 2)
+            && jpeg.get(pos + 3 + len) == Some(&0xFF)
+        {
+            out.extend_from_slice(&jpeg[pos..pos + 2]);
+            out.extend_from_slice(&jpeg[pos + 3..pos + 3 + len]);
+            pos += 3 + len;
+            continue;
+        }
+        let Some(end) = be16(pos + 2).map(|l| pos + 2 + l).filter(|e| *e <= jpeg.len()) else { break };
+        out.extend_from_slice(&jpeg[pos..end]);
+        pos = end;
+        if marker == 0xDA {
+            // entropy-coded data runs to the next marker that is not a stuffed zero or a restart
+            let start = pos;
+            while pos + 1 < jpeg.len() && !(jpeg[pos] == 0xFF && !matches!(jpeg[pos + 1], 0x00 | 0xD0..=0xD7)) {
+                pos += 1;
+            }
+            out.extend_from_slice(&jpeg[start..pos]);
+        }
+    }
+    out.extend_from_slice(&jpeg[pos.min(jpeg.len())..]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::undouble_comment_markers;
+
+    #[test]
+    fn doubled_comment_markers_are_undone_and_nothing_else_changes() {
+        let scan = [0xFF, 0xDA, 0, 2, 0x12, 0xFF, 0x00, 0x34, 0xFF, 0xD0, 0x56];
+        let good: Vec<u8> =
+            [&[0xFF, 0xD8][..], &[0xFF, 0xFE, 0, 4, b'h', b'i'], &scan, &[0xFF, 0xFE, 0, 3, b'!'], &[0xFF, 0xD9, 7, 7]]
+                .concat();
+        assert_eq!(undouble_comment_markers(good.clone()), good, "a well-formed file is copied");
+        let doubled: Vec<u8> = [
+            &[0xFF, 0xD8][..],
+            &[0xFF, 0xFE, 0xFE, 0, 4, b'h', b'i'],
+            &scan,
+            &[0xFF, 0xFE, 0xFE, 0, 3, b'!'],
+            &[0xFF, 0xD9, 7, 7],
+        ]
+        .concat();
+        assert_eq!(undouble_comment_markers(doubled), good);
+        // a real 0xFExx-byte comment: read without the byte it would not end at a marker
+        let mut long = vec![0xFF, 0xD8, 0xFF, 0xFE, 0xFE, 0x10];
+        long.extend(std::iter::repeat_n(b'c', 0xFE10 - 2));
+        long.extend_from_slice(&[0xFF, 0xD9]);
+        assert_eq!(undouble_comment_markers(long.clone()), long);
+    }
+}

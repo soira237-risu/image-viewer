@@ -21,11 +21,13 @@
 - 읽기: JPEG, PNG/APNG, GIF, WebP, AVIF, JPEG XL, TIFF, BMP, ICO, QOI, TGA, PNM, DDS, EXR, HDR, SVG
 - HEIC/HEIF와 카메라 RAW는 Windows 코덱으로 읽음 (Microsoft Store의 확장이 필요, 없으면 무엇을 설치해야 하는지 알려 줌)
 - 압축파일: ZIP/CBZ, 7z/CB7 (만화 두 쪽 보기)
+- JPEG XL 쓰기: 참조 구현 libjxl 0.12 (정적 링크). 손실(`quality` 1–100, libjxl과 같은 거리 대응, 기본 90)·무손실, `effort` 1–9, 투명도와 16비트 깊이 유지, ICC·EXIF 기록
+- JPEG → JPEG XL은 기본으로 화질 손실 없는 재압축 (JPEG 계수를 그대로 보관, 회전·뒤집기는 방향 값으로): 원본보다 작고, 다시 JPEG으로 바꾸면 원본과 바이트까지 같은 파일이 돌아옴. 다른 편집이 있거나 libjxl이 받지 못하는 JPEG은 픽셀 인코딩으로 넘어감
 
 ### 편집과 저장
 
 - 회전·뒤집기·자르기·크기 변경, 밝기·대비·채도·감마 보정, 실행 취소/다시 실행
-- 저장은 파일 내용의 실제 형식으로, JPEG 회전은 무손실, 임시 파일에 쓴 뒤 바꿔치기
+- 저장은 파일 내용의 실제 형식으로, JPEG 회전은 무손실, JPEG XL을 그 자리에 저장하면 항상 무손실, 임시 파일에 쓴 뒤 바꿔치기
 - 다른 이름으로 저장 (9개 형식), 내용과 다른 확장자 바로잡기(Ctrl+E)
 - `iv convert --no-metadata`는 위치(EXIF)·XMP·ICC·주석을 지움: JPEG→JPEG(회전·뒤집기만)은 다시 압축하지 않고 메타데이터만 뺌
 
@@ -49,6 +51,6 @@
 
 ### 배포
 
-- C 런타임을 정적으로 링크: Visual C++ 재배포 패키지 없이 실행
+- C 런타임을 정적으로 링크: Visual C++ 재배포 패키지 없이 실행 (libjxl과 그 안의 highway·brotli·skcms도 /MT로 빌드)
 - 실행 파일에 빌드한 컴퓨터의 경로가 들어가지 않음, 매니페스트에 Windows 10/11 지원·모니터별 DPI 선언
 - 라이선스: MIT (`LICENSE`). 함께 들어 있는 오픈 소스 패키지의 라이선스: `THIRD-PARTY-NOTICES.txt`, `RUST-STD-COPYRIGHT.html`

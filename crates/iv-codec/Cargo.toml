@@ -20,7 +20,9 @@ resvg.workspace = true
 moxcms.workspace = true
 webp.workspace = true
 bytemuck.workspace = true
-zune-jpegxl.workspace = true
+gamut-jxl.workspace = true
+gamut-core.workspace = true
+iv-libjxl.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

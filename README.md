@@ -16,8 +16,9 @@ M0~M6 완료:
 - 형식: JPEG, PNG/APNG, GIF, WebP, AVIF, HEIC, JPEG XL, TIFF, BMP, ICO, QOI, TGA, PNM, DDS, EXR, HDR, SVG, 카메라 RAW, ICC 색 관리 (HEIC와 RAW는 Windows 코덱으로 읽음: [선택 코덱](#선택-코덱-heicraw) 참고)
 - 압축파일: ZIP/CBZ, 7z/CB7 (만화 두 쪽 보기, 7z는 페이지가 든 압축 블록만 풂). `\`로 구분한 항목 이름(일부 Windows 도구)도 열림. 압축파일 밖을 가리키는 이름(`..`, `C:`, `/`로 시작)의 항목은 목록에서 빠짐. 항목 하나는 1 GiB까지 읽음. 7z의 헤더(파일 목록)는 풀어서 17 MiB까지(헤더 압축 사전 16 MiB까지, py7zr 기본값 포함), 압축 사전은 1 GiB까지만 받음
 - SVG: 문서 안에 `data:`로 넣은 이미지만 그림. 바깥 파일·네트워크 경로(`\\서버\...`)를 가리키는 이미지는 읽지 않고 빈 칸으로 둠
-- 편집: 회전·뒤집기·자르기·보정·크기 변경, 실행 취소, 저장/다른 이름으로 저장 (JPEG 회전은 무손실)
+- 편집: 회전·뒤집기·자르기·보정·크기 변경, 실행 취소, 저장/다른 이름으로 저장 (JPEG 회전은 무손실, JPEG XL은 제자리 저장 때 무손실)
 - 변환: 9개 형식 인코더, 확장자 바로잡기(뷰어 Ctrl+E, `iv fix-ext`), 일괄 변환(`iv convert`, 명령줄 전용)
+- JPEG XL 쓰기: 참조 구현 libjxl 0.12 (정적 링크). 손실(품질 1–100)·무손실, 알파·16비트 유지, ICC·EXIF 기록. 편집하지 않은(회전·뒤집기만 한) JPEG은 화질 손실 없이 JPEG XL로 다시 담아 줄이고(JPEG 계수를 그대로 보관), 그 JPEG XL을 다시 JPEG으로 바꾸면 원본 JPEG이 바이트 단위로 그대로 돌아옴. 자세한 것은 [JPEG XL 저장](#jpeg-xl-저장)
 
 설계와 개발 단계는 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), 개발 규칙(빌드 캐시 용량 관리 포함)은 [AGENTS.md](AGENTS.md), 버전별 변경은 [CHANGELOG.md](CHANGELOG.md) 참고.
 
@@ -44,7 +45,7 @@ AVIF·WebP·JPEG XL을 비롯한 나머지 형식은 모두 뷰어 안의 디코
 
 ## 소스에서 빌드
 
-필요: Rust 1.98 이상 (MSVC 툴체인), Visual Studio 2022 Build Tools (C++ 워크로드), NASM (AV1 디코더 `rav1d`의 어셈블리 최적화용).
+필요: Rust 1.98 이상 (MSVC 툴체인), Visual Studio 2022 Build Tools (C++ 워크로드), NASM (AV1 디코더 `rav1d`의 어셈블리 최적화용), CMake (JPEG XL 인코더 libjxl 빌드용: Build Tools의 C++ 워크로드에 들어 있는 것을 PATH에 넣으면 됨, 처음 한 번 1–2분).
 C 런타임 정적 링크 등 모든 빌드에 공통인 설정은 `.cargo/config.toml`에 있음 (`RUSTFLAGS` 환경 변수를 쓰면 이 설정이 무시됨).
 
 ```bash
@@ -59,6 +60,11 @@ cargo build --release
 ./target/release/iv bench <파일|폴더>   # probe / preview / decode 시간 측정
 ./target/release/iv convert --to webp --opt quality=82 --max 1920 --out out <파일|폴더>   # 일괄 변환
 ./target/release/iv convert --to jpg --no-metadata --out out <파일|폴더>   # 위치(EXIF)·XMP·ICC·주석을 지운 사본 (JPEG→JPEG은 다시 압축하지 않음)
+./target/release/iv convert --to jxl --out out <JPEG 파일|폴더>   # JPEG을 손실 없이 JPEG XL로 다시 담기 (보통 20–30% 작아짐)
+./target/release/iv convert --to jpg --out back <JPEG XL 파일>   # 그렇게 만든 JPEG XL에서 원본 JPEG을 그대로 되살리기
+./target/release/iv convert --to jxl --opt quality=80 --opt effort=7 <PNG 등>   # 손실 JPEG XL (기본 quality=90, effort=7)
+./target/release/iv convert --to jxl --opt lossless=true <PNG 등>   # 무손실 JPEG XL
+./target/release/iv convert --to jxl --opt lossless_jpeg=false --opt quality=75 <JPEG>   # JPEG도 픽셀로 다시 인코딩
 ./target/release/iv fix-ext --dry-run <파일|폴더>   # 내용과 다른 확장자 찾기 (빼면 실제로 바꿈)
 ./target/release/image-viewer <파일|폴더>    # 뷰어 (--trace: 시작 단계별 시간 출력, --no-activate: 포커스를 가져가지 않고 열기)
 ./target/release/image-viewer --version     # 버전 (`iv --version`도 같음)
@@ -123,8 +129,26 @@ cargo build --release
 창 위치·크기·최대화 상태는 닫을 때 설정 파일 옆의 `window.toml`에 따로 기록되어 다음 실행 때 그대로 열림 (`settings.toml`은 설정 창에서 저장할 때만 쓰므로 직접 고친 값·주석은 그대로 남음) (전체 화면은 기억하지 않음, 연결이 끊긴 모니터 위치는 무시). 처음 열 때는 주 모니터 배율에 맞춘 1280×800(논리 픽셀) 크기로 가운데에 열림.
 오류 기록: 콘솔 없이 실행되므로 열기·저장·폴더 읽기 실패 같은 진단 내용은 `%LOCALAPPDATA%\image-viewer\image-viewer.log`에도 남음 (무언가 기록할 때만 생김, 256 KiB를 넘으면 다음 실행에서 비우고 새로 씀, 한 번 실행에 128 KiB까지). 뷰어가 비정상 종료하면 `crash.log`(같은 폴더, 마지막 한 건만 보관)에 위치·백트레이스(프레임 주소와 실행 파일 기준 오프셋, 실행 파일의 시작 주소·.pdb 식별자)를 쓰고 그 경로를 알리는 창을 띄움. 기록을 쓰지 못하면(폴더 없음·디스크 가득 참·권한 없음) 창은 파일을 남겼다고 하지 않고 그 이유와 패닉 메시지·위치를 보여 줌. 손상된 파일 때문에 디코더가 패닉해도 그 이미지만 "열 수 없습니다"로 실패하고 뷰어는 계속 동작함.
 
-### 기본 뷰어로 쓰기
+### JPEG XL 저장
 
+JPEG XL 인코더는 참조 구현 libjxl 0.12를 실행 파일에 정적으로 넣은 것 (읽기는 그대로 jxl-oxide). 옵션 (`iv convert --opt`):
+
+| 옵션 | 범위 | 기본 | 뜻 |
+|---|---|---|---|
+| `quality` | 1–100 | 90 | libjxl `JxlEncoderDistanceFromQuality`와 같은 대응으로 거리(distance)로 바꿈: 90 → 1.0("눈으로 보기에 무손실"), 75 → 2.35, 50 → 4.6. 100은 무손실 |
+| `lossless` | true/false | false | 픽셀 그대로 무손실 |
+| `effort` | 1–9 | 7 | 1은 빠르고 9는 느리지만 작음 (libjxl 기본 7) |
+| `lossless_jpeg` | true/false | true | JPEG 원본을 손실 없이 다시 담기 (아래) |
+
+기본값은 libjxl의 `cjxl`과 같음: **JPEG 원본**은 디코딩하지 않고 DCT 계수와 원본 복원 정보(`jbrd`)를 그대로 담음 (`quality`는 쓰이지 않음, 보통 원본보다 20–30% 작음). 회전·뒤집기만 했으면 JPEG XL의 방향 값으로 담아 역시 무손실. 자르기·크기 변경·보정이 있거나, libjxl이 받지 못하는 JPEG(산술 부호화, CMYK 등)이거나, EXIF에 바꿀 방향 태그가 없는 JPEG을 회전했으면 오류 없이 픽셀 인코딩으로 넘어감. **JPEG이 아닌 원본**은 quality 90(거리 1.0)의 손실 인코딩. 투명도와 16비트 깊이는 손실·무손실 모두 유지.
+
+이렇게 만든 JPEG XL을 `--to jpg`로 바꾸면(편집이 없거나 회전·뒤집기만) 다시 인코딩하지 않고 원본 JPEG을 되살림: 편집이 없으면 원본과 바이트까지 같고, 회전·뒤집기는 EXIF 방향만 고침.
+
+메타데이터는 다른 형식과 같은 규칙: ICC와 EXIF를 담고(EXIF는 JPEG XL 컨테이너의 `Exif` 상자), `--no-metadata`면 아무것도 담지 않음 (JPEG을 다시 담을 때는 위치·XMP·ICC·주석을 뺀 JPEG을 담음).
+
+뷰어: 다른 이름으로 저장(`.jxl`)은 저장 품질 슬라이더를 `quality`로 쓰고, 편집하지 않은 JPEG은 위처럼 손실 없이 다시 담음. JPEG XL 파일을 그 자리에 저장(Ctrl+S, 또는 같은 파일로 다른 이름으로 저장)하면 항상 무손실로 씀 (원본이 무손실이거나 다시 담은 JPEG일 수 있으므로 저장할 때마다 화질이 떨어지지 않게 함).
+
+### 기본 뷰어로 쓰기
 설정(F2)의 "Windows '연결 프로그램' 목록"에서 **등록**을 누르면(또는 `image-viewer --register`) 지금 실행 중인 image-viewer.exe가 지원하는 모든 이미지·압축파일 확장자의 "연결 프로그램" 목록과 Windows 설정 > 기본 앱에 나타남. 현재 사용자(`HKEY_CURRENT_USER`)에만 쓰므로 관리자 권한이 필요 없음. Windows 10/11은 프로그램이 스스로 기본 앱이 되는 것을 막으므로, 기본 뷰어로 쓰려면 **기본 앱 설정…** 버튼으로 연 화면에서 image-viewer를 고름. **등록 해제**(`--unregister`)는 등록이 쓴 값만 지우고(다른 프로그램의 항목과 사용자가 고른 기본 앱 설정은 그대로) 원래대로 돌림. 실행 파일을 옮겼으면 다시 등록.
 
 화면 언어는 한국어가 기본이고 설정(F2)의 "언어"에서 English로 바꿀 수 있음 (바로 적용, `settings.toml`의 `language = "ko"` / `"en"`).

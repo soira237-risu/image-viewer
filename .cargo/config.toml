@@ -9,3 +9,11 @@
 # of Windows 10 and later; it is linked statically as well. The C code built by `cc` (libwebp)
 # follows this setting.
 rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+# gamut-jxl's FFI crate would build libjxl through jpegxl-src, which demands the Visual Studio
+# ClangCL toolset (an optional component; the build fails with MSB8020 without it). This tells it
+# to build nothing; crates/iv-libjxl compiles the same libjxl source with the default toolset and
+# links it instead. Its "will not link (check-only)" warning is expected: iv-libjxl provides the
+# library.
+GAMUT_JXL_SYS_SKIP_NATIVE = "1"

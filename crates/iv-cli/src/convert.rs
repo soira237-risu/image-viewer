@@ -177,6 +177,18 @@ pub fn convert(args: &[String]) -> ExitCode {
             Ok(ExportOutcome::LosslessOrientation) => {
                 println!("ok    {} -> {} (lossless EXIF rotation, {ms:.0} ms)", path.display(), dest.display())
             }
+            Ok(ExportOutcome::JpegRecompressed { bytes }) => println!(
+                "ok    {} -> {} (lossless JPEG recompression, {} KiB, {ms:.0} ms)",
+                path.display(),
+                dest.display(),
+                bytes / 1024
+            ),
+            Ok(ExportOutcome::JpegRebuilt { bytes }) => println!(
+                "ok    {} -> {} (original JPEG rebuilt, {} KiB, {ms:.0} ms)",
+                path.display(),
+                dest.display(),
+                bytes / 1024
+            ),
             Ok(ExportOutcome::Encoded { bytes, dropped_frames }) => {
                 let note = if dropped_frames > 0 {
                     format!(", first frame only: {dropped_frames} frames not saved")

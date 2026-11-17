@@ -63,6 +63,7 @@ iv-cli : iv-pipeline + iv-ops + iv-codec 재사용 (일괄 변환·벤치마크�
 | `iv-pipeline` | 폴더 목록·자연 정렬, 디코드 서비스, 캐시, 미리 읽기, 내보내기 | 없음 |
 | `iv-win` | 창(Win32), 입력, 명령, 설정, CPU 렌더러(`raster`), 편집 패널·설정 창(기본 컨트롤) | Win32 (렌더러·명령·키맵·설정은 플랫폼 독립) |
 | `iv-cli` | `iv convert`, `iv bench`, `iv probe` | 없음 |
+| `iv-libjxl` | 코드 없음: build.rs가 libjxl 0.12(`jpegxl-src` 안의 소스)를 CMake + 기본 MSVC 도구 집합으로 빌드해 정적 링크 (`gamut-jxl`의 JPEG XL 인코더용) | 없음 |
 
 UI 없는 크레이트가 핵심 로직 전부를 담아 **CLI·테스트·벤치마크에서 그대로 검증**하는 것이 원칙.
 
@@ -225,7 +226,7 @@ export(source, edits, target_codec, options, dest):
 | TIFF | `image` (`tiff`) → WIC | `image` | |
 | AVIF | **WIC (AV1 확장)** → 이후 dav1d | `ravif` 0.13 | |
 | HEIC/HEIF | **WIC (HEIF 확장)** → 이후 `libheif-rs` 3.0 | (보류) | libheif는 LGPL |
-| JPEG XL | `jxl-oxide` 0.12 (순수 Rust) | (보류, libjxl 필요) | |
+| JPEG XL | `jxl-oxide` 0.12 (순수 Rust) | `gamut-jxl` 0.5 → libjxl 0.12 (정적, `iv-libjxl`) | JPEG 무손실 재압축(jbrd), 원본 JPEG 복원은 `jxl-oxide` |
 | RAW | 내장 미리보기 우선 → WIC(RAW 확장) → `rawler` 0.8 | 해당 없음 | |
 | SVG | `resvg` 0.50 | 해당 없음 | |
 | EXR/HDR | `image` | `image` | HDR 톤매핑은 M5 |
@@ -332,6 +333,19 @@ export(source, edits, target_codec, options, dest):
 - 빌드 요구 사항에 NASM 추가 (rav1d 어셈블리)
 - 자동 창 검사는 `--no-activate`로 실행 (테스트 창이 포커스를 가져가 다른 앱의 키 입력을 받는 일이 실제로 있었음)
 
+### JPEG XL 인코딩 (2026-11-17)
+
+- 인코더를 `zune-jpegxl`(무손실만, 메타데이터 없음)에서 참조 구현 libjxl 0.12로 교체. 안전한 Rust 계층은 `gamut-jxl` 0.5 (MIT/Apache-2.0, `encode` 기능만: 디코딩은 계속 `jxl-oxide`)
+- libjxl 빌드: `gamut-jxl-sys`는 `jpegxl-src`의 `build()`로 빌드하는데, 이것이 CMake에 ClangCL 도구 집합(Visual Studio 선택 구성 요소)을 요구해 Build Tools 기본 설치에서는 MSB8020으로 실패함. 그래서 `.cargo/config.toml`의 `[env] GAMUT_JXL_SYS_SKIP_NATIVE=1`로 그 빌드를 끄고, 새 크레이트 `iv-libjxl`의 build.rs가 같은 소스(`jpegxl-src-0.12.0/libjxl`)를 기본 MSVC 도구 집합으로 빌드해 `jxl`·`jxl_cms`·`hwy`·`brotli*`를 정적 링크. `cmake` 크레이트가 MSVC 플래그를 자기 것으로 바꾸면 최적화(/O2)와 C++ 예외 해제(/EHsc)가 빠지므로 CMake 기본 플래그를 직접 주고, C 런타임은 `CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`(/MT). 디버그 빌드에서도 항상 Release로 빌드(처음 한 번 약 1–2분)
+- 옵션: `quality` 1–100(libjxl `JxlEncoderDistanceFromQuality`와 같은 식으로 거리로, 100은 무손실), `lossless`, `effort` 1–9, `lossless_jpeg`. 기본은 `cjxl`과 같음: JPEG은 무손실 재압축, 그 밖은 quality 90(거리 1.0)·effort 7
+- 메타데이터: RGB ICC는 코드스트림에(libjxl이 아는 색 공간이면 코드로 줄여 담음), EXIF는 컨테이너 `Exif` 상자에. 메타데이터가 없으면 컨테이너 없는 코드스트림
+- 내보내기(`iv-pipeline/src/export.rs`): JPEG 원본 + 회전·뒤집기만 + `lossless_jpeg`면 `Encoder::recompress_jpeg`(libjxl `JxlEncoderAddJPEGFrame` + `StoreJPEGMetadata`). 방향은 libjxl이 넘겨받은 JPEG의 EXIF에서 읽으므로, JPEG 회전과 같은 방식으로 EXIF 방향을 고친(또는 `--no-metadata`면 메타데이터를 뺀) JPEG을 넘김. 아무것도 바꾸지 않으면 원본 바이트를 그대로 넘겨 원본 복원이 바이트 단위로 같게 함. libjxl이 거부하면(CMYK, 산술 부호화 등) 픽셀 인코딩
+- 원본 JPEG 복원: JPEG XL → JPEG(회전·뒤집기만)이면 `jxl-oxide`의 `reconstruct_jpeg`(`jxl-jbr` 0.2.1)로 복원한 뒤 JPEG 회전과 같은 EXIF 경로. `jxl-jbr` 0.2.1은 주석(COM) 세그먼트의 표지 바이트를 두 번 씀(`FF FE FE …`: libjxl이 저장한 주석에 이미 표지 바이트가 있음) → `iv-codec`의 `undouble_comment_markers`가 바로잡음 (뒤따르는 길이로 다음 표지에 정확히 닿을 때만). 복원물이 읽히지 않으면 픽셀 인코딩
+- 뷰어: JPEG XL을 그 자리에 저장하면(같은 파일로 다른 이름으로 저장 포함) `lossless=true`를 더해 항상 무손실. 다른 이름으로 저장은 저장 품질 슬라이더가 `quality`
+- 고지: `scripts/notices.ps1`이 빌드 의존성(`jpegxl-src`)에서 빌드되어 들어가는 libjxl·highway·brotli·skcms의 LICENSE·PATENTS도 넣음
+- 시험: 손실 품질별 크기·PSNR, 거리 대응, effort, 알파·16비트 손실/무손실, ICC(코드로 줄인 것과 그대로 둔 것)·EXIF 상자, JPEG→JXL 무손실 재압축(작아짐, 디코드 결과 PSNR, ICC 유지, `--no-metadata`), 회전, JXL→JPEG 바이트 동일 복원, 픽셀 인코딩으로 넘어가는 경우(자르기, `lossless_jpeg=false`, PNG, CMYK, 방향 태그 없는 EXIF), 뷰어 제자리 저장의 무손실
+- 측정 (i5-14600K, 릴리스): Windows 배경 화면 JPEG 3장(3840×2400) 무손실 재압축 826 734 → 659 500 B(−21%), 1 602 752 → 1 134 487 B(−30%), 1 150 704 → 799 836 B(−31%), 한 장 약 0.3초, 되살린 JPEG은 3장 모두 원본과 바이트 동일. 같은 사진(PNG 2.37 MB)의 손실 JPEG XL: quality 90 148 613 B(3.4초), 75 83 286 B, 50 55 110 B, 무손실 1 446 914 B. 실행 파일: image-viewer.exe 18 808 832 → 22 592 000 B, iv.exe 17 178 624 → 20 958 720 B (+3.6 MiB씩), libjxl 빌드 77초(-j 3)
+- 남은 것: `gamut-jxl`은 libjxl의 병렬 실행기를 쓰지 않아 한 장을 한 스레드로 인코딩함 (일괄 변환은 파일 단위로 병렬). MSVC 빌드의 Highway는 SSE2 + AVX2만 디스패치함 (ClangCL 빌드는 SSE4·AVX-512 경로도 넣어 더 큼)
 ### M4 결과 (2026-11-15)
 
 - `iv-ops`: 회전·뒤집기(방향 합성 = D4 군), 자르기, 크기 변경(Lanczos3), 보정(밝기·대비·감마·채도), 실행 취소/다시 실행. 어떤 편집 목록이든 `Geometry`(저장 픽셀 자르기 영역 + 방향 + 크기 + 보정)로 정규화 → 화면은 GPU UV 변환으로 즉시 미리보기, 저장할 때만 픽셀 계산
@@ -500,7 +514,7 @@ GPU를 쓰는 순간 드라이버(AMD `amdxc64.dll` 등)가 100 MB대 바닥을 
 - 실제 카메라 RAW 파일로 WIC 경로 검증 (샘플 필요)
 - RAR/CBR (unRAR 라이선스 확인 후)
 - HDR 톤매핑 (현재 부동소수 이미지는 SDR로 자름), 모니터 ICC 프로파일
-- JPEG XL 손실 인코딩, 애니메이션 WebP/AVIF로 변환
+- 애니메이션 WebP/AVIF/JPEG XL로 변환
 - 절반보다 덜 줄이는 맞춤(3840×2400을 4K 화면에)은 여전히 원본에서 리샘플: 22 ms. 리샘플러 임시 버퍼를 대기 중에도 두면 빨라지지만 화면 크기의 두 배 메모리
 - 7z 페이지 캐시(최대 128 MiB)는 디코드 예산 밖
 

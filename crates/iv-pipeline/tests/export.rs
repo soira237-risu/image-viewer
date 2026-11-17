@@ -346,3 +346,259 @@ fn archive_pages_decode_and_can_be_saved_as_files() {
     assert_eq!((d.image.width(), d.image.height()), (4, 6));
     assert!(fix_extension(&default_registry(), &pages[0]).is_err(), "archive pages cannot be renamed");
 }
+
+// --- JPEG XL: lossless JPEG recompression, the rebuilt original, and the fallbacks ---
+
+/// A photo-like JPEG (gradients with fine texture) at quality 90.
+fn photo_jpeg(w: u32, h: u32) -> Vec<u8> {
+    let mut seed = 0x9e37_79b9u32;
+    let img = RgbaImage::from_fn(w, h, |x, y| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let n = (seed % 20) as i32 - 10;
+        let wave = (((x as f32 * 0.17).sin() + (y as f32 * 0.11).cos()) * 35.0) as i32;
+        let c = |b: i32| (b + wave + n).clamp(0, 255) as u8;
+        Rgba([c((x * 220 / w) as i32), c((y * 180 / h) as i32 + 20), c(120), 255])
+    });
+    let mut out = Vec::new();
+    let rgb = DynamicImage::ImageRgba8(img).to_rgb8();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
+        .write_image(rgb.as_raw(), w, h, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    out
+}
+
+fn segment(marker: u8, body: &[u8]) -> Vec<u8> {
+    let mut s = vec![0xFF, marker];
+    s.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
+    s.extend_from_slice(body);
+    s
+}
+
+/// `jpeg` with EXIF (orientation 1 and a location), XMP, a real ICC profile and a comment, all
+/// carrying markers a test can look for.
+fn with_real_metadata(jpeg: &[u8], icc: &[u8]) -> Vec<u8> {
+    let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+    tiff.extend_from_slice(&2u16.to_le_bytes());
+    tiff.extend_from_slice(&[0x12, 0x01, 3, 0, 1, 0, 0, 0, 1, 0, 0, 0]);
+    tiff.extend_from_slice(&[0x25, 0x88, 4, 0, 1, 0, 0, 0, 38, 0, 0, 0]);
+    tiff.extend_from_slice(&[0; 4]);
+    tiff.extend_from_slice(&1u16.to_le_bytes());
+    tiff.extend_from_slice(&[0x12, 0, 2, 0, 11, 0, 0, 0, 56, 0, 0, 0]);
+    tiff.extend_from_slice(&[0; 4]);
+    tiff.extend_from_slice(b"SECRET-GPS\0");
+    let icc_body = [b"ICC_PROFILE\0\x01\x01".as_slice(), icc].concat();
+    assert_eq!(jpeg[2..4], [0xFF, 0xE0]);
+    let at = 4 + u16::from_be_bytes([jpeg[4], jpeg[5]]) as usize;
+    [
+        &jpeg[..at],
+        &segment(0xE1, &[b"Exif\0\0".as_slice(), &tiff].concat()),
+        &segment(0xE1, b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta>SECRET-XMP</x:xmpmeta>"),
+        &segment(0xE2, &icc_body),
+        &segment(0xFE, b"SECRET-COMMENT"),
+        &jpeg[at..],
+    ]
+    .concat()
+}
+
+fn jxl_request(source: &Path, dest: &Path, ops: Vec<Op>, opts: &[&str]) -> ExportRequest {
+    let mut req = request(source, dest, FormatId::Jxl, ops);
+    let enc = Encoders::default();
+    let options = enc.for_format(FormatId::Jxl).unwrap().options();
+    req.options = EncodeOptions::parse(options, &opts.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
+    req
+}
+
+/// Mean squared error over the colour channels, as PSNR in dB.
+fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let (sum, n) = a
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<4>().0)
+        .flat_map(|(p, q)| (0..3).map(move |c| (p[c] as f64 - q[c] as f64).powi(2)))
+        .fold((0.0, 0usize), |(s, n), d| (s + d, n + 1));
+    let mse = sum / n as f64;
+    if mse == 0.0 { f64::INFINITY } else { 10.0 * (255.0f64 * 255.0 / mse).log10() }
+}
+
+fn decode_stored(path: &Path) -> iv_codec::Decoded {
+    default_registry().decode_unmanaged(&Source::from_path(path), &CancelToken::never()).unwrap()
+}
+
+/// The stored pixels of `d` turned the way they are shown.
+fn upright(d: &iv_codec::Decoded) -> Vec<u8> {
+    let g = iv_ops::Geometry::new((d.image.width(), d.image.height()), d.info.orientation, &[]);
+    iv_ops::apply::render(&d.image, &g).unwrap().to_rgba8().into_owned()
+}
+
+#[test]
+fn jpeg_to_jxl_is_recompressed_losslessly_and_rebuilds_bit_for_bit() {
+    let dir = tempfile::tempdir().unwrap();
+    let p3 = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+    let original = with_real_metadata(&photo_jpeg(256, 160), &p3);
+    let src = write(dir.path(), "photo.jpg", &original);
+
+    // `iv convert --to jxl`, defaults
+    let jxl = dir.path().join("photo.jxl");
+    let outcome = run(&jxl_request(&src, &jxl, vec![], &[]));
+    let out = std::fs::read(&jxl).unwrap();
+    assert_eq!(outcome, ExportOutcome::JpegRecompressed { bytes: out.len() });
+    assert!(out.len() < original.len(), "{} bytes from a {}-byte JPEG", out.len(), original.len());
+
+    // the same picture: both decoders run the same DCT coefficients, only their rounding differs
+    let (a, b) = (decode_stored(&src), decode_stored(&jxl));
+    assert_eq!(b.info.format, FormatId::Jxl);
+    assert_eq!((b.image.width(), b.image.height()), (256, 160));
+    let p = psnr(&a.image.to_rgba8(), &b.image.to_rgba8());
+    assert!(p > 45.0, "decoded JPEG and JPEG XL differ: PSNR {p:.1} dB");
+
+    // metadata kept: the colour profile (stored by libjxl as Display P3's code) ...
+    let icc = b.info.icc_profile.as_deref().expect("colour profile kept");
+    let red = |p: &[u8]| moxcms::ColorProfile::new_from_slice(p).unwrap().red_colorant;
+    assert!((red(icc).x - red(&p3).x).abs() < 2e-3, "Display P3 primaries");
+
+    // ... and everything else: the original file comes back byte for byte
+    let back = dir.path().join("back.jpg");
+    let outcome = run(&request(&jxl, &back, FormatId::Jpeg, vec![]));
+    assert_eq!(outcome, ExportOutcome::JpegRebuilt { bytes: original.len() });
+    assert_eq!(std::fs::read(&back).unwrap(), original, "JPEG -> JPEG XL -> JPEG gives the same bytes");
+}
+
+#[test]
+fn jpeg_to_jxl_without_metadata_keeps_none_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let p3 = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+    let plain = photo_jpeg(128, 96);
+    let original = with_real_metadata(&plain, &p3);
+    let src = write(dir.path(), "located.jpg", &original);
+    let jxl = dir.path().join("shared.jxl");
+    let mut req = jxl_request(&src, &jxl, vec![], &[]);
+    req.keep_metadata = false;
+    assert!(matches!(run(&req), ExportOutcome::JpegRecompressed { .. }));
+    let out = std::fs::read(&jxl).unwrap();
+    assert!(!contains(&out, b"SECRET"), "metadata left in the JPEG XL");
+    assert!(!contains(&out, b"Exif") && !contains(&out, b"xml "), "no metadata boxes");
+
+    // what it holds is exactly the JPEG without its metadata
+    let back = dir.path().join("back.jpg");
+    assert!(matches!(run(&request(&jxl, &back, FormatId::Jpeg, vec![])), ExportOutcome::JpegRebuilt { .. }));
+    let rebuilt = std::fs::read(&back).unwrap();
+    assert_eq!(rebuilt, exif_edit::jpeg_without_metadata(&original).unwrap());
+    assert!(!contains(&rebuilt, b"SECRET"));
+    assert_eq!(scan_data(&rebuilt), scan_data(&plain));
+    assert!(default_registry().probe(&Source::from_path(&back)).unwrap().icc_profile.is_none());
+}
+
+#[test]
+fn rotating_a_jpeg_into_jxl_stays_lossless() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = photo_jpeg(96, 64);
+    let src = write(dir.path(), "wide.jpg", &original);
+    let jxl = dir.path().join("tall.jxl");
+    assert!(matches!(
+        run(&jxl_request(&src, &jxl, vec![Op::rotate_cw()], &[])),
+        ExportOutcome::JpegRecompressed { .. }
+    ));
+
+    // shown turned: the JPEG XL orientation, taken from the EXIF of the JPEG libjxl was given
+    let d = decode_stored(&jxl);
+    assert_eq!((d.image.width(), d.image.height()), (64, 96));
+    let mut turned = decode_stored(&src);
+    turned.info.orientation = Orientation::Rotate90;
+    let p = psnr(&upright(&turned), &d.image.to_rgba8());
+    assert!(p > 45.0, "PSNR {p:.1} dB");
+
+    // the rebuilt JPEG is the original data with the orientation tag
+    let back = dir.path().join("back.jpg");
+    assert!(matches!(run(&request(&jxl, &back, FormatId::Jpeg, vec![])), ExportOutcome::JpegRebuilt { .. }));
+    let rebuilt = std::fs::read(&back).unwrap();
+    assert_eq!(scan_data(&rebuilt), scan_data(&original));
+    assert_eq!(default_registry().probe(&Source::from_path(&back)).unwrap().orientation, Orientation::Rotate90);
+
+    // and a JPEG XL turned back on the way to JPEG: still the original data, upright
+    let upright_jpeg = dir.path().join("upright.jpg");
+    assert!(matches!(
+        run(&request(&jxl, &upright_jpeg, FormatId::Jpeg, vec![Op::rotate_ccw()])),
+        ExportOutcome::JpegRebuilt { .. }
+    ));
+    let info = default_registry().probe(&Source::from_path(&upright_jpeg)).unwrap();
+    assert_eq!(info.orientation, Orientation::Normal);
+    assert_eq!(scan_data(&std::fs::read(&upright_jpeg).unwrap()), scan_data(&original));
+}
+
+/// A baseline 8×8 CMYK JPEG (Adobe segment, four components), all blocks flat: a JPEG libjxl
+/// cannot recompress.
+fn cmyk_jpeg() -> Vec<u8> {
+    let mut j = vec![0xFF, 0xD8];
+    j.extend(segment(0xEE, &[b"Adobe".as_slice(), &[0, 100, 0, 0, 0, 0, 0]].concat()));
+    j.extend(segment(0xDB, &[[0u8].as_slice(), &[1; 64]].concat()));
+    let mut sof = vec![8, 0, 8, 0, 8, 4];
+    for id in 1..=4 {
+        sof.extend_from_slice(&[id, 0x11, 0]);
+    }
+    j.extend(segment(0xC0, &sof));
+    let one_code = |class: u8| [[class].as_slice(), &[1], &[0; 15], &[0]].concat();
+    j.extend(segment(0xC4, &one_code(0x00)));
+    j.extend(segment(0xC4, &one_code(0x10)));
+    j.extend(segment(0xDA, &[4, 1, 0, 2, 0, 3, 0, 4, 0, 0, 63, 0]));
+    // each block: DC difference 0 ("0"), end of block ("0"): four blocks fill one byte
+    j.extend_from_slice(&[0x00, 0xFF, 0xD9]);
+    j
+}
+
+#[test]
+fn jxl_falls_back_to_a_pixel_encode() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = default_registry();
+    let jpeg = write(dir.path(), "photo.jpg", &photo_jpeg(64, 48));
+
+    // a crop: pixels
+    let out = dir.path().join("crop.jxl");
+    let crop = Op::Crop(Rect { x: 8, y: 8, width: 20, height: 10 });
+    assert!(matches!(run(&jxl_request(&jpeg, &out, vec![crop], &[])), ExportOutcome::Encoded { .. }));
+    let d = reg.decode(&Source::from_path(&out), &CancelToken::never()).unwrap();
+    assert_eq!((d.image.width(), d.image.height()), (20, 10));
+
+    // asked for a pixel encode of a JPEG
+    let out = dir.path().join("reencoded.jxl");
+    let req = jxl_request(&jpeg, &out, vec![], &["lossless_jpeg=false", "quality=60"]);
+    assert!(matches!(run(&req), ExportOutcome::Encoded { .. }));
+    let back = dir.path().join("back.jpg");
+    // no reconstruction data in it: going back to JPEG encodes pixels as well
+    assert!(matches!(run(&request(&out, &back, FormatId::Jpeg, vec![])), ExportOutcome::Encoded { .. }));
+
+    // not a JPEG
+    let png = write(dir.path(), "p.png", &encode(&pattern(), ImageFormat::Png));
+    let out = dir.path().join("p.jxl");
+    assert!(matches!(run(&jxl_request(&png, &out, vec![], &["lossless=true"])), ExportOutcome::Encoded { .. }));
+    let d = reg.decode(&Source::from_path(&out), &CancelToken::never()).unwrap();
+    assert_eq!(d.image.to_rgba8().as_ref(), pattern().as_raw().as_slice(), "lossless pixels");
+
+    // a JPEG libjxl refuses (CMYK): pixels instead of an error
+    let cmyk = write(dir.path(), "cmyk.jpg", &cmyk_jpeg());
+    let reference = reg.decode(&Source::from_path(&cmyk), &CancelToken::never()).unwrap();
+    let encoders = Encoders::default();
+    let jxl = encoders.for_format(FormatId::Jxl).unwrap();
+    let refused = jxl.recompress_jpeg(&cmyk_jpeg(), &EncodeOptions::default()).expect("JPEG XL can recompress JPEGs");
+    assert!(refused.is_err(), "libjxl does not take CMYK");
+    let out = dir.path().join("cmyk.jxl");
+    assert!(matches!(run(&jxl_request(&cmyk, &out, vec![], &[])), ExportOutcome::Encoded { .. }));
+    let d = reg.decode(&Source::from_path(&out), &CancelToken::never()).unwrap();
+    assert_eq!((d.image.width(), d.image.height()), (reference.image.width(), reference.image.height()));
+
+    // a rotation of a JPEG whose EXIF has no orientation tag to rewrite: pixels, turned
+    let mut tiff = b"II*\0\x08\0\0\0\x01\0".to_vec();
+    tiff.extend_from_slice(&[0x0F, 0x01, 2, 0, 2, 0, 0, 0, b'x', 0, 0, 0, 0, 0, 0, 0]);
+    let plain = photo_jpeg(64, 48);
+    let at = 4 + u16::from_be_bytes([plain[4], plain[5]]) as usize;
+    let tagged = [&plain[..at], &segment(0xE1, &[b"Exif\0\0".as_slice(), &tiff].concat()), &plain[at..]].concat();
+    let src = write(dir.path(), "make-only.jpg", &tagged);
+    let out = dir.path().join("make-only.jxl");
+    assert!(matches!(run(&jxl_request(&src, &out, vec![], &[])), ExportOutcome::JpegRecompressed { .. }));
+    assert!(matches!(run(&jxl_request(&src, &out, vec![Op::rotate_cw()], &[])), ExportOutcome::Encoded { .. }));
+    let d = reg.decode(&Source::from_path(&out), &CancelToken::never()).unwrap();
+    assert_eq!((d.image.width(), d.image.height()), (48, 64));
+}
