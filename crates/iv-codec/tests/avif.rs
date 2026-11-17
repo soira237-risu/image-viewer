@@ -352,3 +352,25 @@ fn the_wic_fallback_shows_oriented_avif_the_same_way() {
         assert_eq!(corners(&shown_ours), loose(&pixels(&theirs.image)), "{case}");
     }
 }
+
+/// The Windows AV1 codec acts on an embedded profile itself, and not as a colour conversion
+/// would (measured: with a Display P3 profile the white quadrant (228,228,228) comes out as
+/// (128,128,228); with an sRGB profile nothing changes). So the fallback must not also report
+/// the profile, or the registry would apply it a second time on top of the codec's output.
+/// Skipped where the AV1 codec is not installed.
+#[cfg(windows)]
+#[test]
+fn the_wic_fallback_reports_no_profile_of_its_own() {
+    use iv_codec::{Decoder, WicDecoder};
+    let base = quadrants_avif();
+    let wic = WicDecoder::fallback();
+    if let Err(e) = wic.decode(&avif_source(base.clone()), FormatId::Avif, &CancelToken::never()) {
+        eprintln!("skipped: WIC does not decode AVIF here ({e})");
+        return;
+    }
+    let p3 = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+    let file = with_properties(&base, &[colr_icc(&p3), colr_nclx()]);
+    assert_eq!(wic.probe(&avif_source(file.clone()), FormatId::Avif).unwrap().icc_profile, None);
+    let decoded = wic.decode(&avif_source(file), FormatId::Avif, &CancelToken::never()).unwrap();
+    assert_eq!(decoded.info.icc_profile, None);
+}

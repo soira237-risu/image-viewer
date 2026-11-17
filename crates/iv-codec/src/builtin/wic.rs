@@ -236,7 +236,11 @@ fn read_info(codec: &'static str, opened: &Opened, format: FormatId) -> WicResul
             // HEIF/AVIF decoders apply the container's rotation themselves (for AVIF every
             // irot/imir combination is checked against the rav1d path in tests/avif.rs); EXIF
             // orientation in those files is informative only and applying it again would
-            // double-rotate. The AV1 codec reports no ICC profile of an AVIF.
+            // double-rotate. The AV1 codec reports no ICC profile of an AVIF, yet acts on one
+            // itself, and not as a colour conversion would (a Display P3 profile turns white
+            // (228,228,228) into (128,128,228); tests/avif.rs). Passing on the container's
+            // profile would only apply it a second time, so such a file shows wrong colours
+            // on this path; rav1d decodes it right.
             orientation: if matches!(format, FormatId::Heif | FormatId::Avif) {
                 Orientation::Normal
             } else {
