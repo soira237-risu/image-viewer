@@ -1,0 +1,100 @@
+name: Release
+
+# Pushing a tag v<version> (the version in Cargo.toml) builds, checks and publishes the portable
+# zip as a GitHub release. Run by hand (workflow_dispatch) it does everything except publishing,
+# and keeps the files as a workflow artifact; that holds on a tag too ("Use workflow from" a tag
+# checks the tag against the version but never publishes: only a push event does). The steps
+# themselves are in scripts/package.ps1, so a local run checks the same things.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # the compiler of the released binaries; raise it on purpose, not by whatever stable is today
+  RUST_TOOLCHAIN: 1.100.0
+
+jobs:
+  release:
+    name: Build, check and publish (Windows x64)
+    # pinned, not windows-latest: libjxl is configured by the `cmake` crate with the Visual Studio
+    # generator for the newest VS it finds, and an image whose VS is newer than its CMake (VS 2026
+    # with a CMake that has no "Visual Studio 18 2026" generator) could not build it
+    runs-on: windows-2025
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      # first, before anything is built: there is nothing to release without a license
+      - name: Require a LICENSE file
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem -File | Where-Object { $_.Name -match '^(LICEN[CS]E|COPYING)([-._].*)?$' })
+          if (-not $files) {
+            Write-Host "::error title=No LICENSE file::The repository has no LICENSE file, so there is nothing anyone may legally redistribute. The owner must choose a license, add LICENSE (and license in Cargo.toml [workspace.package]), then push the tag again."
+            exit 1
+          }
+          "license files: $($files.Name -join ', ')"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      # rav1d (AV1 decoding) builds its assembly with NASM
+      - uses: ilammy/setup-nasm@v1
+
+      # libjxl (JPEG XL encoding, crates/iv-libjxl) is built with CMake and the MSVC toolset; the
+      # Windows images have CMake on PATH; this fails here, clearly, when it is missing or does not
+      # know the generator for the image's Visual Studio 2022
+      - name: CMake
+        shell: pwsh
+        run: |
+          cmake --version
+          if (-not (cmake --help | Select-String -SimpleMatch "Visual Studio 17 2022")) { throw "CMake has no Visual Studio 17 2022 generator" }
+
+      # no build cache on purpose: a release is built from scratch, nothing carried over
+
+      - name: Test
+        run: cargo test --workspace --locked --no-fail-fast
+
+      - name: Package
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $tag = if ($env:REF_TYPE -eq 'tag') { $env:REF_NAME } else { '' }
+          pwsh -NoProfile -File scripts/package.ps1 -Tag $tag -OutDir dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish the GitHub release
+        # a push of the tag, never a manual run (which may also be started on a tag ref)
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          $tag = $env:TAG
+          $assets = @(Get-ChildItem dist -File -Filter *.zip) + @(Get-ChildItem dist -File -Filter *.sha256)
+          $pre = if ($tag -match '-') { @('--prerelease') } else { @() }
+          gh release create $tag @($assets.FullName) --verify-tag --title "image-viewer $($tag.TrimStart('v'))" --notes-file dist/release-notes.md @pre
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

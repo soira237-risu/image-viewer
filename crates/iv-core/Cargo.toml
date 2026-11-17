@@ -1,0 +1,12 @@
+[package]
+name = "iv-core"
+description = "Core types for the image viewer: pixel buffers, metadata, sources, errors, cancellation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+bytemuck.workspace = true

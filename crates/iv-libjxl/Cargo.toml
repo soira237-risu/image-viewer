@@ -1,0 +1,12 @@
+[package]
+name = "iv-libjxl"
+description = "Builds the reference libjxl (the source vendored in jpegxl-src) with the default MSVC toolset and links it statically, for gamut-jxl's encoder."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+cmake.workspace = true
