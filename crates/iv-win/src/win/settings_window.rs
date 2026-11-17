@@ -55,7 +55,18 @@ const ID_CANCEL: i32 = 2;
 
 /// Client size in 96-DPI units.
 const WIDTH: i32 = 440;
-const HEIGHT: i32 = 338;
+const HEIGHT: i32 = 368;
+/// Where the pages start, below the strip of tab titles.
+const TOP: i32 = 50;
+/// The band on the General page kept free under the version for checking for updates later:
+/// room for a button (26) and a status line (18) with the usual gaps.
+const UPDATE_Y: i32 = TOP + 220;
+const UPDATE_H: i32 = 52;
+/// The version on the General page, and the Save and Defaults buttons at the bottom of every page.
+const VERSION_Y: i32 = TOP + 194;
+const BUTTONS_Y: i32 = HEIGHT - 38;
+// the room for updates lies between the version (18 high) and the buttons
+const _: () = assert!(VERSION_Y + 18 + 8 <= UPDATE_Y && UPDATE_Y + UPDATE_H <= BUTTONS_Y);
 /// Where the label and value columns start, and how wide they are.
 const LABEL_X: i32 = 16;
 const LABEL_W: i32 = 200;
@@ -231,7 +242,8 @@ fn fit_tabs(tabs: HWND) {
     }
 }
 
-fn create(owner: HWND, s: &Strings) -> windows::core::Result<Window> {
+/// The window (hidden) over `owner`, laid out for `dpi` and labelled in `s`'s language.
+fn create(owner: HWND, dpi: u32, s: &Strings) -> windows::core::Result<Window> {
     unsafe {
         let instance = GetModuleHandleW(None).expect("module handle");
         let class = WNDCLASSW {
@@ -243,7 +255,6 @@ fn create(owner: HWND, s: &Strings) -> windows::core::Result<Window> {
             ..Default::default()
         };
         RegisterClassW(&class);
-        let dpi = GetDpiForWindow(owner).max(96);
         let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
         let ex = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT;
         let mut r = RECT { left: 0, top: 0, right: WIDTH * dpi as i32 / 96, bottom: HEIGHT * dpi as i32 / 96 };
@@ -316,7 +327,7 @@ fn create(owner: HWND, s: &Strings) -> windows::core::Result<Window> {
         for (i, title) in TABS.iter().enumerate() {
             set_tab_title(tabs, i, title(s), true);
         }
-        let top = 50;
+        let top = TOP;
 
         page.set(GENERAL);
         label(|s| s.language, top)?;
@@ -330,8 +341,8 @@ fn create(owner: HWND, s: &Strings) -> windows::core::Result<Window> {
         on_page(button(|s| s.register, LABEL_X, top + 150, 110, ID_REGISTER)?);
         on_page(button(|s| s.unregister, LABEL_X + 116, top + 150, 110, ID_UNREGISTER)?);
         on_page(button(|s| s.default_apps, LABEL_X + 232, top + 150, ROW_W - 232, ID_DEFAULT_APPS)?);
-        // the version, with room under it for checking for updates later
-        let version = on_page(b.add(w!("STATIC"), &version_text(s), 0, LABEL_X, top + 194, LABEL_W, 18, 0)?);
+        // the version; UPDATE_Y..UPDATE_Y + UPDATE_H under it stays free for checking for updates
+        let version = on_page(b.add(w!("STATIC"), &version_text(s), 0, LABEL_X, VERSION_Y, LABEL_W, 18, 0)?);
 
         page.set(VIEW);
         label(|s| s.zoom_on_open, top)?;
@@ -361,8 +372,8 @@ fn create(owner: HWND, s: &Strings) -> windows::core::Result<Window> {
         let quality = field(top, ID_QUALITY, true)?;
 
         // on every page
-        button(|s| s.save, VALUE_X + VALUE_W - 188, HEIGHT - 38, 92, ID_SAVE)?;
-        button(|s| s.defaults, VALUE_X + VALUE_W - 92, HEIGHT - 38, 92, ID_DEFAULTS)?;
+        button(|s| s.save, VALUE_X + VALUE_W - 188, BUTTONS_Y, 92, ID_SAVE)?;
+        button(|s| s.defaults, VALUE_X + VALUE_W - 92, BUTTONS_Y, 92, ID_DEFAULTS)?;
 
         fit_tabs(tabs);
         let window = Window {
@@ -487,8 +498,9 @@ fn fill(s: &Settings) {
 pub fn show(owner: HWND, s: &Settings, activate: bool) -> Result<(), String> {
     if hwnd().is_none() {
         let t = s.language.strings();
-        let w =
-            create(owner, t).map_err(|e| crate::i18n::fill(t.settings_window_error, &[("error", &e.to_string())]))?;
+        let dpi = unsafe { GetDpiForWindow(owner) }.max(96);
+        let w = create(owner, dpi, t)
+            .map_err(|e| crate::i18n::fill(t.settings_window_error, &[("error", &e.to_string())]))?;
         WINDOW.with(|c| *c.borrow_mut() = Some(w));
         show_page(GENERAL);
     }
@@ -702,6 +714,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+    use windows::Win32::UI::Controls::TCM_GETROWCOUNT;
 
     #[test]
     fn ctrl_tab_goes_round_the_tabs() {
@@ -711,6 +726,164 @@ mod tests {
         assert_eq!(next_tab(SAVING, false), GENERAL);
         assert_eq!(next_tab(GENERAL, true), SAVING);
         assert_eq!(next_tab(SAVING, true), NAVIGATION);
+    }
+
+    /// A control of a laid-out window, in the window's client pixels.
+    struct Placed {
+        hwnd: HWND,
+        class: String,
+        style: u32,
+        /// `None`: on every page.
+        page: Option<usize>,
+        rect: RECT,
+        /// Its text, or a drop-down list's items.
+        texts: Vec<String>,
+    }
+
+    fn wide_str(buf: &[u16], len: i32) -> String {
+        String::from_utf16_lossy(&buf[..usize::try_from(len).unwrap_or(0).min(buf.len())])
+    }
+
+    fn placed(w: &Window) -> Vec<Placed> {
+        let mut out = Vec::new();
+        unsafe {
+            let mut next = GetWindow(w.hwnd, GW_CHILD).ok();
+            while let Some(h) = next {
+                let mut buf = [0u16; 256];
+                let len = GetClassNameW(h, &mut buf);
+                let class = wide_str(&buf, len);
+                let mut r = RECT::default();
+                GetWindowRect(h, &mut r).unwrap();
+                let mut corners = [POINT { x: r.left, y: r.top }, POINT { x: r.right, y: r.bottom }];
+                for p in &mut corners {
+                    assert!(ScreenToClient(w.hwnd, p).as_bool());
+                }
+                let rect = RECT { left: corners[0].x, top: corners[0].y, right: corners[1].x, bottom: corners[1].y };
+                let texts = if class.eq_ignore_ascii_case("ComboBox") {
+                    let n = SendMessageW(h, CB_GETCOUNT, None, None).0;
+                    (0..n)
+                        .map(|i| {
+                            let len = SendMessageW(
+                                h,
+                                CB_GETLBTEXT,
+                                Some(WPARAM(i as usize)),
+                                Some(LPARAM(buf.as_mut_ptr() as isize)),
+                            );
+                            wide_str(&buf, len.0 as i32)
+                        })
+                        .collect()
+                } else {
+                    let len = GetWindowTextW(h, &mut buf);
+                    vec![wide_str(&buf, len)]
+                };
+                let page = w.pages.iter().find(|(c, _)| *c == h).map(|(_, p)| *p);
+                let style = GetWindowLongW(h, GWL_STYLE) as u32;
+                out.push(Placed { hwnd: h, class, style, page, rect, texts });
+                next = GetWindow(h, GW_HWNDNEXT).ok();
+            }
+        }
+        out
+    }
+
+    /// The size of `text` on one line in `control`'s font.
+    fn text_size(control: HWND, text: &str) -> (i32, i32) {
+        use windows::Win32::Graphics::Gdi::{DT_CALCRECT, DT_SINGLELINE, DrawTextW, GetDC, ReleaseDC, SelectObject};
+        unsafe {
+            let font = SendMessageW(control, WM_GETFONT, None, None).0;
+            let dc = GetDC(Some(control));
+            let old = SelectObject(dc, HGDIOBJ(font as *mut _));
+            let mut chars: Vec<u16> = text.encode_utf16().collect();
+            let mut r = RECT::default();
+            DrawTextW(dc, &mut chars, &mut r, DT_CALCRECT | DT_SINGLELINE);
+            SelectObject(dc, old);
+            ReleaseDC(Some(control), dc);
+            (r.right - r.left, r.bottom - r.top)
+        }
+    }
+
+    fn overlap(a: &RECT, b: &RECT) -> bool {
+        a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+    }
+
+    /// The window as it is built at 100, 125, 150 and 200 % in both languages (hidden, never
+    /// shown): every label, check box, button, list item and tab title fits on one line in its
+    /// control, controls on one page do not overlap, everything is inside the window, and the
+    /// band for checking for updates is free.
+    #[test]
+    fn every_page_fits_at_every_dpi_in_both_languages() {
+        use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
+        controls::init_common_controls();
+        for dpi in [96, 120, 144, 192] {
+            let px = |v: i32| controls::scale(v, dpi);
+            for s in [&crate::i18n::KO, &crate::i18n::EN] {
+                let w = create(HWND::default(), dpi, s).expect("settings window");
+                let at = format!("{} at {dpi} DPI", s.tab_general);
+                // the client area the window gets at `dpi` (the test thread is not DPI aware, so
+                // the frame Windows actually draws here is the 96-DPI one)
+                let client = RECT { left: 0, top: 0, right: px(WIDTH), bottom: px(HEIGHT) };
+                let all = placed(&w);
+                assert!(all.len() > 30, "{at}: {} controls", all.len());
+                let check_w = unsafe { GetSystemMetricsForDpi(SM_CXMENUCHECK, dpi) };
+                let arrow_w = unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) };
+                for c in &all {
+                    let r = &c.rect;
+                    let (cw, ch) = (r.right - r.left, r.bottom - r.top);
+                    assert!(
+                        r.left >= 0 && r.top >= 0 && r.right <= client.right && r.bottom <= client.bottom,
+                        "{at}: {} {:?} outside the window: {r:?}",
+                        c.class,
+                        c.texts
+                    );
+                    // the room a control leaves its text
+                    let (room, kind) = match c.class.to_ascii_lowercase().as_str() {
+                        "static" => (cw, "label"),
+                        "button" if c.style & 0xf == BS_AUTOCHECKBOX as u32 => (cw - check_w - px(6), "check box"),
+                        "button" => (cw - px(10), "button"),
+                        "combobox" => (cw - arrow_w - px(8), "list item"),
+                        _ => continue,
+                    };
+                    for text in c.texts.iter().filter(|t| !t.is_empty()) {
+                        let (tw, th) = text_size(c.hwnd, text);
+                        assert!(tw <= room, "{at}: {kind} {text:?} is {tw} px wide in {room} px");
+                        assert!(th <= ch, "{at}: {kind} {text:?} is {th} px tall in {ch} px");
+                    }
+                }
+                // the tab titles: one row, inside the strip
+                unsafe {
+                    assert_eq!(SendMessageW(w.tabs, TCM_GETROWCOUNT, None, None).0, 1, "{at}");
+                    let mut last = RECT::default();
+                    let n = TABS.len() - 1;
+                    SendMessageW(
+                        w.tabs,
+                        TCM_GETITEMRECT,
+                        Some(WPARAM(n)),
+                        Some(LPARAM(&mut last as *mut RECT as isize)),
+                    );
+                    let mut strip = RECT::default();
+                    GetClientRect(w.tabs, &mut strip).unwrap();
+                    assert!(last.right > 0 && last.right <= strip.right, "{at}: tab titles end at {}", last.right);
+                }
+                // nothing on a page overlaps another control shown with it
+                for (i, a) in all.iter().enumerate() {
+                    for b in &all[i + 1..] {
+                        let together = a.page.is_none() || b.page.is_none() || a.page == b.page;
+                        assert!(
+                            !(together && overlap(&a.rect, &b.rect)),
+                            "{at}: {:?} {:?} overlaps {:?} {:?}",
+                            a.texts,
+                            a.rect,
+                            b.texts,
+                            b.rect
+                        );
+                    }
+                }
+                let band = RECT { left: 0, top: px(UPDATE_Y), right: client.right, bottom: px(UPDATE_Y + UPDATE_H) };
+                for c in all.iter().filter(|c| matches!(c.page, None | Some(GENERAL))) {
+                    assert!(!overlap(&c.rect, &band), "{at}: {:?} is in the room kept for updates", c.texts);
+                }
+                unsafe { DestroyWindow(w.hwnd).unwrap() };
+            }
+        }
     }
 
     #[test]

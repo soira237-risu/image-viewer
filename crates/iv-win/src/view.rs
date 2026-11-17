@@ -74,10 +74,6 @@ pub struct ViewState {
     open: ZoomOnOpen,
 }
 
-/// Screen pixels of an image hidden past a viewport edge that still count as "nothing to
-/// scroll": the snap to whole pixels can leave less than one.
-const SCROLL_SLACK: f64 = 0.5;
-
 impl ViewState {
     /// A view of an image of `image_size` (display size) in a viewport, shrunk to fit.
     pub fn new(image_size: (u32, u32), viewport: (u32, u32)) -> Self {
@@ -240,24 +236,29 @@ impl ViewState {
         self.clamp_center();
     }
 
-    /// Screen pixels of the image hidden above and below the viewport.
-    pub fn hidden_y(&self) -> (f64, f64) {
-        let r = self.dest_rect();
-        ((-r.y).max(0.0), (r.y + r.height - self.viewport.1).max(0.0))
+    /// The screen rows the image's top edge can be at when the image is taller than the
+    /// viewport: from the lowest one [`Self::snap`] allows (the bottom edge on screen, give or
+    /// take less than a pixel) up to 0 (the top edge at the top). `None` when it fits.
+    fn top_range_y(&self) -> Option<(f64, f64)> {
+        let (image, viewport) = (self.image.1, self.viewport.1);
+        // as `clamp_center` decides between centring and clamping
+        (image > viewport / self.zoom).then(|| ((viewport - image * self.zoom).ceil(), 0.0))
     }
 
     /// Whether the image reaches past the top or bottom of the viewport, so there is something
     /// to scroll to.
     pub fn scrolls_y(&self) -> bool {
-        let (above, below) = self.hidden_y();
-        above > SCROLL_SLACK || below > SCROLL_SLACK
+        self.can_scroll(true) || self.can_scroll(false)
     }
 
-    /// Whether the image can scroll further down (`down`) or up: the edge it would bring into
-    /// view is not on screen yet.
+    /// Whether the image can scroll further down (`down`) or up: its top edge is not yet at the
+    /// limit that way. Compared with the snapped limits, not with the pixels left hidden: at the
+    /// bottom up to one pixel of a fractional height stays hidden and cannot be scrolled to.
     pub fn can_scroll(&self, down: bool) -> bool {
-        let (above, below) = self.hidden_y();
-        (if down { below } else { above }) > SCROLL_SLACK
+        let Some((lowest, highest)) = self.top_range_y() else { return false };
+        let y = self.dest_rect().y;
+        // the top edge sits on whole pixels: half a pixel tells "at the limit" from "one away"
+        if down { y > lowest + 0.5 } else { y < highest - 0.5 }
     }
 
     /// Scrolls the image so the view moves `dy` screen pixels down the image (negative: up),
@@ -527,6 +528,32 @@ mod tests {
         assert!(!v.scroll_by(10.0), "nothing below");
         v.scroll_by(-1e7);
         assert_eq!(rect(&v).1, 0.0);
+    }
+
+    #[test]
+    fn a_fractional_height_scrolls_to_its_end_and_no_further() {
+        // 3000×2000 fitted to a 2560 px width is 1706.67 px tall: the snap leaves 0.67 px of it
+        // below the viewport at the bottom, which is the end (the wheel then turns the page)
+        let mut v = ViewState::opened((3000, 2000), (2560, 1600), ZoomOnOpen::FitWidth);
+        assert!(v.scrolls_y() && v.can_scroll(true) && !v.can_scroll(false));
+        let mut steps = 0;
+        while v.scroll_by(200.0) {
+            steps += 1;
+            assert!(steps < 10, "never reaches the end");
+        }
+        assert!(close(rect(&v).1, -106.0), "{:?}", rect(&v));
+        assert!(!v.can_scroll(true), "at the end: nothing left to scroll down to");
+        assert!(v.can_scroll(false) && v.scrolls_y());
+        // a pixel up from the end is not the end
+        assert!(v.scroll_by(-1.0));
+        assert!(v.can_scroll(true));
+        // the same at the top: a pixel down is not the top
+        v.scroll_by(-1e7);
+        assert!(!v.can_scroll(false));
+        assert!(v.scroll_by(1.0) && v.can_scroll(false));
+        // less than a pixel taller than the viewport: nothing to scroll either way
+        let v = ViewState::opened((3000, 1876), (2560, 1600), ZoomOnOpen::FitWidth);
+        assert!(!v.scrolls_y(), "{:?}", rect(&v));
     }
 
     #[test]

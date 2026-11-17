@@ -32,6 +32,16 @@ fn by_name(a: &str, b: &str) -> Ordering {
     natural_cmp(a, b).then_with(|| a.cmp(b))
 }
 
+/// Whether two names in one folder name the same entry: on Windows names are compared without
+/// case, as the file system does.
+fn same_name(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.chars().flat_map(char::to_lowercase).eq(b.chars().flat_map(char::to_lowercase))
+    } else {
+        a == b
+    }
+}
+
 /// The candidates beside `current` in its parent (folders, or archives when `archive`), in
 /// natural order. Empty when `current` has no parent or the parent cannot be read.
 fn candidates(current: &Path, archive: bool) -> Vec<(String, PathBuf)> {
@@ -75,6 +85,9 @@ pub fn neighbour(current: &Path, archive: bool, forward: bool, order: SortOrder)
     let current = std::path::absolute(current).unwrap_or_else(|_| current.to_path_buf());
     let name = current.file_name()?.to_string_lossy().into_owned();
     let all = candidates(&current, archive);
+    // the name as listed: a path typed in another case (`CH1` for `ch1`) would otherwise sort
+    // beside the listed name by the raw tie-break, and `current` would be its own sibling
+    let name = all.iter().find(|(n, _)| same_name(n, &name)).map_or(name, |(n, _)| n.clone());
     // by name, not by position: `current` itself may be absent (hidden, or deleted meanwhile)
     let wanted = if forward { Ordering::Greater } else { Ordering::Less };
     let mut side: Vec<PathBuf> = all.into_iter().filter(|(n, _)| by_name(n, &name) == wanted).map(|(_, p)| p).collect();
@@ -184,6 +197,32 @@ mod tests {
         let prev = neighbour(&r.join("vol10.zip"), true, false, order).unwrap();
         assert_eq!(dir_name(&prev), "vol1.cbz");
         assert!(neighbour(&r.join("vol1.cbz"), true, false, order).is_none());
+    }
+
+    /// A path may spell a name in another case than the disk (typed on a command line): the
+    /// folder or archive is still itself, not its own neighbour.
+    #[cfg(windows)]
+    #[test]
+    fn a_name_in_another_case_is_still_the_current_one() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        touch(&r.join("ch1"), &["a.png"]);
+        touch(&r.join("ch2"), &["b.png"]);
+        touch(&r.join("CH3"), &["c.png"]);
+        let order = SortOrder::default();
+        // upper case on the command line, lower case on disk: the raw tie-break put "ch1" after "CH1"
+        assert_eq!(dir_name(&neighbour(&r.join("CH1"), false, true, order).unwrap()), "ch2");
+        assert!(neighbour(&r.join("CH1"), false, false, order).is_none());
+        // lower case on the command line, upper case on disk: "CH3" sorted before "ch3"
+        assert_eq!(dir_name(&neighbour(&r.join("ch3"), false, false, order).unwrap()), "ch2");
+        assert!(neighbour(&r.join("ch3"), false, true, order).is_none());
+
+        zip(&r.join("vol1.cbz"), &["01.png"]);
+        zip(&r.join("VOL2.CBZ"), &["01.png"]);
+        assert_eq!(dir_name(&neighbour(&r.join("VOL1.CBZ"), true, true, order).unwrap()), "VOL2.CBZ");
+        assert!(neighbour(&r.join("VOL1.CBZ"), true, false, order).is_none());
+        assert_eq!(dir_name(&neighbour(&r.join("vol2.cbz"), true, false, order).unwrap()), "vol1.cbz");
+        assert!(neighbour(&r.join("vol2.cbz"), true, true, order).is_none());
     }
 
     #[test]

@@ -224,9 +224,10 @@ pub struct App {
     direction: i32,
     /// A navigation key is being held: flip without prefetching.
     quick_browsing: bool,
-    /// The search for the next or previous folder (or archive) that is running, by number; a
-    /// result for any other number (superseded by opening or moving elsewhere) is dropped.
-    crossing: Option<u64>,
+    /// The search for the next or previous folder (or archive) that is running, by number, and
+    /// whether it looks forward; a result for any other number (superseded by opening or moving
+    /// elsewhere, or by a press the other way) is dropped.
+    crossing: Option<(u64, bool)>,
     crossings_started: u64,
     /// Why the current file (or folder) cannot be shown; stays until another one is opened.
     error: Option<String>,
@@ -631,15 +632,16 @@ impl App {
     /// Stepped past the end of the list (`forward`) or before its start with "go on to the next
     /// folder" set: looks for the sibling folder or archive with images on a thread of its own
     /// (it may list many folders or open many archives). [`Self::handle_neighbour`] takes the
-    /// answer. A press while a search runs is ignored.
+    /// answer. Another press the same way while a search runs is ignored; a press the other way
+    /// starts a search that way, and the first one's answer is dropped.
     fn find_neighbour(&mut self, forward: bool) {
         let Some(folder) = &self.folder else { return };
-        if self.crossing.is_some() {
+        if self.crossing.is_some_and(|(_, way)| way == forward) {
             return;
         }
         self.crossings_started += 1;
         let seq = self.crossings_started;
-        self.crossing = Some(seq);
+        self.crossing = Some((seq, forward));
         let (current, archive, order) = (folder.dir().to_path_buf(), folder.is_archive(), self.settings.sort_order());
         self.trace.mark(&format!(
             "looking for the {} {} beside {}",
@@ -648,21 +650,23 @@ impl App {
             current.display()
         ));
         let tx = self.tx.clone();
-        std::thread::Builder::new()
-            .name("neighbour-search".into())
-            .spawn(move || {
-                let started = Instant::now();
-                let result = siblings::neighbour(&current, archive, forward, order);
-                send(&tx, AppEvent::Neighbour { seq, forward, result, elapsed: started.elapsed() });
-            })
-            .expect("spawn neighbour search");
+        let spawned = std::thread::Builder::new().name("neighbour-search".into()).spawn(move || {
+            let started = Instant::now();
+            let result = siblings::neighbour(&current, archive, forward, order);
+            send(&tx, AppEvent::Neighbour { seq, forward, result, elapsed: started.elapsed() });
+        });
+        if let Err(e) = spawned {
+            // no thread to be had (out of memory): stay, and the next press tries again
+            self.crossing = None;
+            self.trace.mark(&format!("neighbour search not started: {e}"));
+        }
     }
 
     /// The answer to [`Self::find_neighbour`]: shows the first image of the next folder (or the
     /// last of the previous one) and names it, or says there is none and stays.
     fn handle_neighbour(&mut self, seq: u64, forward: bool, result: Option<FolderList>, elapsed: Duration) {
-        if self.crossing != Some(seq) {
-            return; // the user opened or moved to something else meanwhile
+        if self.crossing.map(|(running, _)| running) != Some(seq) {
+            return; // the user opened or moved to something else meanwhile, or turned back
         }
         self.crossing = None;
         let archive = self.folder.as_ref().is_some_and(FolderList::is_archive);
