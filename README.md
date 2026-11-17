@@ -45,7 +45,7 @@ AVIF·WebP·JPEG XL을 비롯한 나머지 형식은 모두 뷰어 안의 디코
 
 ## 소스에서 빌드
 
-필요: Rust 1.98 이상 (MSVC 툴체인), Visual Studio 2022 Build Tools (C++ 워크로드), NASM (AV1 디코더 `rav1d`의 어셈블리 최적화용), CMake (JPEG XL 인코더 libjxl 빌드용: Build Tools의 C++ 워크로드에 들어 있는 것을 PATH에 넣으면 됨, 처음 한 번 1–2분).
+필요: Rust 1.98 이상 (MSVC 툴체인), Visual Studio 2022 Build Tools (C++ 워크로드), NASM (AV1 디코더 `rav1d`의 어셈블리 최적화용), CMake (JPEG XL 인코더 libjxl 빌드용: Build Tools의 C++ 워크로드에 들어 있는 것을 빌드가 스스로 찾으므로 PATH에 넣지 않아도 됨, 처음 한 번 1–2분).
 C 런타임 정적 링크 등 모든 빌드에 공통인 설정은 `.cargo/config.toml`에 있음 (`RUSTFLAGS` 환경 변수를 쓰면 이 설정이 무시됨).
 
 ```bash

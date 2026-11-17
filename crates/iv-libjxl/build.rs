@@ -22,6 +22,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed=IV_LIBJXL_SOURCE");
     let source = source_dir();
     let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+    if msvc && let Some(cmake) = visual_studio_cmake() {
+        // SAFETY: the build script is single-threaded; the `cmake` crate reads CMAKE below
+        unsafe { std::env::set_var("CMAKE", cmake) };
+    }
 
     let mut config = cmake::Config::new(&source);
     for (key, value) in [
@@ -125,6 +129,41 @@ fn source_dir() -> PathBuf {
                 registry.display()
             )
         })
+}
+
+/// The CMake that Visual Studio installs with its C++ workload, when no other is set up: the
+/// `cmake` crate runs `$CMAKE` or `cmake` from PATH, and Build Tools does not put its copy on
+/// PATH, so a plain `cargo build` (or `scripts/cache.ps1` from the SessionStart hook) would fail
+/// whenever this script has to run again. `None` leaves the crate's own choice: CMAKE is set,
+/// `cmake` runs from PATH, or no Visual Studio has one (then the crate reports the missing tool).
+fn visual_studio_cmake() -> Option<PathBuf> {
+    println!("cargo:rerun-if-env-changed=CMAKE");
+    if std::env::var_os("CMAKE").is_some() {
+        return None;
+    }
+    let on_path = std::process::Command::new("cmake")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if on_path {
+        return None;
+    }
+    let installer = std::env::var_os("ProgramFiles(x86)")
+        .map(PathBuf::from)?
+        .join("Microsoft Visual Studio")
+        .join("Installer")
+        .join("vswhere.exe");
+    // every installation, newest first; Build Tools counts as a product only with `-products *`
+    let output = std::process::Command::new(installer)
+        .args(["-products", "*", "-sort", "-utf8", "-property", "installationPath"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| Path::new(line.trim()).join(r"Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"))
+        .find(|cmake| cmake.is_file())
 }
 
 fn is_libjxl(dir: &Path) -> bool {
