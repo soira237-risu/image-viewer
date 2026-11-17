@@ -4,6 +4,7 @@
 mod builtin {
     pub mod avif;
     pub(crate) mod exif;
+    pub(crate) mod heif;
     pub mod image_rs;
     pub mod jpeg;
     pub mod jxl;

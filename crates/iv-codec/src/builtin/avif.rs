@@ -3,11 +3,16 @@
 //! The primary AVIF decoder everywhere. The Windows AV1 codec was measured to be wrong twice:
 //! it drops alpha, and it decodes BT.601 files (libavif's default for 8-bit sRGB) with BT.709
 //! coefficients, turning pure red into (255, 25, 0); ffmpeg and this path give (254, 0, 0).
-//! Known gap: container rotation (`irot`/`imir`) and embedded ICC are not read yet.
+//!
+//! The container's rotation and mirroring (`irot`, `imir`) become the image's
+//! [`Orientation`](iv_core::Orientation), as a JPEG's EXIF orientation does: pixels and size are
+//! reported as stored, and the renderer and the save path turn them upright. An ICC profile in
+//! `colr` is passed on for colour management. What is not read: [`ItemProperties`].
 
 use avif_decode::Image;
-use iv_core::{CancelToken, Error, FormatId, ImageBuf, ImageInfo, Orientation, PixelFormat, Result, Source};
+use iv_core::{CancelToken, Error, FormatId, ImageBuf, ImageInfo, PixelFormat, Result, Source};
 
+use super::heif::ItemProperties;
 use crate::decoder::{Decoded, Decoder, DecoderInfo};
 
 const ID: &str = "rav1d";
@@ -31,8 +36,11 @@ struct Header {
     height: u32,
     bit_depth: u8,
     has_alpha: bool,
+    props: ItemProperties,
 }
 
+/// Probe and decode both read the file through here, so they agree on size, orientation and
+/// profile.
 fn header(bytes: &[u8]) -> Result<Header> {
     let avif = avif_parse::read_avif(&mut &bytes[..]).map_err(err)?;
     let meta = avif.primary_item_metadata().map_err(err)?;
@@ -41,6 +49,7 @@ fn header(bytes: &[u8]) -> Result<Header> {
         height: meta.max_frame_height.get(),
         bit_depth: meta.bit_depth,
         has_alpha: avif.alpha_item.is_some(),
+        props: ItemProperties::of_primary_item(bytes),
     })
 }
 
@@ -106,8 +115,8 @@ fn info_from(h: &Header, format: FormatId) -> ImageInfo {
         frame_count: Some(1),
         has_alpha: h.has_alpha,
         bits_per_channel: if h.bit_depth > 8 { 16 } else { 8 },
-        orientation: Orientation::Normal,
-        icc_profile: None,
+        orientation: h.props.orientation,
+        icc_profile: h.props.icc.clone(),
         exif: None,
     }
 }

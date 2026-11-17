@@ -233,8 +233,10 @@ fn read_info(codec: &'static str, opened: &Opened, format: FormatId) -> WicResul
             frame_count,
             has_alpha,
             bits_per_channel,
-            // HEIF/AVIF decoders apply the container's rotation themselves; EXIF orientation in
-            // those files is informative only and applying it again would double-rotate
+            // HEIF/AVIF decoders apply the container's rotation themselves (for AVIF every
+            // irot/imir combination is checked against the rav1d path in tests/avif.rs); EXIF
+            // orientation in those files is informative only and applying it again would
+            // double-rotate. The AV1 codec reports no ICC profile of an AVIF.
             orientation: if matches!(format, FormatId::Heif | FormatId::Avif) {
                 Orientation::Normal
             } else {

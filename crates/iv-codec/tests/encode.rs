@@ -139,6 +139,28 @@ fn icc_and_exif_are_embedded() {
     }
 }
 
+/// `EncoderInfo::embeds_icc` is what the export path trusts to decide whether to convert the
+/// pixels to sRGB instead: it must say exactly which encoders write the profile.
+#[test]
+fn every_encoder_says_truly_whether_it_embeds_the_profile() {
+    // not tiny: with decode limits set, `image` caps a TIFF tag at the pixel buffer's size in
+    // `tiff::decoder::ifd::Value`s (one per byte), so a 32x16 TIFF loses a 600-byte profile
+    let img = gradient(128, 96, false);
+    let icc = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+    let meta = Metadata { icc: Some(icc), exif: None };
+    let mut embedding = Vec::new();
+    for enc in Encoders::default().all() {
+        let format = enc.info().format;
+        let (d, _) = round_trip(format, &img, &[], &meta);
+        assert_eq!(d.info.icc_profile.is_some(), enc.info().embeds_icc, "{format}");
+        if enc.info().embeds_icc {
+            embedding.push(format);
+        }
+    }
+    use FormatId::*;
+    assert_eq!(embedding, [Jpeg, Png, Webp, Jxl, Tiff]);
+}
+
 /// Photo-like content: smooth gradients with fine deterministic texture, so lossy encoders have
 /// detail to trade away (a plain gradient compresses to almost nothing at any quality).
 fn photo(w: u32, h: u32) -> ImageBuf {

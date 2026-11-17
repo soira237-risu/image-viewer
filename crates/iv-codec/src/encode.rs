@@ -103,6 +103,9 @@ pub struct EncoderInfo {
     pub supports_alpha: bool,
     pub supports_16bit: bool,
     pub lossy: bool,
+    /// Writes [`Metadata::icc`] into the file. Where it cannot, a caller that keeps metadata
+    /// converts the pixels to sRGB first, so the file looks as the original did.
+    pub embeds_icc: bool,
 }
 
 pub trait Encoder: Send + Sync {
@@ -177,8 +180,8 @@ fn write_with(enc: impl ImageEncoder, img: &DynamicImage, meta: &Metadata, id: &
 }
 
 macro_rules! info {
-    ($id:literal, $fmt:expr, alpha: $a:expr, deep: $d:expr, lossy: $l:expr) => {
-        EncoderInfo { id: $id, format: $fmt, supports_alpha: $a, supports_16bit: $d, lossy: $l }
+    ($id:literal, $fmt:expr, alpha: $a:expr, deep: $d:expr, lossy: $l:expr, icc: $i:expr) => {
+        EncoderInfo { id: $id, format: $fmt, supports_alpha: $a, supports_16bit: $d, lossy: $l, embeds_icc: $i }
     };
 }
 
@@ -456,15 +459,15 @@ pub struct Encoders {
 impl Default for Encoders {
     fn default() -> Self {
         let list: Vec<Arc<dyn Encoder>> = vec![
-            Arc::new(Jpeg(info!("jpeg", FormatId::Jpeg, alpha: false, deep: false, lossy: true))),
-            Arc::new(Png(info!("png", FormatId::Png, alpha: true, deep: true, lossy: false))),
-            Arc::new(Webp(info!("webp", FormatId::Webp, alpha: true, deep: false, lossy: true))),
-            Arc::new(Avif(info!("avif", FormatId::Avif, alpha: true, deep: false, lossy: true))),
-            Arc::new(Jxl(info!("jxl", FormatId::Jxl, alpha: true, deep: true, lossy: true))),
-            Arc::new(Plain(info!("tiff", FormatId::Tiff, alpha: true, deep: true, lossy: false))),
-            Arc::new(Plain(info!("bmp", FormatId::Bmp, alpha: true, deep: false, lossy: false))),
-            Arc::new(Plain(info!("qoi", FormatId::Qoi, alpha: true, deep: false, lossy: false))),
-            Arc::new(Plain(info!("gif", FormatId::Gif, alpha: true, deep: false, lossy: true))),
+            Arc::new(Jpeg(info!("jpeg", FormatId::Jpeg, alpha: false, deep: false, lossy: true, icc: true))),
+            Arc::new(Png(info!("png", FormatId::Png, alpha: true, deep: true, lossy: false, icc: true))),
+            Arc::new(Webp(info!("webp", FormatId::Webp, alpha: true, deep: false, lossy: true, icc: true))),
+            Arc::new(Avif(info!("avif", FormatId::Avif, alpha: true, deep: false, lossy: true, icc: false))),
+            Arc::new(Jxl(info!("jxl", FormatId::Jxl, alpha: true, deep: true, lossy: true, icc: true))),
+            Arc::new(Plain(info!("tiff", FormatId::Tiff, alpha: true, deep: true, lossy: false, icc: true))),
+            Arc::new(Plain(info!("bmp", FormatId::Bmp, alpha: true, deep: false, lossy: false, icc: false))),
+            Arc::new(Plain(info!("qoi", FormatId::Qoi, alpha: true, deep: false, lossy: false, icc: false))),
+            Arc::new(Plain(info!("gif", FormatId::Gif, alpha: true, deep: false, lossy: true, icc: false))),
         ];
         Self { list }
     }

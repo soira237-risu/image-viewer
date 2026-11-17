@@ -323,7 +323,7 @@ export(source, edits, target_codec, options, dest):
 
 - 확인된 사실과 그에 따른 결정
   - Windows AV1 코덱은 AVIF 알파를 버림 (ffmpeg 디코드로 파일의 알파 1~254 확인 후 비교) → rav1d 경로 추가, 내용 기반 선택을 위한 `Decoder::claims` 확장 지점 추가
-  - **(M4에서 정정)** 처음에는 불투명 AVIF를 회전·ICC 때문에 WIC에 맡겼으나, M4 인코더 왕복 테스트에서 Windows AV1 코덱이 BT.601 파일을 BT.709로 디코드함을 발견 (순수 빨강 → (255,25,0); ffmpeg·rav1d는 (254,0,0)). libavif의 8비트 sRGB 기본값이 BT.601이므로 실사용 AVIF 다수에 영향 → 모든 AVIF를 rav1d로. 남은 한계: AVIF 컨테이너 회전(irot/imir)과 내장 ICC 미적용
+  - **(M4에서 정정)** 처음에는 불투명 AVIF를 회전·ICC 때문에 WIC에 맡겼으나, M4 인코더 왕복 테스트에서 Windows AV1 코덱이 BT.601 파일을 BT.709로 디코드함을 발견 (순수 빨강 → (255,25,0); ffmpeg·rav1d는 (254,0,0)). libavif의 8비트 sRGB 기본값이 BT.601이므로 실사용 AVIF 다수에 영향 → 모든 AVIF를 rav1d로. 남은 한계였던 AVIF 컨테이너 회전(irot/imir)과 내장 ICC는 2026-11-17에 해결 (아래 "AVIF 컨테이너 방향과 ICC")
   - avif-decode의 10비트 출력은 이미 16비트 범위 (실측 56503 ≈ 220×257) → 처음 넣었던 추가 확장은 테스트에서 흰색으로 드러나 제거
   - WIC는 잘린 PNG를 성공으로 반환 → PNG/GIF/ICO/WebP는 WIC 보루에서 제외(손상 파일은 오류로 보고)
   - WIC의 AVIF 미리보기는 사실상 전체 디코드(9.2MP에서 46ms/76ms)이고 알파도 없음 → AVIF 미리보기 생략
@@ -352,11 +352,24 @@ export(source, edits, target_codec, options, dest):
 - 검토 후 수정 측정: Windows 잠금 화면 JPEG(3840×2160) 1 033 330 → 740 816 B(−28%, 285 ms), 되살린 JPEG 바이트 동일. 같은 JPEG에 LONG 형식 방향 6 태그를 넣으면 2160×3840 JPEG XL(전에는 돌지 않은 3840×2160), 두 번 재압축이라 543 ms. EXIF 세그먼트 둘(6, 1)이면 뷰어처럼 Normal. 재압축한 JPEG XL을 `--rotate cw`하면 740 859 B로 재압축 상태 그대로(354 ms; 전에는 무손실 픽셀 인코딩으로 약 2.7배). libjxl을 `/Gw`로 빌드해 실행 파일이 약 40 KB 줄어 image-viewer.exe 22 567 936 B, iv.exe 20 934 144 B
 - 남은 것: `gamut-jxl`은 libjxl의 병렬 실행기를 쓰지 않아 한 장을 한 스레드로 인코딩함 (일괄 변환은 파일 단위로 병렬). MSVC 빌드의 Highway는 SSE2 + AVX2만 디스패치함 (ClangCL 빌드는 SSE4·AVX-512 경로도 넣어 더 큼). `iv-libjxl`의 build.rs는 libjxl 소스를 `$CARGO_HOME/registry/src`의 `jpegxl-src-0.12.0`에서 찾음 (`jpegxl-src`가 소스 위치를 공개하지 않음): `cargo vendor` 등으로 다른 곳에 있으면 `IV_LIBJXL_SOURCE`를 지정. CI·릴리스는 `windows-2025` 이미지에 고정(`cmake` 크레이트가 찾은 가장 새 VS의 생성기를 쓰므로, CMake가 모르는 VS가 있는 이미지에서는 빌드할 수 없음)
 
+### AVIF 컨테이너 방향과 ICC (2026-11-17)
+
+- 읽기(`iv-codec/src/builtin/heif.rs`): avif-parse 2.1은 `irot`·`imir`·`colr`을 내놓지 않으므로 `meta` 상자(`pitm`, `iprp`의 `ipco`·`ipma`)를 직접 읽음. 32/64비트·끝까지(크기 0) 상자, `ipma` 버전 0/1과 7/15비트 속성 번호, `pitm` 버전 0/1. 모든 읽기는 경계 검사, 읽지 못한 속성은 건너뜀(깨진 EXIF 방향 태그와 같은 취급: 파일 구조는 avif-parse가 이미 받아들임)
+- 방향: `irot`는 반시계 90°×n → 1 = `Rotate270`, 2 = `Rotate180`, 3 = `Rotate90`. `imir`의 axis 0은 위아래를 바꿈(`FlipV`, EXIF 4), 1은 좌우를 바꿈(`FlipH`, EXIF 2) — ISO/IEC 23008-12:2022 6.5.12. 변환 속성은 `ipma`에 적힌 순서대로 합성(HEIF 규칙, MIAF가 그 순서를 clap → irot → imir로 고정). 회전 뒤 뒤집기 조합은 libavif의 EXIF 대응표와 같음(irot 1 + axis 0 = EXIF 5, + axis 1 = EXIF 7 …)
+- 보고 방식은 JPEG EXIF와 같음: `width`·`height`는 저장된(부호화된) 크기, `orientation`이 보여 줄 때의 변환, 표시 크기는 `display_size()`. probe와 decode가 같은 함수(`header`)로 읽으므로 크기·방향·프로필이 항상 같음. 화면(`raster`의 UV 변환)과 저장(`Geometry` → `apply::render`)은 손대지 않고 그대로 따름
+- ICC: 첫 `colr`의 `prof`/`rICC` 프로필을 `icc_profile`로 넘겨 다른 형식과 같은 색 관리(moxcms → sRGB). `nclx`는 프로필이 아님: YUV 행렬·범위는 avif-decode가 AV1 시퀀스 헤더에서 가져오고(지정 없으면 BT.601) 컨테이너의 `nclx`는 보지 않음, 원색·전달 함수(P3·BT.2020·PQ 등)는 색 관리하지 않아 sRGB로 간주. 깨끗한 조리개(`clap`) 자르기도 적용하지 않음(부호화된 전체를 보여 줌)
+- WIC 대체 디코더(rav1d가 실패할 때만): Windows AV1 코덱은 `irot`/`imir`를 스스로 적용해 똑바른 크기와 `Normal`을 보고 → 12가지 조합 모두 rav1d 경로와 네 모서리 배치가 같음(테스트). ICC는 보고하지 않고, moxcms가 만든 Display P3 프로필이 붙으면 색이 틀어짐((213,73,37) → (200,94,100), sRGB 프로필은 변화 없음) → 대체 경로의 한계로 남김
+- 독립 확인: 같은 12개 파일을 ffmpeg 9.0.2로 디코드(자동 회전)해도 네 모서리 배치가 모두 같음
+- 저장: 내보내기는 방향을 픽셀에 굽고 AVIF 인코더는 `irot`/`imir`를 쓰지 않으므로 결과는 `Normal`. 이번에 드러난 문제: AVIF 인코더(ravif/avif-serialize)는 ICC를 담지 못해, 프로필은 버려지고 픽셀은 원래 색 공간 그대로 저장돼 색이 바뀌었음(P3 JPEG → AVIF도 같음). `EncoderInfo::embeds_icc`(JPEG·PNG·WebP·JPEG XL·TIFF 참, AVIF·BMP·QOI·GIF 거짓 — 테스트가 인코더마다 실제 왕복으로 확인)가 거짓이고 메타데이터를 유지하면 `color::image_to_srgb`로 sRGB로 바꿔 저장. `--no-metadata`는 종전대로 프로필만 뺌
+- 곁가지 발견: image 0.25.10의 TIFF 디코더는 디코드 제한을 걸면 태그 값 개수를 픽셀 버퍼 크기로 묶어, 32×16 TIFF는 600바이트 ICC를 읽지 못함(128×96이면 읽음). 실제 사진 크기에서는 문제없어 그대로 둠
+- 시험: 상자 읽기 단위 시험(각 회전·뒤집기, libavif 대응표 8가지, `ipma` 순서, 다른 항목의 속성·번호 0·범위 밖 번호 무시, 64비트·크기 0 상자와 32비트 번호, `prof`/`rICC`/`nclx`, 모든 앞부분 잘림과 바이트 하나씩 바꾼 파일에서 패닉 없음). 인코더가 쓴 48×32 AVIF에 `irot`/`imir`/`colr`를 덧붙인 파일(`iv-codec/tests/support/avif_props.rs`, `iloc` 오프셋 이동 포함)로: 회전 4 × 뒤집기 3 = 12가지에서 저장 픽셀 그대로·probe = decode·표시 크기·화면 변환 결과 = HEIF 정의를 픽셀 인덱스로 직접 계산한 결과(8가지 방향 모두 나옴), 모서리 배치, P3 프로필 전달·색 관리 = moxcms 기준 ±1, WIC 대조. 내보내기: 회전·뒤집힌 AVIF → PNG(픽셀 일치, 32×48) → 시계 방향 회전 후 AVIF 제자리 저장(PSNR > 35 dB), P3 AVIF → PNG(프로필·픽셀 유지) / → AVIF(sRGB로 변환, 보이던 색 ±4) / `--no-metadata`(픽셀 그대로). 새 시험은 고치기 전 코드에서 모두 실패(디코더 4개, 내보내기 2개; 내보내기만 되돌리면 ICC 시험 1개)
+- 실제 실행: `iv probe` → `Transverse`/`Rotate90`, `iv convert --to png` → 32×48, ffmpeg의 AVIF 디코드와 네 모서리 색 일치. 실제 창(`--no-activate`, 자기 창 `PrintWindow`, 200% 모니터): 480×320 AVIF + irot 1 + imir 1 → 제목 "320×480", 100%에서 위 왼쪽부터 흰색·초록·파랑·빨강(= 저장된 오른쪽 아래·오른쪽 위·왼쪽 아래·왼쪽 위), P3 프로필 AVIF는 왼쪽 위 사분면이 (201,61,40) → (219,43,23)으로 색 관리됨, 창이 포커스를 가져가지 않음
+
 ### M4 결과 (2026-11-15)
 
 - `iv-ops`: 회전·뒤집기(방향 합성 = D4 군), 자르기, 크기 변경(Lanczos3), 보정(밝기·대비·감마·채도), 실행 취소/다시 실행. 어떤 편집 목록이든 `Geometry`(저장 픽셀 자르기 영역 + 방향 + 크기 + 보정)로 정규화 → 화면은 GPU UV 변환으로 즉시 미리보기, 저장할 때만 픽셀 계산
 - 인코더 9종 (JPEG, PNG 8/16비트, WebP 손실·무손실, AVIF, JPEG XL 무손실, TIFF 8/16비트, BMP, QOI, GIF): 옵션을 데이터로 선언(`quality=80`, `lossless=true` 등) → CLI가 검증·안내
-- 내보내기: 색 관리 없이 디코드(원래 색역 유지) + 원본 ICC 포함, EXIF 방향 1로 재설정 + 낡은 썸네일 연결 해제, 임시 파일 → fsync → 이름 바꾸기(실패 주입 시험에서 원본 무손상)
+- 내보내기: 색 관리 없이 디코드(원래 색역 유지) + 원본 ICC 포함(프로필을 담지 못하는 형식이면 sRGB로 변환 — 2026-11-17), EXIF 방향 1로 재설정 + 낡은 썸네일 연결 해제, 임시 파일 → fsync → 이름 바꾸기(실패 주입 시험에서 원본 무손상)
 - JPEG 회전·뒤집기만 했을 때: EXIF 방향만 고쳐 저장 → 압축 데이터 바이트 단위 동일 (5ms)
 - 확장자 바로잡기: 내용 기준으로 이름만 변경, 기존 파일은 절대 덮어쓰지 않음
 - CLI: `iv convert --to webp --opt quality=82 --max 1920 --out dir <파일|폴더>` (병렬), `iv fix-ext [--dry-run]`
@@ -516,7 +529,7 @@ GPU를 쓰는 순간 드라이버(AMD `amdxc64.dll` 등)가 100 MB대 바닥을 
 ### 남은 일 (다음 단계 후보)
 
 - 폴더 감시: 보고 있는 폴더에 다른 프로그램이 파일을 넣거나 지우면 목록 갱신 (지금은 폴더를 다시 열어야 반영)
-- AVIF 컨테이너 회전(irot/imir)·내장 ICC 읽기 (rav1d 경로)
+- AVIF `nclx`의 원색·전달 함수 색 관리(P3·BT.2020·PQ/HLG를 sRGB로), `clap` 자르기
 - 실제 카메라 RAW 파일로 WIC 경로 검증 (샘플 필요)
 - RAR/CBR (unRAR 라이선스 확인 후)
 - HDR 톤매핑 (현재 부동소수 이미지는 SDR로 자름), 모니터 ICC 프로파일

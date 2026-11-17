@@ -717,3 +717,107 @@ fn jxl_falls_back_to_a_pixel_encode() {
     let d = reg.decode(&Source::from_path(&out), &CancelToken::never()).unwrap();
     assert_eq!((d.image.width(), d.image.height()), (48, 64));
 }
+
+#[path = "../../iv-codec/tests/support/avif_props.rs"]
+mod avif_props;
+
+use avif_props::{colr_icc, colr_nclx, imir, irot, with_properties};
+
+/// 48x32 AVIF in four flat quadrants, written by the AVIF encoder, with `props` added to its
+/// primary item.
+fn quadrant_avif(props: &[Vec<u8>]) -> Vec<u8> {
+    let img = RgbaImage::from_fn(48, 32, |x, y| match (x < 24, y < 16) {
+        (true, true) => Rgba([200, 60, 40, 255]),
+        (false, true) => Rgba([60, 180, 70, 255]),
+        (true, false) => Rgba([50, 70, 190, 255]),
+        (false, false) => Rgba([230, 230, 230, 255]),
+    });
+    let img = iv_core::ImageBuf::new(48, 32, iv_core::PixelFormat::Rgba8, img.into_raw()).unwrap();
+    let encoders = Encoders::default();
+    let enc = encoders.for_format(FormatId::Avif).unwrap();
+    let opts = EncodeOptions::parse(enc.options(), &["quality=95".into(), "speed=10".into()]).unwrap();
+    let avif = enc.encode(&iv_codec::encode::prepare(&img, enc.info(), [0; 3]), &opts, &Default::default()).unwrap();
+    with_properties(&avif, props)
+}
+
+/// The colour at the centre of each quarter: top left, top right, bottom left, bottom right.
+fn quarters(rgba: &[u8], (w, h): (u32, u32)) -> [[u8; 3]; 4] {
+    [(w / 4, h / 4), (w * 3 / 4, h / 4), (w / 4, h * 3 / 4), (w * 3 / 4, h * 3 / 4)].map(|(x, y)| {
+        let i = ((y * w + x) * 4) as usize;
+        [rgba[i], rgba[i + 1], rgba[i + 2]]
+    })
+}
+
+fn near(a: [[u8; 3]; 4], b: [[u8; 3]; 4], tol: i32) -> bool {
+    a.as_flattened().iter().zip(b.as_flattened()).all(|(x, y)| (*x as i32 - *y as i32).abs() <= tol)
+}
+
+#[test]
+fn an_avif_turned_by_its_container_is_saved_and_converted_upright() {
+    let dir = tempfile::tempdir().unwrap();
+    // as a phone writes it: a quarter turn anticlockwise, then mirrored left to right (EXIF 7)
+    let src = write(dir.path(), "phone.avif", &quadrant_avif(&[colr_nclx(), irot(1), imir(1)]));
+    let stored = decode_stored(&src);
+    assert_eq!(stored.info.orientation, Orientation::Transverse);
+    let shown = upright(&stored);
+
+    // `iv convert --to png`: the turn is in the pixels, nothing is left to apply
+    let png = dir.path().join("phone.png");
+    assert!(matches!(run(&request(&src, &png, FormatId::Png, vec![])), ExportOutcome::Encoded { .. }));
+    let d = decode_stored(&png);
+    assert_eq!(d.info.orientation, Orientation::Normal);
+    assert_eq!((d.image.width(), d.image.height()), (32, 48));
+    assert_eq!(d.image.to_rgba8().as_ref(), shown.as_slice(), "PNG holds the image as it was shown");
+    // the bottom-right corner, turned anticlockwise to the top right, then mirrored to the top left
+    assert!(near(quarters(&shown, (32, 48)), [[230; 3], [60, 180, 70], [50, 70, 190], [200, 60, 40]], 8));
+
+    // the viewer's Save after one more turn clockwise: written over itself as AVIF, upright
+    let g = iv_ops::Geometry::new((48, 32), stored.info.orientation, &[Op::rotate_cw()]);
+    let want = iv_ops::apply::render(&stored.image, &g).unwrap();
+    assert!(matches!(run(&request(&src, &src, FormatId::Avif, vec![Op::rotate_cw()])), ExportOutcome::Encoded { .. }));
+    let d = decode_stored(&src);
+    assert_eq!(d.info.orientation, Orientation::Normal, "the encoder writes no irot/imir");
+    assert_eq!((d.image.width(), d.image.height()), (48, 32));
+    let p = psnr(&d.image.to_rgba8(), &want.to_rgba8());
+    assert!(p > 35.0, "re-encoded AVIF differs from the edit: PSNR {p:.1} dB");
+    assert!(near(quarters(&d.image.to_rgba8(), (48, 32)), quarters(&want.to_rgba8(), (48, 32)), 6));
+}
+
+#[test]
+fn an_avif_profile_is_kept_where_the_format_can_hold_it_and_applied_where_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let p3 = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+    let src = write(dir.path(), "wide.avif", &quadrant_avif(&[colr_icc(&p3), colr_nclx(), irot(2)]));
+    let reg = default_registry();
+    let raw = decode_stored(&src);
+    assert_eq!(raw.info.icc_profile.as_deref(), Some(p3.as_slice()));
+    let mut managed = reg.decode(&Source::from_path(&src), &CancelToken::never()).unwrap();
+    assert!(managed.color_managed);
+    managed.info.icc_profile = None;
+    let (raw_shown, seen) = (upright(&raw), upright(&managed));
+    assert!(!near(quarters(&raw_shown, (48, 32)), quarters(&seen, (48, 32)), 7), "P3 visibly changes the colours");
+
+    // PNG holds the profile: the pixels stay in it
+    let png = dir.path().join("wide.png");
+    run(&request(&src, &png, FormatId::Png, vec![]));
+    let d = decode_stored(&png);
+    assert_eq!(d.info.icc_profile.as_deref(), Some(p3.as_slice()));
+    assert_eq!(d.image.to_rgba8().as_ref(), raw_shown.as_slice());
+
+    // the AVIF encoder writes no profile: the pixels are converted, so the file looks as it did
+    let avif = dir.path().join("saved.avif");
+    run(&request(&src, &avif, FormatId::Avif, vec![]));
+    let d = reg.decode(&Source::from_path(&avif), &CancelToken::never()).unwrap();
+    assert_eq!(d.info.icc_profile, None);
+    assert_eq!(d.info.orientation, Orientation::Normal);
+    let got = quarters(&d.image.to_rgba8(), (48, 32));
+    assert!(near(got, quarters(&seen, (48, 32)), 4), "{got:?} vs shown {:?}", quarters(&seen, (48, 32)));
+
+    // without metadata the profile is dropped as asked, and the pixels are not touched
+    let bare = dir.path().join("bare.avif");
+    let mut req = request(&src, &bare, FormatId::Avif, vec![]);
+    req.keep_metadata = false;
+    run(&req);
+    let got = quarters(&decode_stored(&bare).image.to_rgba8(), (48, 32));
+    assert!(near(got, quarters(&raw_shown, (48, 32)), 4), "{got:?} vs stored {:?}", quarters(&raw_shown, (48, 32)));
+}

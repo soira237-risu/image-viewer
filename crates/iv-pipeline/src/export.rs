@@ -161,7 +161,9 @@ fn rebuilt_jpeg(
 ///
 /// Anything else, and a file one of those paths refuses (a JPEG libjxl cannot take, such as
 /// arithmetic coding or CMYK), is decoded (in the file's own colour space), edited, encoded and
-/// written atomically.
+/// written atomically. Rotations and mirrors the file carries (EXIF, HEIF `irot`/`imir`) are
+/// baked into the pixels; a colour profile the target format cannot hold is applied to them
+/// (converted to sRGB) instead of being dropped.
 pub fn export(registry: &Registry, encoders: &Encoders, req: &ExportRequest) -> Result<ExportOutcome> {
     let src = crate::archive::source_for(&req.source)?;
     let identified = registry.identify(&src)?;
@@ -212,9 +214,24 @@ pub fn export(registry: &Registry, encoders: &Encoders, req: &ExportRequest) -> 
     // encoder's copy is made
     drop(image);
 
+    // a format that cannot hold the profile (AVIF, BMP, QOI, GIF) gets the pixels converted to
+    // sRGB instead, so the file looks as the original did; a profile that cannot be applied
+    // (grey, float pixels, unreadable) leaves them as they are
+    let mut icc = info.icc_profile.as_ref().filter(|_| req.keep_metadata).map(|p| p.to_vec());
+    let edited = match &icc {
+        Some(profile) if !encoder.info().embeds_icc => match iv_codec::color::image_to_srgb(&edited, profile) {
+            Ok(converted) => {
+                icc = None;
+                converted.unwrap_or(edited)
+            }
+            Err(_) => edited,
+        },
+        _ => edited,
+    };
+
     let meta = if req.keep_metadata {
         Metadata {
-            icc: info.icc_profile.as_ref().map(|p| p.to_vec()),
+            icc,
             exif: info.exif.as_ref().map(|e| {
                 let mut e = e.to_vec();
                 // the orientation is now in the pixels, and the old thumbnail shows the old image
