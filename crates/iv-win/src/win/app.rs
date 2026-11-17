@@ -1371,7 +1371,8 @@ impl App {
         if self.edits.is_empty() {
             return;
         }
-        let target = in_place(&self.encoders, &cur.path, info.format, frames(info, cur.full.as_deref()));
+        let target = in_place(&self.encoders, &cur.path, info.format, frames(info, cur.full.as_deref()))
+            .keeping_depth(info.bits_per_channel);
         self.trace.mark(&format!("save in place: {target:?}"));
         match target {
             InPlace::NotLoaded => self.set_notice(self.t().save_not_loaded.into()),

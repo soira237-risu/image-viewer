@@ -441,3 +441,21 @@ fn jpeg_xl_lossless_round_trips_exactly() {
     assert!(d.info.has_alpha);
     assert_exact(&d, &expected);
 }
+
+/// `testdata/jxl/float-hdr.jxl`: a 4×2 lossless JPEG XL with 32-bit float samples in linear
+/// sRGB, made with libjxl's own API (`JxlEncoderAddImageFrame`, `JXL_TYPE_FLOAT`), with values
+/// up to 12.0: what an HDR or float JPEG XL decodes to.
+#[test]
+fn a_float_jpeg_xl_decodes_as_float() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/jxl/float-hdr.jxl");
+    let reg = default_registry();
+    let src = Source::from_path(path);
+    let probed = reg.probe(&src).unwrap();
+    assert_eq!((probed.width, probed.height, probed.bits_per_channel), (4, 2, 32));
+    let d = reg.decode_unmanaged(&src, &CancelToken::never()).unwrap();
+    assert_eq!(d.info.bits_per_channel, 32);
+    assert_eq!(d.image.format(), iv_core::PixelFormat::RgbaF32);
+    let px: &[f32] = bytemuck::cast_slice(d.image.data());
+    // the second pixel was (1.0, 2.5, 4.0) in linear light: above 1.0 survives decoding
+    assert!(px[4..7].iter().any(|v| *v > 1.0), "{:?}", &px[4..8]);
+}

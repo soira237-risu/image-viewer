@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use iv_codec::encode::{EncodeOptions, Encoders, Metadata, prepare};
+use iv_codec::encode::{EncodeOptions, Encoder, Encoders, Metadata, prepare};
 use iv_codec::{Registry, exif_edit};
 use iv_core::{CancelToken, Error, FormatId, Orientation, Result, Source};
 use iv_ops::{Geometry, Op, apply};
@@ -34,13 +34,14 @@ pub enum ExportOutcome {
     /// A JPEG that was only rotated or flipped: the EXIF orientation was rewritten and the
     /// compressed image data copied unchanged (no quality loss).
     LosslessOrientation,
-    /// A JPEG stored as JPEG XL without decoding it: its DCT coefficients are kept as they are,
-    /// with the data to rebuild the original file (no quality loss). Rotations and flips are in
-    /// the orientation.
+    /// A JPEG (or the JPEG a JPEG XL was made from by this same recompression) stored as JPEG XL
+    /// without decoding it: its DCT coefficients are kept as they are, with the data to rebuild
+    /// the original file (no quality loss). Rotations and flips are in the orientation.
     JpegRecompressed { bytes: usize },
-    /// The original JPEG rebuilt from a JPEG XL made by lossless recompression: the same bytes
-    /// as the file it was made from, unless a rotation or flip (in the EXIF orientation) or
-    /// dropping the metadata changed them; the compressed image data is untouched either way.
+    /// The JPEG rebuilt from a JPEG XL's reconstruction data: the same bytes as the file it was
+    /// made from, unless a rotation or flip (in the EXIF orientation) or dropping the metadata
+    /// changed them; the compressed image data is untouched either way. The data carries no
+    /// checksum, so a file damaged in a way that still parses rebuilds into another JPEG.
     JpegRebuilt { bytes: usize },
     /// Decoded, edited and encoded.
     Encoded {
@@ -109,11 +110,54 @@ fn jpeg_shown_as(jpeg: &[u8], stored: Orientation, target: Orientation, keep_met
     exif_edit::jpeg_with_orientation(&bare, target.to_exif()).map(Cow::Owned)
 }
 
+/// `jpeg` recompressed losslessly as a JPEG XL shown as `target`. libjxl takes the orientation
+/// from the JPEG's EXIF, but reads it more narrowly than the viewer does: only the first EXIF
+/// segment, and only a SHORT tag. So the result's own header is checked, and when it says
+/// otherwise (a LONG tag, two EXIF segments that disagree) every orientation tag of the JPEG is
+/// rewritten in the form libjxl reads and it is recompressed once more. `None` when the encoder
+/// does not recompress (a pixel encode was asked for), refuses this JPEG, or still disagrees:
+/// the caller encodes the pixels.
+fn recompress_as(encoder: &dyn Encoder, jpeg: &[u8], target: Orientation, opts: &EncodeOptions) -> Option<Vec<u8>> {
+    let shown_right = |jxl: &[u8]| iv_codec::jxl_orientation(jxl).ok() == Some(target);
+    let out = encoder.recompress_jpeg(jpeg, opts)?.ok()?;
+    if shown_right(&out) {
+        return Some(out);
+    }
+    let canonical = exif_edit::jpeg_with_orientation(jpeg, target.to_exif())?;
+    let out = encoder.recompress_jpeg(&canonical, opts)?.ok()?;
+    shown_right(&out).then_some(out)
+}
+
+/// The original JPEG rebuilt from a JPEG XL made by lossless recompression, made to show as the
+/// JPEG XL does after `ops` (only rotations and flips) and stripped of its metadata unless
+/// `keep_metadata`, with the orientation that is. `None` when the file carries no reconstruction
+/// data, or the rebuilt file does not read: the caller decodes.
+fn rebuilt_jpeg(
+    registry: &Registry,
+    src: &Source,
+    size: (u32, u32),
+    ops: &[Op],
+    keep_metadata: bool,
+) -> Option<(Vec<u8>, Orientation)> {
+    // a file it cannot read is decoded by the caller, which reports the error
+    let (jpeg, shown) = iv_codec::jpeg_from_jxl(src).ok()??;
+    // the edits apply to the image as shown, which is the JPEG under the JPEG XL's orientation;
+    // the rebuilt file's own EXIF says how it is stored
+    let target = Geometry::new(size, shown, ops).orientation;
+    let jpeg: std::sync::Arc<[u8]> = jpeg.into();
+    let stored = registry.probe(&Source::from_bytes("rebuilt.jpg", jpeg.clone())).ok()?.orientation;
+    let out = jpeg_shown_as(&jpeg, stored, target, keep_metadata)?.into_owned();
+    Some((out, target))
+}
+
 /// Saves `req`, without decoding where that loses nothing:
 /// - a JPEG only rotated or flipped and saved as JPEG: the EXIF orientation is rewritten;
 /// - a JPEG only rotated or flipped and saved as a format that can hold its coefficients (JPEG
 ///   XL): recompressed losslessly, unless the encoder options ask for a pixel encode;
-/// - a JPEG XL made that way, saved as JPEG: the original JPEG is rebuilt.
+/// - a JPEG XL made that way, saved as JPEG: the original JPEG is rebuilt;
+/// - such a JPEG XL only rotated or flipped and saved as JPEG XL again (the viewer's Save of it):
+///   the original JPEG is rebuilt, turned in its EXIF and recompressed, so the file stays as small
+///   and as able to give the JPEG back as it was.
 ///
 /// Anything else, and a file one of those paths refuses (a JPEG libjxl cannot take, such as
 /// arithmetic coding or CMYK), is decoded (in the file's own colour space), edited, encoded and
@@ -138,27 +182,23 @@ pub fn export(registry: &Registry, encoders: &Encoders, req: &ExportRequest) -> 
                 write_atomic(&req.dest, |f| f.write_all(&jpeg))?;
                 return Ok(ExportOutcome::LosslessOrientation);
             }
-            // JPEG XL takes the orientation from the EXIF of the JPEG it is given
-            if let Some(Ok(out)) = encoder.recompress_jpeg(&jpeg, &req.options) {
+            if let Some(out) = recompress_as(encoder.as_ref(), &jpeg, g.orientation, &req.options) {
                 write_atomic(&req.dest, |f| f.write_all(&out))?;
                 return Ok(ExportOutcome::JpegRecompressed { bytes: out.len() });
             }
         }
     }
 
-    if identified.format == FormatId::Jxl && req.format == FormatId::Jpeg && g.is_orientation_only() {
-        // a file it cannot read is decoded below, which reports the error
-        if let Ok(Some((jpeg, shown))) = iv_codec::jpeg_from_jxl(&src) {
-            // the edits apply to the image as shown, which is the JPEG under the JPEG XL's
-            // orientation; the rebuilt file's own EXIF says how it is stored
-            let target = Geometry::new((info.width, info.height), shown, &req.ops).orientation;
-            let jpeg: std::sync::Arc<[u8]> = jpeg.into();
-            let rebuilt = registry.probe(&Source::from_bytes("rebuilt.jpg", jpeg.clone()));
-            if let Ok(rebuilt) = rebuilt
-                && let Some(out) = jpeg_shown_as(&jpeg, rebuilt.orientation, target, req.keep_metadata)
-            {
+    if identified.format == FormatId::Jxl && lossless_target && g.is_orientation_only() {
+        let rebuilt = rebuilt_jpeg(registry, &src, (info.width, info.height), &req.ops, req.keep_metadata);
+        if let Some((jpeg, target)) = rebuilt {
+            if req.format == FormatId::Jpeg {
+                write_atomic(&req.dest, |f| f.write_all(&jpeg))?;
+                return Ok(ExportOutcome::JpegRebuilt { bytes: jpeg.len() });
+            }
+            if let Some(out) = recompress_as(encoder.as_ref(), &jpeg, target, &req.options) {
                 write_atomic(&req.dest, |f| f.write_all(&out))?;
-                return Ok(ExportOutcome::JpegRebuilt { bytes: out.len() });
+                return Ok(ExportOutcome::JpegRecompressed { bytes: out.len() });
             }
         }
     }

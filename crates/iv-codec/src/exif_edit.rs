@@ -31,6 +31,10 @@ impl Tiff {
         let b = if self.little { v.to_le_bytes() } else { v.to_be_bytes() };
         raw[at..at + 2].copy_from_slice(&b);
     }
+    fn put_u32(&self, raw: &mut [u8], at: usize, v: u32) {
+        let b = if self.little { v.to_le_bytes() } else { v.to_be_bytes() };
+        raw[at..at + 4].copy_from_slice(&b);
+    }
     /// Offset of the 4-byte "next IFD" pointer that follows IFD0's entries.
     fn next_ifd_pointer(&self, raw: &[u8]) -> Option<usize> {
         let count = self.u16(raw, self.ifd0)? as usize;
@@ -39,19 +43,29 @@ impl Tiff {
     }
 }
 
-/// Sets IFD0's orientation tag. Returns `false` (and leaves `raw` alone) when the block is not
-/// valid TIFF or has no orientation tag to overwrite.
+/// Sets IFD0's orientation tag, written the one way every reader takes: type SHORT, count 1
+/// (libjxl, for one, ignores a LONG tag that kamadak-exif and so the viewer read). Returns
+/// `false` (and leaves `raw` alone) when the block is not valid TIFF or has no orientation tag
+/// whose value sits in the entry itself (one or two SHORTs, or one LONG).
 pub fn set_orientation(raw: &mut [u8], value: u16) -> bool {
     let Some(t) = header(raw) else { return false };
     let Some(count) = t.u16(raw, t.ifd0) else { return false };
     for i in 0..count as usize {
         let entry = t.ifd0 + 2 + i * 12;
-        let (Some(tag), Some(kind)) = (t.u16(raw, entry), t.u16(raw, entry + 2)) else { return false };
-        // tag 0x0112, type SHORT: the value sits in the first two bytes of the value field
-        if tag == 0x0112 && kind == 3 && entry + 10 <= raw.len() {
-            t.put_u16(raw, entry + 8, value);
-            return true;
+        let (Some(tag), Some(kind), Some(n)) = (t.u16(raw, entry), t.u16(raw, entry + 2), t.u32(raw, entry + 4)) else {
+            return false;
+        };
+        if tag != 0x0112 {
+            continue;
         }
+        if entry + 12 > raw.len() || !matches!((kind, n), (3, 1 | 2) | (4, 1)) {
+            return false;
+        }
+        t.put_u16(raw, entry + 2, 3);
+        t.put_u32(raw, entry + 4, 1);
+        t.put_u16(raw, entry + 8, value);
+        t.put_u16(raw, entry + 10, 0);
+        return true;
     }
     false
 }
@@ -78,18 +92,22 @@ pub fn minimal_with_orientation(value: u16) -> Vec<u8> {
 }
 
 /// Rewrites a JPEG's EXIF orientation without touching the compressed image data: patches the
-/// existing tag, or inserts an EXIF segment when the file has none. Returns `None` when the file
-/// has EXIF but no orientation tag (adding a tag means rebuilding the IFD; callers re-encode).
+/// tag in every EXIF segment (readers differ in which one they take from a file that has two:
+/// libjxl the first, the JPEG decoder the last), or inserts an EXIF segment when the file has
+/// none. Returns `None` when an EXIF segment has no orientation tag (adding a tag means
+/// rebuilding the IFD; callers re-encode).
 pub fn jpeg_with_orientation(jpeg: &[u8], value: u16) -> Option<Vec<u8>> {
     if !jpeg.starts_with(&[0xFF, 0xD8]) {
         return None;
     }
+    let mut out = jpeg.to_vec();
+    let mut patched = false;
     let mut pos = 2;
     // walk the marker segments before the image data
     while pos + 4 <= jpeg.len() && jpeg[pos] == 0xFF {
         let marker = jpeg[pos + 1];
         if marker == 0xDA || marker == 0xD9 {
-            break; // start of scan / end: no EXIF segment before the image data
+            break; // start of scan / end: no EXIF segment after this
         }
         let len = u16::from_be_bytes([jpeg[pos + 2], jpeg[pos + 3]]) as usize;
         let body = pos + 4;
@@ -98,10 +116,15 @@ pub fn jpeg_with_orientation(jpeg: &[u8], value: u16) -> Option<Vec<u8>> {
             return None;
         }
         if marker == 0xE1 && jpeg[body..end].starts_with(b"Exif\0\0") {
-            let mut out = jpeg.to_vec();
-            return set_orientation(&mut out[body + 6..end], value).then_some(out);
+            if !set_orientation(&mut out[body + 6..end], value) {
+                return None;
+            }
+            patched = true;
         }
         pos = end;
+    }
+    if patched {
+        return Some(out);
     }
     // no EXIF: insert one after SOI (and after a JFIF APP0, which must come first)
     let mut insert_at = 2;
@@ -268,6 +291,33 @@ mod tests {
         assert_eq!(read_orientation(&be), Some(6));
         assert!(set_orientation(&mut be, 8));
         assert_eq!(read_orientation(&be), Some(8));
+    }
+
+    #[test]
+    fn a_long_orientation_tag_is_rewritten_as_a_short_one() {
+        // IFD0 with one entry: orientation 6 as a LONG (type 4), which libjxl does not read
+        let mut long =
+            b"II\x2A\x00\x08\x00\x00\x00\x01\x00\x12\x01\x04\x00\x01\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00"
+                .to_vec();
+        assert_eq!(read_orientation(&long), Some(6));
+        assert!(set_orientation(&mut long, 6));
+        assert_eq!(long, minimal_with_orientation(6), "SHORT, count 1, value 6");
+        // a value stored elsewhere (three SHORTs) is not patched
+        let mut many = minimal_with_orientation(1);
+        many[14..18].copy_from_slice(&3u32.to_le_bytes());
+        assert!(!set_orientation(&mut many, 6));
+    }
+
+    #[test]
+    fn every_exif_segment_of_a_jpeg_gets_the_orientation() {
+        let exif = |o: u16| segment(0xE1, &[b"Exif\0\0".as_slice(), &minimal_with_orientation(o)].concat());
+        let tail = [0xFF, 0xDA, 0x00, 0x02, 0x12, 0x34, 0xFF, 0xD9];
+        let jpeg = [&[0xFF, 0xD8][..], &exif(6), &exif(1), &tail].concat();
+        let out = jpeg_with_orientation(&jpeg, 3).unwrap();
+        assert_eq!(out, [&[0xFF, 0xD8][..], &exif(3), &exif(3), &tail].concat());
+        // one of them without the tag: nothing to patch it with
+        let no_tag = segment(0xE1, b"Exif\0\0II\x2A\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00");
+        assert_eq!(jpeg_with_orientation(&[&[0xFF, 0xD8][..], &exif(6), &no_tag, &tail].concat(), 3), None);
     }
 
     #[test]

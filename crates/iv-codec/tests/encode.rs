@@ -284,6 +284,8 @@ fn jpeg_xl_embeds_icc_and_exif() {
         // the box is the 4-byte TIFF header offset, then the EXIF block
         let boxed = jxl_box(&bytes, b"Exif").expect("Exif box");
         assert_eq!(&boxed[4..], exif.as_slice(), "{opts:?}");
+        // and the decoder reads it back, so a JPEG XL's EXIF survives being saved again
+        assert_eq!(d.info.exif.as_deref(), Some(exif.as_slice()), "{opts:?}");
     }
     // a profile with a sampled tone curve (here gamma 2.0 on sRGB primaries) has no code: kept
     // byte for byte, and the lossy encode converts through it (libjxl's colour management)
@@ -323,4 +325,47 @@ fn jpeg_xl_embeds_icc_and_exif() {
     cmyk[16..20].copy_from_slice(b"CMYK");
     let (_, bytes) = round_trip(FormatId::Jxl, &img, &["quality=80"], &Metadata { icc: Some(cmyk), exif: None });
     assert!(bytes.starts_with(&[0xFF, 0x0A]));
+}
+
+#[test]
+fn jpeg_xl_writes_gray_pixels_as_gray_with_their_profile() {
+    // a gray picture under a gamma 1.8 gray profile (what a gray source decodes to: equal RGB)
+    let (w, h) = (24u32, 8u32);
+    let gray: Vec<u8> = (0..w * h).flat_map(|i| [(i * 7 % 256) as u8; 3].into_iter().chain([255])).collect();
+    let img = ImageBuf::new(w, h, PixelFormat::Rgba8, gray).unwrap();
+    let profile = moxcms::ColorProfile::new_gray_with_gamma(1.8).encode().unwrap();
+    let meta = Metadata { icc: Some(profile), exif: None };
+    let space = |icc: Option<&[u8]>| icc.map(|p| p[16..20].to_vec());
+    for opts in [["lossless=true"], ["quality=90"]] {
+        let (d, bytes) = round_trip(FormatId::Jxl, &img, &opts, &meta);
+        let header = jxl_oxide::JxlImage::builder().read(&bytes[..]).unwrap();
+        assert!(header.image_header().metadata.grayscale(), "{opts:?}: written as gray");
+        // the curve is the profile's, not sRGB's: kept, and the viewer converts through it
+        assert_eq!(space(d.info.icc_profile.as_deref()), Some(b"GRAY".to_vec()), "{opts:?}");
+        let trc = moxcms::ColorProfile::new_from_slice(d.info.icc_profile.as_deref().unwrap()).unwrap().gray_trc;
+        let mid = match trc.expect("a gray tone curve") {
+            moxcms::ToneReprCurve::Parametric(p) => 0.5f64.powf(p[0] as f64),
+            moxcms::ToneReprCurve::Lut(l) if l.len() == 1 => 0.5f64.powf(l[0] as f64 / 256.0),
+            moxcms::ToneReprCurve::Lut(l) => l[l.len() / 2] as f64 / 65535.0,
+        };
+        assert!((mid - 0.5f64.powf(1.8)).abs() < 0.01, "{opts:?}: gamma 1.8, mid-gray at {mid:.3}");
+        let stored =
+            default_registry().decode_unmanaged(&Source::from_bytes("g.jxl", bytes), &CancelToken::never()).unwrap();
+        if opts[0] == "lossless=true" {
+            assert_eq!(stored.image.to_rgba8(), img.to_rgba8(), "exact gray samples");
+        } else {
+            let p = psnr(&stored.image, &img);
+            assert!(p > 35.0, "PSNR {p:.1}");
+        }
+    }
+    // a pixel an edit coloured: the gray profile no longer describes the image, which goes out
+    // as sRGB colour
+    let mut coloured = img.to_rgba8().into_owned();
+    coloured[0] = 200;
+    let coloured = ImageBuf::new(w, h, PixelFormat::Rgba8, coloured).unwrap();
+    let (d, bytes) = round_trip(FormatId::Jxl, &coloured, &["lossless=true"], &meta);
+    assert_ne!(space(d.info.icc_profile.as_deref()), Some(b"GRAY".to_vec()));
+    let stored =
+        default_registry().decode_unmanaged(&Source::from_bytes("c.jxl", bytes), &CancelToken::never()).unwrap();
+    assert_eq!(stored.image.to_rgba8(), coloured.to_rgba8());
 }

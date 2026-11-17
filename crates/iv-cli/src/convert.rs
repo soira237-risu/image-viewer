@@ -184,7 +184,7 @@ pub fn convert(args: &[String]) -> ExitCode {
                 bytes / 1024
             ),
             Ok(ExportOutcome::JpegRebuilt { bytes }) => println!(
-                "ok    {} -> {} (original JPEG rebuilt, {} KiB, {ms:.0} ms)",
+                "ok    {} -> {} (JPEG rebuilt from its JPEG XL reconstruction data, {} KiB, {ms:.0} ms)",
                 path.display(),
                 dest.display(),
                 bytes / 1024

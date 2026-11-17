@@ -53,9 +53,92 @@ fn is_animated(src: &Source) -> Result<bool> {
     }
 }
 
-fn info_from(dec: &mut JxlDecoder<iv_core::SourceReader>, format: FormatId, animated: bool) -> ImageInfo {
+/// Largest `Exif` box read: EXIF in a JPEG is limited to one 64 KiB segment, and a camera's
+/// maker notes stay well within this.
+const MAX_EXIF: u64 = 1 << 20;
+
+/// Where a JPEG XL container keeps its EXIF.
+enum ExifBox {
+    /// An `Exif` box: its contents, the offset of the TIFF header within the rest, then that.
+    Plain(Vec<u8>),
+    /// A Brotli-compressed one (`brob` holding `Exif`), as libjxl writes when it recompresses a
+    /// JPEG.
+    Compressed,
+}
+
+/// The file's first EXIF box, found by walking the container's box headers and seeking past
+/// everything else, the codestream included. `None` for a bare codestream, a file without one,
+/// or a box that does not read.
+fn find_exif_box(src: &Source) -> Option<ExifBox> {
+    use std::io::{Seek, SeekFrom};
+    let mut r = src.reader().ok()?;
+    let mut signature = [0u8; 12];
+    r.read_exact(&mut signature).ok()?;
+    if signature != *b"\0\0\0\x0cJXL \r\n\x87\n" {
+        return None;
+    }
+    let mut at = 12u64;
+    loop {
+        let mut head = [0u8; 8];
+        r.read_exact(&mut head).ok()?;
+        let (mut size, mut header) = (u32::from_be_bytes(head[..4].try_into().ok()?) as u64, 8);
+        if size == 1 {
+            let mut large = [0u8; 8];
+            r.read_exact(&mut large).ok()?;
+            (size, header) = (u64::from_be_bytes(large), 16);
+        }
+        match &head[4..] {
+            b"Exif" => {
+                // a size of 0 runs to the end of the file
+                let len = if size == 0 { src.len().ok()?.checked_sub(at + header)? } else { size.checked_sub(header)? };
+                if !(4..=MAX_EXIF).contains(&len) {
+                    return None;
+                }
+                let mut contents = vec![0u8; len as usize];
+                r.read_exact(&mut contents).ok()?;
+                return Some(ExifBox::Plain(contents));
+            }
+            b"brob" => {
+                let mut inner = [0u8; 4];
+                r.read_exact(&mut inner).ok()?;
+                if inner == *b"Exif" {
+                    return Some(ExifBox::Compressed);
+                }
+            }
+            _ => {}
+        }
+        if size < header {
+            return None; // the last box (size 0), or a broken one
+        }
+        at += size;
+        r.seek(SeekFrom::Start(at)).ok()?;
+    }
+}
+
+/// `tiff` when it starts with a TIFF header.
+fn tiff(tiff: &[u8]) -> Option<Arc<[u8]>> {
+    (tiff.starts_with(b"II\x2A\x00") || tiff.starts_with(b"MM\x00\x2A")).then(|| Arc::from(tiff))
+}
+
+/// The EXIF (TIFF block) of a JPEG XL. An uncompressed box is read directly: libjxl writes it
+/// after the image when encoding pixels, and jxl-oxide hands out a box only once another follows
+/// it, so it never sees that one. A compressed box (before the image, from JPEG recompression) is
+/// left to jxl-oxide, which unpacks it; it gives the contents after the offset field, which for
+/// the offset 0 libjxl writes is the TIFF block itself.
+fn exif_from(dec: &mut JxlDecoder<iv_core::SourceReader>, src: &Source) -> Option<Arc<[u8]>> {
+    match find_exif_box(src)? {
+        ExifBox::Plain(contents) => {
+            let offset = u32::from_be_bytes(contents[..4].try_into().ok()?) as usize;
+            tiff(contents.get(4 + offset..)?)
+        }
+        ExifBox::Compressed => tiff(&dec.exif_metadata().ok()??),
+    }
+}
+
+fn info_from(dec: &mut JxlDecoder<iv_core::SourceReader>, src: &Source, format: FormatId, animated: bool) -> ImageInfo {
     let (width, height) = dec.dimensions();
     let (bits_per_channel, has_alpha) = color_traits(dec.color_type());
+    let exif = exif_from(dec, src);
     ImageInfo {
         format,
         codec: ID,
@@ -69,7 +152,25 @@ fn info_from(dec: &mut JxlDecoder<iv_core::SourceReader>, format: FormatId, anim
         bits_per_channel,
         orientation: Orientation::Normal,
         icc_profile: dec.icc_profile().ok().flatten().map(Arc::from),
-        exif: None,
+        // the orientation tag in it is not the image's: a JPEG XL's own header has that
+        exif,
+    }
+}
+
+/// The orientation a JPEG XL's image header says it is shown in, read from the start of `jxl`.
+pub fn header_orientation(jxl: &[u8]) -> Result<Orientation> {
+    let mut uninit = JxlImage::builder().build_uninit();
+    let mut rest = jxl;
+    loop {
+        let consumed = uninit.feed_bytes(rest).map_err(err)?;
+        rest = &rest[consumed..];
+        match uninit.try_init().map_err(err)? {
+            InitializeResult::Initialized(image) => {
+                return Ok(Orientation::from_exif(image.image_header().metadata.orientation));
+            }
+            InitializeResult::NeedMoreData(more) if consumed > 0 => uninit = more,
+            InitializeResult::NeedMoreData(_) => return Err(err("the file ends before its image header")),
+        }
     }
 }
 
@@ -80,13 +181,13 @@ impl Decoder for JxlOxideDecoder {
 
     fn probe(&self, src: &Source, format: FormatId) -> Result<ImageInfo> {
         let mut dec = JxlDecoder::new(src.reader()?).map_err(err)?;
-        Ok(info_from(&mut dec, format, is_animated(src)?))
+        Ok(info_from(&mut dec, src, format, is_animated(src)?))
     }
 
     fn decode(&self, src: &Source, format: FormatId, cancel: &CancelToken) -> Result<Decoded> {
         cancel.check()?;
         let mut dec = JxlDecoder::new(src.reader()?).map_err(err)?;
-        let info = info_from(&mut dec, format, is_animated(src)?);
+        let info = info_from(&mut dec, src, format, is_animated(src)?);
         let out = match info.bits_per_channel {
             16 => PixelFormat::Rgba16,
             32 => PixelFormat::RgbaF32,

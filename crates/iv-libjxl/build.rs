@@ -73,8 +73,10 @@ fn main() {
             .define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreaded")
             .define("CMAKE_C_FLAGS", &common)
             .define("CMAKE_CXX_FLAGS", format!("{common} /GR /EHsc"))
-            .define("CMAKE_C_FLAGS_RELEASE", "/O2 /Ob2 /DNDEBUG")
-            .define("CMAKE_CXX_FLAGS_RELEASE", "/O2 /Ob2 /DNDEBUG")
+            // /Gw: each global in its own section, so the linker drops the tables of code it
+            // already drops (/O2 does that for functions); no effect on speed
+            .define("CMAKE_C_FLAGS_RELEASE", "/O2 /Ob2 /DNDEBUG /Gw")
+            .define("CMAKE_CXX_FLAGS_RELEASE", "/O2 /Ob2 /DNDEBUG /Gw")
             // compile the files of one project in parallel too, within Cargo's job count
             .define("CMAKE_VS_GLOBALS", "UseMultiToolTask=true;EnforceProcessCountAcrossBuilds=true");
     }

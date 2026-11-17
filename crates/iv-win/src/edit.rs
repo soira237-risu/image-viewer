@@ -84,6 +84,9 @@ pub enum InPlace {
     NotLoaded,
     /// Nothing can write the format (HEIC, RAW, …).
     NotWritable,
+    /// Floating-point samples (a float JPEG XL or TIFF, HDR): no encoder writes them, so saving
+    /// would round the file to 8 bits per channel and clip what lies outside 0–1.
+    TooDeep,
 }
 
 impl InPlace {
@@ -95,6 +98,16 @@ impl InPlace {
             InPlace::Animated => Some(t.animated_save_as),
             InPlace::NotLoaded => Some(t.save_not_loaded),
             InPlace::NotWritable => Some(t.format_not_writable),
+            InPlace::TooDeep => Some(t.deep_save_as),
+        }
+    }
+
+    /// `self`, unless it would write over an image with more than 16 bits per channel (what
+    /// the decoders give for float and deeper integer samples), which no encoder keeps.
+    pub fn keeping_depth(self, bits_per_channel: u8) -> InPlace {
+        match self {
+            InPlace::Write(_) if bits_per_channel > 16 => InPlace::TooDeep,
+            other => other,
         }
     }
 }
@@ -352,7 +365,9 @@ mod tests {
         assert_eq!(in_place(&enc, &page, FormatId::Png, Frames::One), InPlace::ArchivePage);
         assert_eq!(in_place(&enc, &page, FormatId::Gif, Frames::Many), InPlace::ArchivePage);
         // every refusal says why, in both languages
-        for kind in [InPlace::ArchivePage, InPlace::Animated, InPlace::NotWritable, InPlace::NotLoaded] {
+        for kind in
+            [InPlace::ArchivePage, InPlace::Animated, InPlace::NotWritable, InPlace::NotLoaded, InPlace::TooDeep]
+        {
             assert!(kind.reason(&KO).is_some_and(|s| !s.is_empty()) && kind.reason(&EN).is_some());
         }
         assert_eq!(InPlace::Write(FormatId::Png).reason(&EN), None);
@@ -441,6 +456,29 @@ mod tests {
     }
 
     #[test]
+    fn a_float_jpeg_xl_is_never_saved_over_itself() {
+        use iv_core::{CancelToken, Source};
+        let enc = Encoders::default();
+        let registry = iv_codec::default_registry();
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/jxl/float-hdr.jxl");
+        let src = Source::from_path(fixture);
+        // what the viewer has after the probe, and after the full decode: no encoder writes
+        // float samples, so Save would round them to 8 bits and clip the HDR values
+        let probed = registry.probe(&src).unwrap();
+        let decoded = registry.decode(&src, &CancelToken::never()).unwrap();
+        for (info, full) in [(&probed, None), (&decoded.info, Some(&decoded))] {
+            let target = in_place(&enc, Path::new(fixture), info.format, frames(info, full));
+            assert_eq!(target, InPlace::Write(FormatId::Jxl), "a still JPEG XL is writable");
+            assert_eq!(target.keeping_depth(info.bits_per_channel), InPlace::TooDeep);
+        }
+        // 8- and 16-bit images are written in place as before
+        for bits in [8, 16] {
+            assert_eq!(InPlace::Write(FormatId::Jxl).keeping_depth(bits), InPlace::Write(FormatId::Jxl));
+        }
+        assert_eq!(InPlace::Animated.keeping_depth(32), InPlace::Animated, "the first reason stays");
+    }
+
+    #[test]
     fn a_jpeg_xl_saved_over_itself_stays_lossless() {
         use iv_codec::encode::{EncodeOptions, Metadata, prepare};
         use iv_core::{CancelToken, ImageBuf, PixelFormat, Source};
@@ -499,5 +537,16 @@ mod tests {
             let outcome = export(&iv_codec::default_registry(), &enc, &req).unwrap();
             assert!(matches!(outcome, ExportOutcome::JpegRecompressed { .. }), "{ops:?}: {outcome:?}");
         }
+        // Save (in place) of that JPEG XL turned once more: the JPEG inside is turned and
+        // recompressed again, not decoded and written as a lossless pixel image many times larger
+        let jxl = dir.path().join("photo.jxl");
+        let before = std::fs::metadata(&jxl).unwrap().len();
+        let req = save_request_as(&enc, &jxl, &[Op::rotate_cw()], jxl.clone(), FormatId::Jxl, 60).unwrap();
+        let outcome = export(&iv_codec::default_registry(), &enc, &req).unwrap();
+        assert!(matches!(outcome, ExportOutcome::JpegRecompressed { .. }), "{outcome:?}");
+        let after = std::fs::metadata(&jxl).unwrap().len();
+        assert!(after.abs_diff(before) < 64, "{before} -> {after} bytes");
+        let shown = iv_codec::jxl_orientation(&std::fs::read(&jxl).unwrap()).unwrap();
+        assert_eq!(shown, iv_core::Orientation::Rotate180, "turned twice");
     }
 }

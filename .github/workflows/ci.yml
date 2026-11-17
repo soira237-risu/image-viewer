@@ -20,7 +20,10 @@ env:
 jobs:
   check:
     name: fmt, clippy, test (Windows)
-    runs-on: windows-latest
+    # pinned, not windows-latest: libjxl is configured by the `cmake` crate with the Visual Studio
+    # generator for the newest VS it finds, and an image whose VS is newer than its CMake (VS 2026
+    # with a CMake that has no "Visual Studio 18 2026" generator) could not build it
+    runs-on: windows-2025
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -33,9 +36,13 @@ jobs:
       - uses: ilammy/setup-nasm@v1
 
       # libjxl (JPEG XL encoding, crates/iv-libjxl) is built with CMake and the MSVC toolset; the
-      # Windows images have CMake on PATH, this only makes a missing one fail here, clearly
+      # Windows images have CMake on PATH; this fails here, clearly, when it is missing or does not
+      # know the generator for the image's Visual Studio 2022
       - name: CMake
-        run: cmake --version
+        shell: pwsh
+        run: |
+          cmake --version
+          if (-not (cmake --help | Select-String -SimpleMatch "Visual Studio 17 2022")) { throw "CMake has no Visual Studio 17 2022 generator" }
 
       - uses: Swatinem/rust-cache@v2
 

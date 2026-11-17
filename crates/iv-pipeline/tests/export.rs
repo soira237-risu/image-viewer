@@ -529,6 +529,121 @@ fn rotating_a_jpeg_into_jxl_stays_lossless() {
     assert_eq!(scan_data(&std::fs::read(&upright_jpeg).unwrap()), scan_data(&original));
 }
 
+/// `jpeg` with one EXIF segment per entry of `tags`, each holding only an orientation tag of
+/// that (TIFF type, value).
+fn with_orientation_segments(jpeg: &[u8], tags: &[(u16, u16)]) -> Vec<u8> {
+    let at = 4 + u16::from_be_bytes([jpeg[4], jpeg[5]]) as usize;
+    let mut out = jpeg[..at].to_vec();
+    for &(kind, value) in tags {
+        let mut tiff = b"II*\0\x08\0\0\0\x01\0\x12\x01".to_vec();
+        tiff.extend_from_slice(&kind.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&(value as u32).to_le_bytes());
+        tiff.extend_from_slice(&[0; 4]);
+        out.extend(segment(0xE1, &[b"Exif\0\0".as_slice(), &tiff].concat()));
+    }
+    out.extend_from_slice(&jpeg[at..]);
+    out
+}
+
+#[test]
+fn a_jpeg_turned_by_its_exif_is_recompressed_shown_the_same_way() {
+    const SHORT: u16 = 3;
+    const LONG: u16 = 4;
+    let dir = tempfile::tempdir().unwrap();
+    let plain = photo_jpeg(96, 64);
+    // what the viewer shows, read the way it reads it; libjxl reads only the first EXIF segment
+    // and only a SHORT tag, so each of these has to come out of the JPEG XL the same way
+    // (name, the EXIF segments as (TIFF type, value), how the viewer shows the file)
+    type Case = (&'static str, &'static [(u16, u16)], Orientation);
+    let cases: [Case; 4] = [
+        ("short", &[(SHORT, 6)], Orientation::Rotate90),
+        ("long", &[(LONG, 6)], Orientation::Rotate90),
+        ("first-disagrees", &[(SHORT, 6), (SHORT, 1)], Orientation::Normal),
+        ("last-disagrees", &[(SHORT, 1), (LONG, 8)], Orientation::Rotate270),
+    ];
+    for (name, tags, shown) in cases {
+        let original = with_orientation_segments(&plain, tags);
+        let src = write(dir.path(), &format!("{name}.jpg"), &original);
+        assert_eq!(default_registry().probe(&Source::from_path(&src)).unwrap().orientation, shown, "{name}");
+        let jxl = dir.path().join(format!("{name}.jxl"));
+        assert!(matches!(run(&jxl_request(&src, &jxl, vec![], &[])), ExportOutcome::JpegRecompressed { .. }), "{name}");
+        assert_eq!(iv_codec::jxl_orientation(&std::fs::read(&jxl).unwrap()).unwrap(), shown, "{name}");
+        let d = decode_stored(&jxl);
+        let size = if shown == Orientation::Normal { (96, 64) } else { (64, 96) };
+        assert_eq!((d.image.width(), d.image.height()), size, "{name}");
+        let p = psnr(&upright(&decode_stored(&src)), &d.image.to_rgba8());
+        assert!(p > 45.0, "{name}: PSNR {p:.1} dB");
+
+        // back to JPEG: the same image data, shown the same way
+        let back = dir.path().join(format!("{name}-back.jpg"));
+        assert!(matches!(run(&request(&jxl, &back, FormatId::Jpeg, vec![])), ExportOutcome::JpegRebuilt { .. }));
+        let rebuilt = std::fs::read(&back).unwrap();
+        assert_eq!(scan_data(&rebuilt), scan_data(&plain), "{name}");
+        assert_eq!(default_registry().probe(&Source::from_path(&back)).unwrap().orientation, shown, "{name}");
+        if name == "short" {
+            assert_eq!(rebuilt, original, "a tag libjxl reads as it is: nothing rewritten");
+        }
+    }
+}
+
+#[test]
+fn turning_a_recompressed_jpeg_xl_keeps_it_recompressed() {
+    let dir = tempfile::tempdir().unwrap();
+    let p3 = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+    let plain = photo_jpeg(96, 64);
+    let original = with_real_metadata(&plain, &p3);
+    let src = write(dir.path(), "photo.jpg", &original);
+    let jxl = dir.path().join("photo.jxl");
+    assert!(matches!(run(&jxl_request(&src, &jxl, vec![], &[])), ExportOutcome::JpegRecompressed { .. }));
+    let size = std::fs::read(&jxl).unwrap().len();
+
+    // `iv convert a.jxl --to jxl --rotate cw` with the defaults (quality 90), and the viewer's
+    // Save (lossless=true): the JPEG inside is turned and recompressed, not decoded
+    for (name, opts) in [("default", &[][..]), ("save", &["lossless=true"][..])] {
+        let turned = dir.path().join(format!("turned-{name}.jxl"));
+        let outcome = run(&jxl_request(&jxl, &turned, vec![Op::rotate_cw()], opts));
+        let out = std::fs::read(&turned).unwrap();
+        assert_eq!(outcome, ExportOutcome::JpegRecompressed { bytes: out.len() }, "{name}");
+        assert!(out.len().abs_diff(size) < 64, "{name}: {size} -> {} bytes", out.len());
+        assert_eq!(iv_codec::jxl_orientation(&out).unwrap(), Orientation::Rotate90, "{name}");
+        let d = decode_stored(&turned);
+        assert_eq!((d.image.width(), d.image.height()), (64, 96), "{name}");
+
+        // still the original JPEG inside, metadata and all, now turned in its EXIF
+        let back = dir.path().join(format!("back-{name}.jpg"));
+        assert!(matches!(run(&request(&turned, &back, FormatId::Jpeg, vec![])), ExportOutcome::JpegRebuilt { .. }));
+        let rebuilt = std::fs::read(&back).unwrap();
+        assert_eq!(scan_data(&rebuilt), scan_data(&plain), "{name}");
+        assert!(contains(&rebuilt, b"SECRET-GPS") && contains(&rebuilt, b"SECRET-XMP"), "{name}");
+        assert_eq!(default_registry().probe(&Source::from_path(&back)).unwrap().orientation, Orientation::Rotate90);
+    }
+
+    // turned back: the original file again, byte for byte
+    let turned = dir.path().join("turned-default.jxl");
+    let again = dir.path().join("again.jxl");
+    assert!(matches!(
+        run(&jxl_request(&turned, &again, vec![Op::rotate_ccw()], &[])),
+        ExportOutcome::JpegRecompressed { .. }
+    ));
+    let back = dir.path().join("again.jpg");
+    assert!(matches!(run(&request(&again, &back, FormatId::Jpeg, vec![])), ExportOutcome::JpegRebuilt { .. }));
+    assert_eq!(std::fs::read(&back).unwrap(), original);
+
+    // without metadata: none of it, and still recompressed
+    let bare = dir.path().join("bare.jxl");
+    let mut req = jxl_request(&jxl, &bare, vec![Op::rotate_cw()], &[]);
+    req.keep_metadata = false;
+    assert!(matches!(run(&req), ExportOutcome::JpegRecompressed { .. }));
+    assert!(!contains(&std::fs::read(&bare).unwrap(), b"SECRET"));
+
+    // asked for a pixel encode: pixels, and the EXIF read from the JPEG XL's box goes with them
+    let pixels = dir.path().join("pixels.jxl");
+    let req = jxl_request(&jxl, &pixels, vec![Op::rotate_cw()], &["lossless_jpeg=false", "quality=80"]);
+    assert!(matches!(run(&req), ExportOutcome::Encoded { .. }));
+    assert!(contains(&std::fs::read(&pixels).unwrap(), b"SECRET-GPS"), "EXIF kept through a pixel encode");
+}
+
 /// A baseline 8×8 CMYK JPEG (Adobe segment, four components), all blocks flat: a JPEG libjxl
 /// cannot recompress.
 fn cmyk_jpeg() -> Vec<u8> {

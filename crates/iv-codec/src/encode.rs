@@ -319,10 +319,35 @@ impl Jxl {
     }
 }
 
-/// An ICC profile JPEG XL can carry for RGB pixels: a profile of an RGB colour space (a CMYK or
-/// gray profile left over from the source does not describe the RGB pixels being written).
-fn rgb_icc(meta: &Metadata) -> Option<&[u8]> {
-    meta.icc.as_deref().filter(|p| p.len() >= 128 && &p[16..20] == b"RGB ")
+/// The ICC profile in `meta` when it is of colour space `space` (`b"RGB "`, `b"GRAY"`).
+fn icc_of<'a>(meta: &'a Metadata, space: &[u8; 4]) -> Option<&'a [u8]> {
+    meta.icc.as_deref().filter(|p| p.len() >= 128 && &p[16..20] == space)
+}
+
+/// Whether every pixel of `img` (as [`prepare`] makes it: RGB or RGBA, 8 or 16 bits) is gray.
+fn all_gray(img: &DynamicImage) -> bool {
+    fn equal<T: PartialEq>(px: &[T], channels: usize) -> bool {
+        px.chunks_exact(channels).all(|p| p[0] == p[1] && p[1] == p[2])
+    }
+    match img {
+        DynamicImage::ImageRgb8(i) => equal(i.as_raw(), 3),
+        DynamicImage::ImageRgba8(i) => equal(i.as_raw(), 4),
+        DynamicImage::ImageRgb16(i) => equal(i.as_raw(), 3),
+        DynamicImage::ImageRgba16(i) => equal(i.as_raw(), 4),
+        _ => false,
+    }
+}
+
+/// The first channel and, with `alpha`, the last of each pixel of `px` (`channels` samples each).
+fn gray_samples<T: Copy>(px: &[T], channels: usize, alpha: bool) -> Vec<T> {
+    let mut out = Vec::with_capacity(px.len() / channels * (1 + alpha as usize));
+    for p in px.chunks_exact(channels) {
+        out.push(p[0]);
+        if alpha {
+            out.push(p[channels - 1]);
+        }
+    }
+    out
 }
 
 impl Encoder for Jxl {
@@ -333,7 +358,9 @@ impl Encoder for Jxl {
         JXL_OPTIONS
     }
     fn encode(&self, img: &DynamicImage, opts: &EncodeOptions, meta: &Metadata) -> Result<Vec<u8>> {
-        use gamut_core::{Dimensions, EncodeImage, ImageRef, Rgb8, Rgb16, Rgba8, Rgba16};
+        use gamut_core::{
+            Dimensions, EncodeImage, Gray8, Gray16, GrayAlpha8, GrayAlpha16, ImageRef, Rgb8, Rgb16, Rgba8, Rgba16,
+        };
         use gamut_jxl::{ColorSpec, Container, Distance, JxlEncoder};
         let id = self.0.id;
         let quality = opts.get(JXL_OPTIONS, "quality");
@@ -344,7 +371,12 @@ impl Encoder for Jxl {
             JxlEncoder::lossy(Distance::new(distance).map_err(|e| err(id, e))?)
         };
         enc = enc.with_effort(Self::effort(opts));
-        if let Some(icc) = rgb_icc(meta) {
+        // A gray profile (a gray source) describes gray samples: the image is written as gray
+        // with it, so tones under a non-sRGB curve stay as they were. Pixels an edit coloured,
+        // and a CMYK profile left over from the source, describe nothing that is written: the
+        // RGB pixels go out as sRGB.
+        let gray_icc = icc_of(meta, b"GRAY").filter(|_| all_gray(img));
+        if let Some(icc) = icc_of(meta, b"RGB ").or(gray_icc) {
             enc = enc.with_color(ColorSpec::Icc(icc.to_vec()));
         }
         // EXIF lives in a box of the container; without it the bare codestream is smaller
@@ -353,6 +385,19 @@ impl Encoder for Jxl {
         }
         let dims = Dimensions::new(img.width(), img.height()).map_err(|e| err(id, e))?;
         let encoded = match img {
+            DynamicImage::ImageRgb8(i) if gray_icc.is_some() => {
+                ImageRef::<Gray8>::new(&gray_samples(i.as_raw(), 3, false), dims).and_then(|r| enc.encode_to_vec(r))
+            }
+            DynamicImage::ImageRgba8(i) if gray_icc.is_some() => {
+                ImageRef::<GrayAlpha8>::new(&gray_samples(i.as_raw(), 4, true), dims).and_then(|r| enc.encode_to_vec(r))
+            }
+            DynamicImage::ImageRgb16(i) if gray_icc.is_some() => {
+                ImageRef::<Gray16>::new(&gray_samples(i.as_raw(), 3, false), dims).and_then(|r| enc.encode_to_vec(r))
+            }
+            DynamicImage::ImageRgba16(i) if gray_icc.is_some() => {
+                ImageRef::<GrayAlpha16>::new(&gray_samples(i.as_raw(), 4, true), dims)
+                    .and_then(|r| enc.encode_to_vec(r))
+            }
             DynamicImage::ImageRgb8(i) => ImageRef::<Rgb8>::new(i.as_raw(), dims).and_then(|r| enc.encode_to_vec(r)),
             DynamicImage::ImageRgba8(i) => ImageRef::<Rgba8>::new(i.as_raw(), dims).and_then(|r| enc.encode_to_vec(r)),
             DynamicImage::ImageRgb16(i) => ImageRef::<Rgb16>::new(i.as_raw(), dims).and_then(|r| enc.encode_to_vec(r)),
