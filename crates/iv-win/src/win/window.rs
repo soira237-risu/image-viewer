@@ -412,6 +412,8 @@ pub fn run(opts: Options) -> i32 {
     if start.fullscreen {
         with_app(App::start_fullscreen);
     }
+    // a registration left pointing at a deleted older copy is repaired, beside the first frame
+    with_app(|app| app.check_registration(true));
     // events that arrived before the window existed
     super::wake();
 

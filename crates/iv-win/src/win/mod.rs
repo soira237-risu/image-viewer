@@ -10,6 +10,7 @@ pub mod panel;
 pub mod session;
 pub mod settings_window;
 pub mod shell;
+pub mod update_check;
 pub mod window;
 
 use std::cell::{Cell, RefCell};
@@ -57,6 +58,10 @@ pub enum UiEvent {
     Register(bool),
     /// Open Windows' Default apps settings.
     OpenDefaultApps,
+    /// Ask GitHub for the latest release (the user pressed the button).
+    CheckUpdate,
+    /// Open the page of the newer release that the last check found.
+    OpenReleasePage,
 }
 
 thread_local! {

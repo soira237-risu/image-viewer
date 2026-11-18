@@ -129,6 +129,12 @@ strings! {
     entered_folder, entered_archive, no_next_folder, no_previous_folder, no_next_archive, no_previous_archive,
     // what logoff or shutdown would lose (shown by Windows)
     shutdown_saving, shutdown_unsaved,
+    // checking for updates (settings window, --check-update)
+    check_updates, open_release_page, update_checking, update_current, update_available, update_failed,
+    update_offline, update_timeout, update_tls, update_network, update_rate_limited, update_http,
+    update_too_large, update_unreadable, update_open_failed,
+    // where the "Open with" registration points
+    registration_here, registration_other, registration_missing, registration_none, registration_repaired,
 }
 
 impl Strings {
@@ -353,7 +359,7 @@ pub static KO: Strings = Strings {
     image_type_name: "이미지 (image-viewer)",
     archive_type_name: "만화·이미지 압축파일 (image-viewer)",
     app_description: "작고 빠른 이미지 뷰어",
-    about_text: "image-viewer {version}\n작고 빠른 Windows 이미지 뷰어\n\n설정·키맵 폴더:\n{config}\n\n진단 기록 폴더:\n{logs}",
+    about_text: "image-viewer {version}\n작고 빠른 Windows 이미지 뷰어\n\n설정·키맵 폴더:\n{config}\n\n진단 기록 폴더:\n{logs}\n\n홈페이지:\n{url}",
     settings_unreadable: "설정 파일을 읽지 못해 기본값을 씁니다 ({error})",
     keymap_warning: "키맵: {error}",
     settings_backed_up: "설정을 저장했습니다. 읽지 못한 예전 파일은 {name}(으)로 보관했습니다",
@@ -371,6 +377,26 @@ pub static KO: Strings = Strings {
     no_previous_archive: "이전 압축파일이 없습니다",
     shutdown_saving: "{name} 저장 중",
     shutdown_unsaved: "{name}에 저장하지 않은 편집이 있습니다",
+    check_updates: "업데이트 확인",
+    open_release_page: "릴리스 페이지 열기",
+    update_checking: "GitHub에서 확인하는 중…",
+    update_current: "최신 버전입니다 ({version})",
+    update_available: "새 버전이 있습니다: {latest} (지금 {version})",
+    update_failed: "확인하지 못함: {reason}",
+    update_offline: "인터넷에 연결할 수 없음",
+    update_timeout: "응답 시간 초과",
+    update_tls: "보안 연결 실패",
+    update_network: "네트워크 오류 {code}",
+    update_rate_limited: "요청 한도 초과 (HTTP {status}), 나중에 다시",
+    update_http: "서버 응답 HTTP {status}",
+    update_too_large: "응답이 너무 큼",
+    update_unreadable: "알아볼 수 없는 응답",
+    update_open_failed: "릴리스 페이지를 열지 못했습니다: {error}",
+    registration_here: "등록됨: 이 실행 파일",
+    registration_other: "다른 사본에 등록됨: {path}",
+    registration_missing: "없는 파일에 등록됨: {path}",
+    registration_none: "등록되지 않음",
+    registration_repaired: "연결 프로그램 등록을 이 실행 파일로 옮겼습니다 (전에 등록한 파일이 없음: {path})",
 };
 
 pub static EN: Strings = Strings {
@@ -534,7 +560,7 @@ pub static EN: Strings = Strings {
     image_type_name: "Image (image-viewer)",
     archive_type_name: "Comic or image archive (image-viewer)",
     app_description: "A small, fast image viewer",
-    about_text: "image-viewer {version}\nA small, fast image viewer for Windows\n\nSettings and keymap folder:\n{config}\n\nDiagnostic log folder:\n{logs}",
+    about_text: "image-viewer {version}\nA small, fast image viewer for Windows\n\nSettings and keymap folder:\n{config}\n\nDiagnostic log folder:\n{logs}\n\nHome page:\n{url}",
     settings_unreadable: "the settings file could not be read; using defaults ({error})",
     keymap_warning: "keymap: {error}",
     settings_backed_up: "settings saved; the unreadable old file was kept as {name}",
@@ -552,6 +578,26 @@ pub static EN: Strings = Strings {
     no_previous_archive: "no previous archive",
     shutdown_saving: "saving {name}",
     shutdown_unsaved: "{name} has unsaved edits",
+    check_updates: "Check for updates",
+    open_release_page: "Open release page",
+    update_checking: "Asking GitHub…",
+    update_current: "Up to date ({version})",
+    update_available: "New version available: {latest} (this is {version})",
+    update_failed: "Check failed: {reason}",
+    update_offline: "no internet connection",
+    update_timeout: "no answer in time",
+    update_tls: "secure connection failed",
+    update_network: "network error {code}",
+    update_rate_limited: "too many requests (HTTP {status}), try later",
+    update_http: "the server answered HTTP {status}",
+    update_too_large: "answer too large",
+    update_unreadable: "unreadable answer",
+    update_open_failed: "cannot open the release page: {error}",
+    registration_here: "Registered: this copy",
+    registration_other: "Registered to another copy: {path}",
+    registration_missing: "Registered to a missing file: {path}",
+    registration_none: "Not registered",
+    registration_repaired: "Open with now runs this copy (the one registered before is gone: {path})",
 };
 
 #[cfg(test)]

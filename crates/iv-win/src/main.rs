@@ -1,8 +1,10 @@
 //! image-viewer: `image-viewer [--trace] [--no-activate] [--keymap <file.toml>] [--settings <file.toml>] [file]`
 //!
-//! Also `image-viewer --version` (prints the version) and `image-viewer --register` /
-//! `--unregister` (lists the viewer in Windows' "Open with" and Default apps for the current
-//! user, or removes it; the settings window has the same buttons).
+//! Also `image-viewer --version` (prints the version), `image-viewer --check-update` (asks
+//! GitHub for the latest release and prints whether it is newer; exit code 1 when the check
+//! failed) and `image-viewer --register` / `--unregister` (lists the viewer in Windows' "Open
+//! with" and Default apps for the current user, or removes it; the settings window has the same
+//! buttons). None of these opens a window.
 
 // no console window for release builds launched from Explorer
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -22,8 +24,26 @@ use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 #[derive(Clone, Copy)]
 enum Action {
     Version,
+    CheckUpdate,
     /// `true`: register for "Open with"; `false`: remove that registration.
     Register(bool),
+}
+
+/// `--check-update`: what the check found, in `t`'s language, and whether it worked.
+fn check_update(t: &iv_win::i18n::Strings) -> (String, bool) {
+    use iv_win::update::{self, Outcome, State};
+    let result = iv_win::win::update_check::check();
+    let ok = result.is_ok();
+    let page = match &result {
+        Ok(Outcome::Newer { page, .. }) => Some(page.clone()),
+        _ => None,
+    };
+    let mut text = format!("image-viewer: {}", update::status_text(&State::Done(result), t));
+    if let Some(page) = page {
+        text.push('\n');
+        text.push_str(&page);
+    }
+    (text, ok)
 }
 
 /// Prints a line for a command-line flag. A release build has no console of its own, so it
@@ -64,6 +84,8 @@ fn main() {
             no_activate = true;
         } else if arg == "--version" || arg == "-V" {
             action = Some(Action::Version);
+        } else if arg == "--check-update" {
+            action = Some(Action::CheckUpdate);
         } else if arg == "--register" {
             action = Some(Action::Register(true));
         } else if arg == "--unregister" {
@@ -91,6 +113,11 @@ fn main() {
         Some(p) => Settings::load(p),
         None => (Settings::default(), None),
     };
+    if let Some(Action::CheckUpdate) = action {
+        let (text, ok) = check_update(settings.language.strings());
+        console_line(&text);
+        std::process::exit(i32::from(!ok));
+    }
     if let Some(Action::Register(on)) = action {
         let result = if on { shell::register(settings.language.strings()) } else { shell::unregister() };
         if let Err(e) = &result {

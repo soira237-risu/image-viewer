@@ -4,6 +4,8 @@
 //!   awareness v2;
 //! - the icon (`res/app.ico`) and the version information (from Cargo.toml), written as a `.res`
 //!   file that the linker takes directly, so no resource compiler is needed.
+//!
+//! It also has WinHTTP delay-loaded (see below).
 
 // the .ico writer in it is for the icon's generator (a test), not for the build
 #[allow(dead_code)]
@@ -21,6 +23,10 @@ fn main() {
         return;
     }
     let dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    // WinHTTP is only used when the user checks for updates: load it then, not at every start
+    // (mapping it at start cost about 1 ms before the window existed)
+    println!("cargo:rustc-link-arg-bins=/DELAYLOAD:winhttp.dll");
+    println!("cargo:rustc-link-arg-bins=delayimp.lib");
     println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
     println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", dir.join("res").join("app.manifest").display());
 

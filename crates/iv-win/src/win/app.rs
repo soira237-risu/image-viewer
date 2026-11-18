@@ -29,6 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use super::dialogs::{self, Answer, Filter};
 use super::shell::{self, Clip};
 use super::{UiEvent, help, keys, menu, panel, session, settings_window, wake, wide};
+use crate::assoc::Check;
 use crate::clipboard;
 use crate::commands::Command;
 use crate::diag;
@@ -41,6 +42,7 @@ use crate::panel::{PanelAction, PanelContext, PanelState, typed_resize};
 use crate::raster::{self, Frame, Page, Picture, Style};
 use crate::settings::Settings;
 use crate::trace::Trace;
+use crate::update::{self, Failure, Outcome};
 use crate::view::{Fit, ScreenRect, ViewState, ZoomMode};
 use crate::wheel::{WheelSteps, WheelUse, wheel_use};
 
@@ -70,6 +72,15 @@ pub enum AppEvent {
         seq: u64,
         forward: bool,
         result: Option<FolderList>,
+        elapsed: Duration,
+    },
+    /// The answer to the check for updates the user asked for.
+    UpdateChecked(Result<Outcome, Failure>),
+    /// Where the "Open with" registration points, and how repairing it went when it pointed at
+    /// a program that is gone ([`App::check_registration`]).
+    Registration {
+        check: Check,
+        repaired: Option<Result<(), String>>,
         elapsed: Duration,
     },
 }
@@ -263,6 +274,8 @@ pub struct App {
     fullscreen: Option<Restore>,
     /// A key handled as WM_SYSKEYDOWN: swallow the WM_SYSCHAR that follows (else: a beep).
     swallow_syschar: bool,
+    /// The check for updates: only ever started by the user, one at a time.
+    update: update::State,
 }
 
 fn file_name(p: &Path) -> String {
@@ -350,6 +363,7 @@ impl App {
             style,
             fullscreen: None,
             swallow_syschar: false,
+            update: update::State::Idle,
         }
     }
 
@@ -389,6 +403,10 @@ impl App {
                     AppEvent::Saved { source, dest, result } => self.handle_saved(source, dest, result),
                     AppEvent::Neighbour { seq, forward, result, elapsed } => {
                         self.handle_neighbour(seq, forward, result, elapsed)
+                    }
+                    AppEvent::UpdateChecked(result) => self.handle_update(result),
+                    AppEvent::Registration { check, repaired, elapsed } => {
+                        self.handle_registration(check, repaired, elapsed)
                     }
                 }
             } else if let Some(e) = super::take_ui() {
@@ -1260,9 +1278,99 @@ impl App {
                 if let Err(e) = settings_window::show(h, &self.settings, !self.no_activate) {
                     self.settings_open = false;
                     self.set_notice(e);
+                } else {
+                    // another copy may have registered itself since: look again
+                    self.check_registration(false);
                 }
             }
             _ => settings_window::hide(),
+        }
+    }
+
+    /// Looks where the "Open with" registration points on a thread of its own (the registered
+    /// program may sit on a slow or missing drive). With `repair` (at startup), a registration
+    /// whose program is gone is moved to this one. The answer comes back as
+    /// [`AppEvent::Registration`].
+    pub fn check_registration(&mut self, repair: bool) {
+        let Ok(exe) = std::env::current_exe() else { return };
+        let tx = self.tx.clone();
+        let t = self.t();
+        let spawned = std::thread::Builder::new().name("open-with-check".into()).spawn(move || {
+            let start = Instant::now();
+            let (check, repaired) = if repair {
+                shell::repair_registration("", &exe, t)
+            } else {
+                (shell::registration_check("", &exe), None)
+            };
+            send(&tx, AppEvent::Registration { check, repaired, elapsed: start.elapsed() });
+        });
+        if let Err(e) = spawned {
+            self.trace.mark(&format!("open-with check not started: {e}"));
+        }
+    }
+
+    fn handle_registration(&mut self, check: Check, repaired: Option<Result<(), String>>, elapsed: Duration) {
+        self.trace.mark(&format!(
+            "open-with registration: {check:?}{} ({:.1} ms)",
+            repaired.as_ref().map_or(String::new(), |r| format!(", repaired: {r:?}")),
+            elapsed.as_secs_f64() * 1000.0
+        ));
+        let t = self.t();
+        let check = match (check, repaired) {
+            (Check::Repair { old }, Some(Ok(()))) => {
+                diag::log(&format!("open-with registration moved from {} to this copy", old.display()));
+                self.set_notice(fill(t.registration_repaired, &[("path", &old.display().to_string())]));
+                Check::Here
+            }
+            (check, Some(Err(e))) => {
+                diag::log(&format!("open-with registration repair: {e}"));
+                self.set_notice(fill(t.register_failed, &[("error", &e)]));
+                check
+            }
+            (check, _) => check,
+        };
+        settings_window::set_registration(check, t);
+    }
+
+    /// Starts the check for updates the user asked for, unless one is running. The answer
+    /// comes back as [`AppEvent::UpdateChecked`]; nothing waits for it, and if the window
+    /// closes first the answer is dropped with the process.
+    fn check_update(&mut self) {
+        if self.update == update::State::Checking {
+            return;
+        }
+        let tx = self.tx.clone();
+        let spawned = std::thread::Builder::new().name("update-check".into()).spawn(move || {
+            send(&tx, AppEvent::UpdateChecked(super::update_check::check()));
+        });
+        match spawned {
+            Ok(_) => {
+                self.trace.mark("update check started");
+                self.update = update::State::Checking;
+            }
+            Err(e) => {
+                self.trace.mark(&format!("update check not started: {e}"));
+                self.update = update::State::Done(Err(Failure::Network(0)));
+            }
+        }
+        settings_window::set_update(&self.update, self.t());
+    }
+
+    fn handle_update(&mut self, result: Result<Outcome, Failure>) {
+        self.trace.mark(&format!("update check: {result:?}"));
+        if let Err(f) = &result {
+            diag::log(&format!("update check: {f:?}"));
+        }
+        self.update = update::State::Done(result);
+        settings_window::set_update(&self.update, self.t());
+    }
+
+    /// The page of the newer release the last check found (checked to be this repository's).
+    fn open_release_page(&mut self) {
+        let update::State::Done(Ok(Outcome::Newer { page, .. })) = &self.update else { return };
+        let Some(hwnd) = self.hwnd else { return };
+        if let Err(e) = shell::open_uri(hwnd, page) {
+            self.set_notice(fill(self.t().update_open_failed, &[("error", &e)]));
         }
     }
 
@@ -1334,7 +1442,10 @@ impl App {
                         self.set_notice(fill(t.register_failed, &[("error", &e)]));
                     }
                 }
+                self.check_registration(false);
             }
+            UiEvent::CheckUpdate => self.check_update(),
+            UiEvent::OpenReleasePage => self.open_release_page(),
             UiEvent::OpenDefaultApps => {
                 let Some(hwnd) = self.hwnd else { return };
                 if let Err(e) = shell::open_uri(hwnd, shell::DEFAULT_APPS_URI) {
@@ -1984,8 +2095,15 @@ impl App {
         let folder = |d: Option<&Path>| d.map_or_else(|| "-".to_string(), |d| d.display().to_string());
         let config = folder(self.settings_path.as_deref().and_then(Path::parent));
         let logs = folder(diag::default_dir().as_deref());
-        let text =
-            fill(self.t().about_text, &[("version", env!("CARGO_PKG_VERSION")), ("config", &config), ("logs", &logs)]);
+        let text = fill(
+            self.t().about_text,
+            &[
+                ("version", env!("CARGO_PKG_VERSION")),
+                ("config", &config),
+                ("logs", &logs),
+                ("url", crate::update::REPOSITORY),
+            ],
+        );
         dialogs::show_info(hwnd, &text);
     }
 }

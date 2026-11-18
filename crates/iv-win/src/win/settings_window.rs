@@ -12,7 +12,7 @@ use std::cell::{Cell, RefCell};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, CreateSolidBrush, DeleteObject, HBRUSH, HGDIOBJ};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::SystemServices::SS_SUNKEN;
+use windows::Win32::System::SystemServices::{SS_ENDELLIPSIS, SS_NOPREFIX, SS_PATHELLIPSIS, SS_SUNKEN};
 use windows::Win32::UI::Controls::{
     NMHDR, TCIF_TEXT, TCITEMW, TCM_GETCURSEL, TCM_GETITEMRECT, TCM_INSERTITEMW, TCM_SETCURSEL, TCM_SETITEMW,
     TCN_SELCHANGE, WC_TABCONTROLW,
@@ -26,8 +26,10 @@ use windows::core::{PCWSTR, PWSTR, w};
 
 use super::controls::{self, Builder};
 use super::{UiEvent, dialogs, post_ui, wide};
+use crate::assoc::Check;
 use crate::i18n::{Language, Strings};
 use crate::settings::{Choice, Settings, StartupWindow};
+use crate::update::{self, Outcome, State};
 use crate::view::ZoomOnOpen;
 use iv_pipeline::{AtEnd, SortBy};
 
@@ -51,22 +53,27 @@ const ID_SORT: i32 = 116;
 const ID_DESCENDING: i32 = 117;
 const ID_STARTUP: i32 = 118;
 const ID_TABS: i32 = 119;
+const ID_CHECK_UPDATE: i32 = 120;
+const ID_OPEN_RELEASE: i32 = 121;
 const ID_CANCEL: i32 = 2;
 
 /// Client size in 96-DPI units.
 const WIDTH: i32 = 440;
-const HEIGHT: i32 = 368;
+const HEIGHT: i32 = 384;
 /// Where the pages start, below the strip of tab titles.
 const TOP: i32 = 50;
-/// The band on the General page kept free under the version for checking for updates later:
-/// room for a button (26) and a status line (18) with the usual gaps.
-const UPDATE_Y: i32 = TOP + 220;
+/// On the General page, under the "Open with" buttons: where the registration points.
+const REGISTRATION_Y: i32 = TOP + 182;
+/// The version, then the band for checking for updates: a row of buttons (26) and a status
+/// line (18) with the usual gaps.
+const VERSION_Y: i32 = TOP + 208;
+const UPDATE_Y: i32 = TOP + 234;
 const UPDATE_H: i32 = 52;
-/// The version on the General page, and the Save and Defaults buttons at the bottom of every page.
-const VERSION_Y: i32 = TOP + 194;
+/// The Save and Defaults buttons at the bottom of every page.
 const BUTTONS_Y: i32 = HEIGHT - 38;
-// the room for updates lies between the version (18 high) and the buttons
-const _: () = assert!(VERSION_Y + 18 + 8 <= UPDATE_Y && UPDATE_Y + UPDATE_H <= BUTTONS_Y);
+// each line (18 high) clears the next, and the update band ends above the buttons
+const _: () =
+    assert!(REGISTRATION_Y + 18 + 8 <= VERSION_Y && VERSION_Y + 18 + 8 <= UPDATE_Y && UPDATE_Y + UPDATE_H <= BUTTONS_Y);
 /// Where the label and value columns start, and how wide they are.
 const LABEL_X: i32 = 16;
 const LABEL_W: i32 = 200;
@@ -142,6 +149,16 @@ fn version_text(s: &Strings) -> String {
     crate::i18n::fill(s.version, &[("version", env!("CARGO_PKG_VERSION"))])
 }
 
+/// Where the "Open with" registration points, as the General page says it.
+fn registration_text(c: &Check, s: &Strings) -> String {
+    match c {
+        Check::NotRegistered => s.registration_none.to_string(),
+        Check::Here => s.registration_here.to_string(),
+        Check::OtherCopy(p) => crate::i18n::fill(s.registration_other, &[("path", &p.display().to_string())]),
+        Check::Repair { old } => crate::i18n::fill(s.registration_missing, &[("path", &old.display().to_string())]),
+    }
+}
+
 /// The tab that Ctrl+Tab (`back`: Ctrl+Shift+Tab) moves to from `current`, round the ends.
 pub fn next_tab(current: usize, back: bool) -> usize {
     let n = TABS.len();
@@ -155,7 +172,11 @@ struct Window {
     startup: HWND,
     wheel: HWND,
     confirm_delete: HWND,
+    registration: HWND,
     version: HWND,
+    check_update: HWND,
+    open_release: HWND,
+    update_status: HWND,
     zoom: HWND,
     swatch: HWND,
     nearest: HWND,
@@ -183,6 +204,10 @@ thread_local! {
     static SWATCH_BRUSH: Cell<isize> = const { Cell::new(0) };
     /// The page shown.
     static PAGE: Cell<usize> = const { Cell::new(GENERAL) };
+    /// The last check for updates, and where the registration points (`None`: not known yet),
+    /// kept for relabelling in another language.
+    static UPDATE: RefCell<State> = const { RefCell::new(State::Idle) };
+    static REGISTRATION: RefCell<Option<Check>> = const { RefCell::new(None) };
 }
 
 pub fn hwnd() -> Option<HWND> {
@@ -341,8 +366,16 @@ fn create(owner: HWND, dpi: u32, s: &Strings) -> windows::core::Result<Window> {
         on_page(button(|s| s.register, LABEL_X, top + 150, 110, ID_REGISTER)?);
         on_page(button(|s| s.unregister, LABEL_X + 116, top + 150, 110, ID_UNREGISTER)?);
         on_page(button(|s| s.default_apps, LABEL_X + 232, top + 150, ROW_W - 232, ID_DEFAULT_APPS)?);
-        // the version; UPDATE_Y..UPDATE_Y + UPDATE_H under it stays free for checking for updates
+        // a long path keeps its start and its file name
+        let path_style = SS_NOPREFIX.0 | SS_PATHELLIPSIS.0;
+        let registration = on_page(b.add(w!("STATIC"), "", path_style, LABEL_X, REGISTRATION_Y, ROW_W, 18, 0)?);
         let version = on_page(b.add(w!("STATIC"), &version_text(s), 0, LABEL_X, VERSION_Y, LABEL_W, 18, 0)?);
+        // checking for updates happens only when this button is pressed
+        let check_update = on_page(button(|s| s.check_updates, LABEL_X, UPDATE_Y, 150, ID_CHECK_UPDATE)?);
+        let open_release = on_page(button(|s| s.open_release_page, LABEL_X + 156, UPDATE_Y, 160, ID_OPEN_RELEASE)?);
+        let status_style = SS_NOPREFIX.0 | SS_ENDELLIPSIS.0;
+        let update_status =
+            on_page(b.add(w!("STATIC"), "", status_style, LABEL_X, UPDATE_Y + UPDATE_H - 18, ROW_W, 18, 0)?);
 
         page.set(VIEW);
         label(|s| s.zoom_on_open, top)?;
@@ -383,7 +416,11 @@ fn create(owner: HWND, dpi: u32, s: &Strings) -> windows::core::Result<Window> {
             startup,
             wheel,
             confirm_delete,
+            registration,
             version,
+            check_update,
+            open_release,
+            update_status,
             zoom,
             swatch,
             nearest,
@@ -494,6 +531,44 @@ fn fill(s: &Settings) {
     set_swatch(s.background);
 }
 
+/// Shows the registration and the last check for updates in `s`'s language: the status lines,
+/// the Check button (off while a check runs) and the release page button (on only when a newer
+/// release was found).
+fn show_status(s: &Strings) {
+    WINDOW.with(|w| {
+        let w = w.borrow();
+        let Some(w) = w.as_ref() else { return };
+        let registration = REGISTRATION.with(|r| r.borrow().as_ref().map(|c| registration_text(c, s)));
+        controls::set_text(w.registration, &registration.unwrap_or_default());
+        let state = UPDATE.with(|u| u.borrow().clone());
+        controls::set_text(w.update_status, &update::status_text(&state, s));
+        let checking = state == State::Checking;
+        // a button being turned off must not keep the focus, or the keyboard would go nowhere
+        let focus = unsafe { GetFocus() };
+        let newer = matches!(state, State::Done(Ok(Outcome::Newer { .. })));
+        for (button, on) in [(w.check_update, !checking), (w.open_release, newer)] {
+            if !on && focus == button {
+                unsafe {
+                    let _ = SetFocus(Some(w.tabs));
+                }
+            }
+            controls::enable(button, on);
+        }
+    });
+}
+
+/// The state of the check for updates changed.
+pub fn set_update(state: &State, s: &Strings) {
+    UPDATE.with(|u| *u.borrow_mut() = state.clone());
+    show_status(s);
+}
+
+/// Where the "Open with" registration points now.
+pub fn set_registration(check: Check, s: &Strings) {
+    REGISTRATION.with(|r| *r.borrow_mut() = Some(check));
+    show_status(s);
+}
+
 /// Opens the window on a copy of `s`.
 pub fn show(owner: HWND, s: &Settings, activate: bool) -> Result<(), String> {
     if hwnd().is_none() {
@@ -503,6 +578,7 @@ pub fn show(owner: HWND, s: &Settings, activate: bool) -> Result<(), String> {
             .map_err(|e| crate::i18n::fill(t.settings_window_error, &[("error", &e.to_string())]))?;
         WINDOW.with(|c| *c.borrow_mut() = Some(w));
         show_page(GENERAL);
+        show_status(t);
     }
     VALUE.with(|v| *v.borrow_mut() = s.clone());
     fill(s);
@@ -551,6 +627,7 @@ pub fn set_language(s: &Strings) {
             let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(w.tabs), None, true);
         }
     });
+    show_status(s);
 }
 
 pub fn hide() {
@@ -669,6 +746,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 (ID_REGISTER, BN_CLICKED) => post_ui(UiEvent::Register(true)),
                 (ID_UNREGISTER, BN_CLICKED) => post_ui(UiEvent::Register(false)),
                 (ID_DEFAULT_APPS, BN_CLICKED) => post_ui(UiEvent::OpenDefaultApps),
+                (ID_CHECK_UPDATE, BN_CLICKED) => post_ui(UiEvent::CheckUpdate),
+                (ID_OPEN_RELEASE, BN_CLICKED) => post_ui(UiEvent::OpenReleasePage),
                 (ID_CANCEL, _) => post_ui(UiEvent::SettingsClosed),
                 _ => {}
             }
@@ -801,6 +880,64 @@ mod tests {
         }
     }
 
+    /// Every kind of result a check can show, with long but realistic numbers.
+    fn status_samples() -> Vec<State> {
+        use crate::update::Failure;
+        let mut out = vec![
+            State::Checking,
+            State::Done(Ok(Outcome::UpToDate { latest: "v0.1.0".into() })),
+            State::Done(Ok(Outcome::Newer { latest: "v10.20.30-beta.2".into(), page: String::new() })),
+        ];
+        out.extend(
+            [
+                Failure::Offline,
+                Failure::Timeout,
+                Failure::Tls,
+                Failure::Network(12030),
+                Failure::RateLimited(403),
+                Failure::Http(503),
+                Failure::TooLarge,
+                Failure::Unreadable,
+            ]
+            .map(|f| State::Done(Err(f))),
+        );
+        out
+    }
+
+    /// The status follows the check: the button is off while it runs, and the release page
+    /// button is on only when a newer release was found. Built hidden, never shown.
+    #[test]
+    fn buttons_follow_the_check() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+        controls::init_common_controls();
+        let w = create(HWND::default(), 96, &crate::i18n::EN).expect("settings window");
+        let (check, release, status) = (w.check_update, w.open_release, w.update_status);
+        WINDOW.with(|c| *c.borrow_mut() = Some(w));
+        let enabled = |h: HWND| unsafe { IsWindowEnabled(h).as_bool() };
+        let s = &crate::i18n::EN;
+        set_update(&State::Idle, s);
+        assert!(enabled(check) && !enabled(release));
+        assert_eq!(controls::text(status), "");
+        set_update(&State::Checking, s);
+        assert!(!enabled(check) && !enabled(release));
+        assert_eq!(controls::text(status), "Asking GitHub…");
+        let newer = State::Done(Ok(Outcome::Newer { latest: "v9.0.0".into(), page: "https://x".into() }));
+        set_update(&newer, s);
+        assert!(enabled(check) && enabled(release));
+        assert!(controls::text(status).starts_with("New version available: v9.0.0"));
+        set_update(&State::Done(Err(crate::update::Failure::Timeout)), s);
+        assert!(enabled(check) && !enabled(release));
+        assert_eq!(controls::text(status), "Check failed: no answer in time");
+        // relabelled with the language
+        set_language(&crate::i18n::KO);
+        assert_eq!(controls::text(status), "확인하지 못함: 응답 시간 초과");
+        set_registration(Check::OtherCopy(r"D:\old\image-viewer.exe".into()), &crate::i18n::KO);
+        let reg = WINDOW.with(|c| c.borrow().as_ref().unwrap().registration);
+        assert_eq!(controls::text(reg), r"다른 사본에 등록됨: D:\old\image-viewer.exe");
+        let hwnd = WINDOW.with(|c| c.borrow_mut().take().unwrap().hwnd);
+        unsafe { DestroyWindow(hwnd).unwrap() };
+    }
+
     fn overlap(a: &RECT, b: &RECT) -> bool {
         a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
     }
@@ -877,9 +1014,32 @@ mod tests {
                         );
                     }
                 }
+                // the band for updates holds the two buttons and the status line, and nothing else
                 let band = RECT { left: 0, top: px(UPDATE_Y), right: client.right, bottom: px(UPDATE_Y + UPDATE_H) };
+                let update_controls = [w.check_update, w.open_release, w.update_status];
                 for c in all.iter().filter(|c| matches!(c.page, None | Some(GENERAL))) {
-                    assert!(!overlap(&c.rect, &band), "{at}: {:?} is in the room kept for updates", c.texts);
+                    let inside = c.rect.top >= band.top && c.rect.bottom <= band.bottom;
+                    if update_controls.contains(&c.hwnd) {
+                        assert!(inside, "{at}: {:?} {:?} outside the band {band:?}", c.texts, c.rect);
+                    } else {
+                        assert!(!overlap(&c.rect, &band), "{at}: {:?} is in the band for updates", c.texts);
+                    }
+                }
+                // every status line the two lines can show fits on one line
+                let fits = |control: HWND, text: &str| {
+                    let mut r = RECT::default();
+                    unsafe { GetClientRect(control, &mut r).unwrap() };
+                    let (tw, th) = text_size(control, text);
+                    assert!(tw <= r.right && th <= r.bottom, "{at}: {text:?} is {tw}x{th} px in {r:?}");
+                };
+                for state in status_samples() {
+                    fits(w.update_status, &update::status_text(&state, s));
+                }
+                let short = std::path::PathBuf::from(r"D:\iv\image-viewer.exe");
+                for c in
+                    [Check::NotRegistered, Check::Here, Check::OtherCopy(short.clone()), Check::Repair { old: short }]
+                {
+                    fits(w.registration, &registration_text(&c, s));
                 }
                 unsafe { DestroyWindow(w.hwnd).unwrap() };
             }
