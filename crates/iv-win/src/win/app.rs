@@ -276,6 +276,11 @@ pub struct App {
     swallow_syschar: bool,
     /// The check for updates: only ever started by the user, one at a time.
     update: update::State,
+    /// A look at the "Open with" registration is running ([`App::check_registration`]).
+    registration_running: bool,
+    /// Another look was asked for while one ran: started when that one answers, and that
+    /// answer (possibly read before the change asked about) is not shown.
+    registration_again: bool,
 }
 
 fn file_name(p: &Path) -> String {
@@ -364,6 +369,8 @@ impl App {
             fullscreen: None,
             swallow_syschar: false,
             update: update::State::Idle,
+            registration_running: false,
+            registration_again: false,
         }
     }
 
@@ -1290,8 +1297,14 @@ impl App {
     /// Looks where the "Open with" registration points on a thread of its own (the registered
     /// program may sit on a slow or missing drive). With `repair` (at startup), a registration
     /// whose program is gone is moved to this one. The answer comes back as
-    /// [`AppEvent::Registration`].
+    /// [`AppEvent::Registration`]. One look runs at a time: asking while one runs (the startup
+    /// repair may wait on a slow drive) looks again once it answers, so the line always ends up
+    /// showing a look started after the last change.
     pub fn check_registration(&mut self, repair: bool) {
+        if self.registration_running {
+            self.registration_again = true;
+            return;
+        }
         let Ok(exe) = std::env::current_exe() else { return };
         let tx = self.tx.clone();
         let t = self.t();
@@ -1304,8 +1317,9 @@ impl App {
             };
             send(&tx, AppEvent::Registration { check, repaired, elapsed: start.elapsed() });
         });
-        if let Err(e) = spawned {
-            self.trace.mark(&format!("open-with check not started: {e}"));
+        match spawned {
+            Ok(_) => self.registration_running = true,
+            Err(e) => self.trace.mark(&format!("open-with check not started: {e}")),
         }
     }
 
@@ -1315,6 +1329,11 @@ impl App {
             repaired.as_ref().map_or(String::new(), |r| format!(", repaired: {r:?}")),
             elapsed.as_secs_f64() * 1000.0
         ));
+        self.registration_running = false;
+        if std::mem::take(&mut self.registration_again) {
+            self.check_registration(false);
+        }
+        let stale = self.registration_running;
         let t = self.t();
         let check = match (check, repaired) {
             (Check::Repair { old }, Some(Ok(()))) => {
@@ -1329,7 +1348,10 @@ impl App {
             }
             (check, _) => check,
         };
-        settings_window::set_registration(check, t);
+        // a newer look is on its way: it says where the registration points now
+        if !stale {
+            settings_window::set_registration(check, t);
+        }
     }
 
     /// Starts the check for updates the user asked for, unless one is running. The answer
@@ -1350,7 +1372,7 @@ impl App {
             }
             Err(e) => {
                 self.trace.mark(&format!("update check not started: {e}"));
-                self.update = update::State::Done(Err(Failure::Network(0)));
+                self.update = update::State::Done(Err(Failure::NotStarted));
             }
         }
         settings_window::set_update(&self.update, self.t());

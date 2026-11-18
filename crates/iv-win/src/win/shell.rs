@@ -248,7 +248,10 @@ fn texts(t: &Strings) -> assoc::Texts<'static> {
 /// names in the language of `t`.
 pub fn register(t: &Strings) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let result = write_values("", &assoc::registration(&exe, &texts(t)));
+    let result = {
+        let _writing = writing();
+        write_values("", &assoc::registration(&exe, &texts(t)))
+    };
     notify_associations_changed();
     result
 }
@@ -292,17 +295,35 @@ pub fn registered_exe(root: &str) -> Option<PathBuf> {
 /// thread does not call it at startup.
 pub fn registration_check(root: &str, current: &Path) -> Check {
     let registered = registered_exe(root);
-    let exists = registered.as_deref().is_some_and(Path::is_file);
-    assoc::check(registered.as_deref(), current, exists)
+    let found = registered.as_deref().map_or(assoc::Found::Unknown, |r| assoc::look_up(r, current));
+    assoc::check(registered.as_deref(), current, found)
 }
 
-/// At startup: when the registration points at a program that no longer exists, registers the
-/// running program `current` instead (in the language of `t`), dropping the old program's own
-/// "Open with" entry if it had another file name. Anything else is left as it is. Returns what
-/// was found, and how repairing went when it was needed.
+/// Held while the registration is written or removed, so a startup repair and the Register or
+/// Unregister button do not interleave their writes.
+fn writing() -> std::sync::MutexGuard<'static, ()> {
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    WRITING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// At startup: when the registration points at a program that is gone, registers the running
+/// program `current` instead (in the language of `t`), dropping the old program's own "Open
+/// with" entry if it had another file name. Anything else is left as it is. Returns what was
+/// found, and how repairing went when it was needed.
 pub fn repair_registration(root: &str, current: &Path, t: &Strings) -> (Check, Option<Result<(), String>>) {
-    let found = registration_check(root, current);
+    apply_repair(root, current, registration_check(root, current), t)
+}
+
+/// The writing half of [`repair_registration`], for what `found` says.
+fn apply_repair(root: &str, current: &Path, found: Check, t: &Strings) -> (Check, Option<Result<(), String>>) {
     let Check::Repair { old } = &found else { return (found, None) };
+    let writing = writing();
+    // the file system was asked without the lock (it can be slow): if Register or Unregister
+    // changed the registration meanwhile, that choice stands
+    if !registered_exe(root).is_some_and(|r| assoc::same_path(&r, old)) {
+        drop(writing);
+        return (registration_check(root, current), None);
+    }
     let mut result = write_values(root, &assoc::registration(current, &texts(t)));
     let old_name = assoc::exe_name(old);
     if result.is_ok() && !old_name.eq_ignore_ascii_case(&assoc::exe_name(current)) {
@@ -313,6 +334,7 @@ pub fn repair_registration(root: &str, current: &Path, t: &Strings) -> (Check, O
             result = remove(root, &Removal { trees: vec![key], ..Default::default() });
         }
     }
+    drop(writing);
     // the real registration changed: Explorer reads it again
     if root.is_empty() {
         notify_associations_changed();
@@ -323,7 +345,10 @@ pub fn repair_registration(root: &str, current: &Path, t: &Strings) -> (Check, O
 /// Removes what [`register`] wrote.
 pub fn unregister() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let result = remove("", &assoc::removal(&assoc::exe_name(&exe)));
+    let result = {
+        let _writing = writing();
+        remove("", &assoc::removal(&assoc::exe_name(&exe)))
+    };
     notify_associations_changed();
     result
 }
@@ -492,6 +517,53 @@ mod tests {
         let empty = Scratch::new("none");
         assert_eq!(repair_registration(&empty.0, &current, &crate::i18n::EN), (Check::NotRegistered, None));
         assert!(!exists(&empty.0, r"Software\Classes"), "nothing written when nothing was registered");
+    }
+
+    #[test]
+    fn a_copy_on_a_drive_that_does_not_answer_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("image-viewer.exe");
+        std::fs::write(&current, b"MZ").unwrap();
+        // a drive letter with nothing behind it, like an unplugged USB stick
+        let Some(drive) = (b'D'..=b'Z').rev().map(|l| format!(r"{}:\", l as char)).find(|d| !Path::new(d).exists())
+        else {
+            return;
+        };
+        let away = Path::new(&drive).join("iv").join("image-viewer.exe");
+        let scratch = registered_at("unplugged", &away);
+        let root = scratch.0.as_str();
+        assert_eq!(repair_registration(root, &current, &crate::i18n::EN), (Check::OtherCopy(away.clone()), None));
+        assert_eq!(registered_exe(root).as_deref(), Some(away.as_path()), "moved off a drive that may come back");
+    }
+
+    #[test]
+    fn a_registration_changed_while_looking_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("new").join("image-viewer.exe");
+        let other = dir.path().join("other").join("image-viewer.exe");
+        for f in [&current, &other] {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b"MZ").unwrap();
+        }
+        let old = dir.path().join("old").join("image-viewer.exe");
+        let stale = Check::Repair { old: old.clone() };
+
+        // another copy registered itself after the look found the old one gone
+        let scratch = registered_at("moved-meanwhile", &old);
+        let root = scratch.0.as_str();
+        write_values(root, &assoc::registration(&other, &TEXTS)).unwrap();
+        assert_eq!(
+            apply_repair(root, &current, stale.clone(), &crate::i18n::EN),
+            (Check::OtherCopy(other.clone()), None)
+        );
+        assert_eq!(registered_exe(root).as_deref(), Some(other.as_path()));
+
+        // or the user unregistered meanwhile: nothing comes back
+        let scratch = registered_at("removed-meanwhile", &old);
+        let root = scratch.0.as_str();
+        remove(root, &assoc::removal(&assoc::exe_name(&old))).unwrap();
+        assert_eq!(apply_repair(root, &current, stale, &crate::i18n::EN), (Check::NotRegistered, None));
+        assert!(!exists(root, r"Software\Classes\ImageViewer.Image"), "written again after unregistering");
     }
 
     #[test]

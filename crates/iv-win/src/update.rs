@@ -30,7 +30,8 @@ pub fn latest_release_api(repo: &str) -> Option<(&'static str, String)> {
 }
 
 /// The page to open for a release: GitHub's `html_url` when it is a release page of this
-/// repository (and holds nothing but plain URL characters), otherwise the list of releases.
+/// repository and holds nothing but plain URL characters (no `..`, and no `%`, so no escaped
+/// `..` either), otherwise the list of releases.
 pub fn release_page(html_url: Option<&str>, repo: &str) -> String {
     let list = releases_page(repo);
     let prefix = format!("{list}/");
@@ -38,7 +39,7 @@ pub fn release_page(html_url: Option<&str>, repo: &str) -> String {
         Some((url, rest))
             if !rest.is_empty()
                 && !rest.contains("..")
-                && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~/%+".contains(&b)) =>
+                && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~/+".contains(&b)) =>
         {
             url.to_string()
         }
@@ -53,8 +54,14 @@ enum Ident {
     Text(String),
 }
 
+/// The longest tag taken for a version (real tags are a dozen characters). The tag is shown as
+/// it is, so this also bounds what an answer can put in the status line.
+pub const MAX_TAG: usize = 64;
+
 /// A version tag as releases are named: an optional `v`, then `major.minor.patch` (a missing
-/// minor or patch counts as 0), an optional `-pre.release`, an optional `+build` (ignored).
+/// minor or patch counts as 0), an optional `-pre.release`, an optional `+build` (checked, then
+/// ignored). As semantic versioning says, identifiers are `[0-9A-Za-z-]` and numbers have no
+/// leading zeros; nothing else (no spaces, no control characters) is taken.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Version {
     core: [u64; 3],
@@ -63,15 +70,22 @@ pub struct Version {
 
 impl Version {
     pub fn parse(text: &str) -> Option<Version> {
-        let t = text.trim();
-        let t = t.strip_prefix(['v', 'V']).unwrap_or(t);
-        let t = t.split_once('+').map_or(t, |(v, build)| if build.is_empty() { "" } else { v });
+        if text.len() > MAX_TAG {
+            return None;
+        }
+        let t = text.strip_prefix(['v', 'V']).unwrap_or(text);
+        let identifier = |id: &str| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        let t = match t.split_once('+') {
+            Some((v, build)) => build.split('.').all(identifier).then_some(v)?,
+            None => t,
+        };
         let (core_text, pre_text) = match t.split_once('-') {
             Some((c, p)) => (c, Some(p)),
             None => (t, None),
         };
         let number = |s: &str| -> Option<u64> {
-            if s.is_empty() || s.len() > 19 || !s.bytes().all(|b| b.is_ascii_digit()) {
+            let digits = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+            if !digits || s.len() > 19 || (s.len() > 1 && s.starts_with('0')) {
                 return None;
             }
             s.parse().ok()
@@ -89,7 +103,7 @@ impl Version {
             Some(p) => p
                 .split('.')
                 .map(|id| {
-                    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                    if !identifier(id) {
                         None
                     } else if id.bytes().all(|b| b.is_ascii_digit()) {
                         number(id).map(Ident::Num)
@@ -151,6 +165,8 @@ pub enum Failure {
     TooLarge,
     /// Not the JSON of a release, or no version in it.
     Unreadable,
+    /// The check could not be started (no thread for it).
+    NotStarted,
 }
 
 /// What a check found.
@@ -203,6 +219,7 @@ pub fn reason(f: &Failure, s: &Strings) -> String {
         Failure::Http(status) => fill(s.update_http, &[("status", &status.to_string())]),
         Failure::TooLarge => s.update_too_large.to_string(),
         Failure::Unreadable => s.update_unreadable.to_string(),
+        Failure::NotStarted => s.update_not_started.to_string(),
     }
 }
 
@@ -515,7 +532,8 @@ mod tests {
         for pair in chain.windows(2) {
             assert!(v(pair[0]) < v(pair[1]), "{} < {}", pair[0], pair[1]);
         }
-        assert_eq!(v(" v2.0.0 ").cmp(&v("2.0.0")), Ordering::Equal);
+        assert_eq!(v("v2.0.0+exp.sha-5114f85").cmp(&v("2.0.0")), Ordering::Equal);
+        assert!(v("1.0.0-0") < v("1.0.0-1") && v("10.0.0") > v("9.0.0"), "a lone 0 is a number");
     }
 
     #[test]
@@ -538,9 +556,32 @@ mod tests {
             "v 1.0",
             "１.０.０",
             "1.0.0-é",
+            // build metadata is checked too, not skipped
+            "1.0.0+ anything\n",
+            "v9.0.0+a b",
+            "1.0.0+a..b",
+            "1.0.0+a.",
+            "1.0.0+\u{202e}x",
+            "1.0.0+a+b",
+            // no white space or control characters around the tag
+            " v2.0.0 ",
+            "v1.0.0\n",
+            "\tv1.0.0",
+            // leading zeros
+            "v01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "1.0.0-01",
+            "00.1.0",
         ] {
             assert_eq!(Version::parse(bad), None, "{bad:?}");
         }
+        // what an answer can put in the status line is bounded
+        let long = format!("v1.0.0-{}", "a".repeat(MAX_TAG));
+        assert_eq!(Version::parse(&long), None);
+        assert!(Version::parse(&long[..MAX_TAG]).is_some());
+        let huge = format!(r#"{{"tag_name":"v9.0.0+{}"}}"#, "x".repeat(100_000));
+        assert_eq!(evaluate(200, huge.as_bytes(), "0.1.0", REPO), Err(Failure::Unreadable));
     }
 
     #[test]
@@ -554,6 +595,8 @@ mod tests {
             Some("https://github.com/owner/repo-evil/releases/tag/v1"),
             Some("https://github.com/owner/repo/releases/"),
             Some("https://github.com/owner/repo/releases/../../../other"),
+            Some("https://github.com/owner/repo/releases/%2e%2e/%2e%2e/%2e%2e/x"),
+            Some("https://github.com/owner/repo/releases/tag/%2E%2E"),
             Some("https://github.com/owner/repo/releases/tag/v1\" calc"),
             Some("https://github.com/owner/repo/releases/tag/v1 &x"),
             Some("https://github.com/owner/repo/releasesx/tag/v1"),
@@ -681,6 +724,7 @@ mod tests {
             State::Done(Err(Failure::Http(404))),
             State::Done(Err(Failure::TooLarge)),
             State::Done(Err(Failure::Unreadable)),
+            State::Done(Err(Failure::NotStarted)),
         ];
         assert_eq!(status_text(&State::Idle, &KO), "");
         for s in [&KO, &EN] {

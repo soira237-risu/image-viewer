@@ -108,6 +108,9 @@ fn main() {
     for w in &keymap_warnings {
         diag::log(&format!("keymap: {w}"));
     }
+    // a run given its own settings file (tests, a second copy) leaves the system-wide "Open
+    // with" registration to the Register button
+    let repair_registration = settings_path.is_none();
     let settings_path = settings_path.or_else(|| config_dir().map(|d| d.join("settings.toml")));
     let (settings, warning) = match &settings_path {
         Some(p) => Settings::load(p),
@@ -139,5 +142,6 @@ fn main() {
         settings_path,
         trace,
         no_activate,
+        repair_registration,
     }));
 }

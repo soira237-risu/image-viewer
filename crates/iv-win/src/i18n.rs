@@ -132,7 +132,7 @@ strings! {
     // checking for updates (settings window, --check-update)
     check_updates, open_release_page, update_checking, update_current, update_available, update_failed,
     update_offline, update_timeout, update_tls, update_network, update_rate_limited, update_http,
-    update_too_large, update_unreadable, update_open_failed,
+    update_too_large, update_unreadable, update_not_started, update_open_failed,
     // where the "Open with" registration points
     registration_here, registration_other, registration_missing, registration_none, registration_repaired,
 }
@@ -391,6 +391,7 @@ pub static KO: Strings = Strings {
     update_http: "서버 응답 HTTP {status}",
     update_too_large: "응답이 너무 큼",
     update_unreadable: "알아볼 수 없는 응답",
+    update_not_started: "확인을 시작할 수 없음",
     update_open_failed: "릴리스 페이지를 열지 못했습니다: {error}",
     registration_here: "등록됨: 이 실행 파일",
     registration_other: "다른 사본에 등록됨: {path}",
@@ -592,6 +593,7 @@ pub static EN: Strings = Strings {
     update_http: "the server answered HTTP {status}",
     update_too_large: "answer too large",
     update_unreadable: "unreadable answer",
+    update_not_started: "the check could not start",
     update_open_failed: "cannot open the release page: {error}",
     registration_here: "Registered: this copy",
     registration_other: "Registered to another copy: {path}",

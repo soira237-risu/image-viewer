@@ -54,6 +54,10 @@ pub struct Options {
     pub settings_path: Option<PathBuf>,
     pub trace: Trace,
     pub no_activate: bool,
+    /// Whether startup may move an "Open with" registration left pointing at a deleted copy to
+    /// this one. Off for a run with its own settings file (tests, side-by-side copies): those
+    /// never change the system-wide registration on their own.
+    pub repair_registration: bool,
 }
 
 /// Runs `f` on the app, then lets it drain its queues. `None` when the app is busy further up
@@ -312,6 +316,7 @@ pub fn run(opts: Options) -> i32 {
     let saved_place = opts.settings_path.as_deref().and_then(|p| WindowPlacement::load(&WindowPlacement::path_for(p)));
     let language = opts.settings.language;
     let startup_window = opts.settings.startup_window;
+    let repair_registration = opts.repair_registration;
     let mut app = App::new(opts.keymap, opts.trace, opts.settings, opts.settings_path, opts.no_activate);
     // without a console these would go unseen: the title bar says them until the first command
     app.startup_warnings(opts.settings_warning, &opts.keymap_warnings);
@@ -412,8 +417,9 @@ pub fn run(opts: Options) -> i32 {
     if start.fullscreen {
         with_app(App::start_fullscreen);
     }
-    // a registration left pointing at a deleted older copy is repaired, beside the first frame
-    with_app(|app| app.check_registration(true));
+    // a registration left pointing at a deleted older copy is repaired (unless this run has its
+    // own settings file), beside the first frame
+    with_app(|app| app.check_registration(repair_registration));
     // events that arrived before the window existed
     super::wake();
 

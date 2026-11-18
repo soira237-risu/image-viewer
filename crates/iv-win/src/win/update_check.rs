@@ -105,9 +105,10 @@ fn query_number(request: &Handle, what: u32) -> Option<u32> {
     Some(value)
 }
 
-/// GETs `ep`: the HTTP status and up to [`MAX_ANSWER`] bytes of body.
+/// GETs `ep`: the HTTP status and up to [`MAX_ANSWER`] bytes of body. Each step before the
+/// headers has its own WinHTTP limit; the body as a whole gets `ep.timeout` from the moment
+/// the headers arrived (a server trickling bytes would otherwise keep every read alive).
 pub fn fetch(ep: &Endpoint) -> Result<(u16, Vec<u8>), Failure> {
-    let start = Instant::now();
     let agent = wide(&format!("image-viewer/{CURRENT}"));
     let ms = i32::try_from(ep.timeout.as_millis()).unwrap_or(i32::MAX).max(1);
     unsafe {
@@ -159,21 +160,29 @@ pub fn fetch(ep: &Endpoint) -> Result<(u16, Vec<u8>), Failure> {
         if query_number(&request, WINHTTP_QUERY_CONTENT_LENGTH).is_some_and(|n| n as usize > MAX_ANSWER) {
             return Err(Failure::TooLarge);
         }
+        let body_start = Instant::now();
         let mut body = Vec::new();
         let mut chunk = vec![0u8; 16 * 1024];
         loop {
-            if start.elapsed() > ep.timeout {
-                return Err(Failure::Timeout);
+            // wait for some data, then read just that: a read for more than has come waits
+            // until the buffer fills or the answer ends, however long the server dawdles
+            let mut available = 0u32;
+            WinHttpQueryDataAvailable(request.0, &mut available).map_err(|e| error_failure(&e))?;
+            if available == 0 {
+                break;
             }
             let mut read = 0u32;
-            WinHttpReadData(request.0, chunk.as_mut_ptr().cast(), chunk.len() as u32, &mut read)
-                .map_err(|e| error_failure(&e))?;
+            let want = (available as usize).min(chunk.len()) as u32;
+            WinHttpReadData(request.0, chunk.as_mut_ptr().cast(), want, &mut read).map_err(|e| error_failure(&e))?;
             if read == 0 {
                 break;
             }
             body.extend_from_slice(&chunk[..read as usize]);
             if body.len() > MAX_ANSWER {
                 return Err(Failure::TooLarge);
+            }
+            if body_start.elapsed() > ep.timeout {
+                return Err(Failure::Timeout);
             }
         }
         Ok((status, body))
@@ -203,6 +212,11 @@ mod tests {
     /// A one-request HTTP server on this computer: it reads the request, hands its head back
     /// through the channel, waits `delay`, and answers `response`.
     fn serve(response: Vec<u8>, delay: Duration) -> (u16, mpsc::Receiver<String>) {
+        serve_parts(vec![(delay, response)])
+    }
+
+    /// Like [`serve`], answering in pieces: each after its own pause.
+    fn serve_parts(parts: Vec<(Duration, Vec<u8>)>) -> (u16, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = mpsc::channel();
@@ -210,9 +224,12 @@ mod tests {
             let Ok((mut s, _)) = listener.accept() else { return };
             let head = read_head(&mut s);
             let _ = tx.send(head);
-            std::thread::sleep(delay);
-            let _ = s.write_all(&response);
-            let _ = s.flush();
+            for (delay, part) in parts {
+                std::thread::sleep(delay);
+                if s.write_all(&part).and_then(|()| s.flush()).is_err() {
+                    return;
+                }
+            }
             let _ = s.shutdown(std::net::Shutdown::Write);
             // let the client read everything before the socket closes
             let mut rest = [0u8; 256];
@@ -325,6 +342,56 @@ mod tests {
         unannounced.extend_from_slice(&big);
         let (r, _) = ask(unannounced, Duration::ZERO, TIMEOUT);
         assert_eq!(r, Err(Failure::TooLarge));
+    }
+
+    /// A Content-Length over the cap is refused before any of the body is read: here the body
+    /// is two bytes, so only the announced length can make it too large.
+    #[test]
+    fn an_announced_length_over_the_cap_is_refused_unread() {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{}}",
+            MAX_ANSWER + 1
+        );
+        let (r, _) = ask(head.into_bytes(), Duration::ZERO, TIMEOUT);
+        assert_eq!(r, Err(Failure::TooLarge));
+    }
+
+    /// The headers take longer than `timeout` but come within WinHTTP's own (coarser) wait: the
+    /// answer is still read, since the limit for the body starts when the headers arrive.
+    #[test]
+    fn slow_headers_within_winhttps_limit_are_still_read() {
+        let delay = Duration::from_millis(1500);
+        let started = Instant::now();
+        let (r, _) = ask(answer("200 OK", &release("v99.0.0")), delay, Duration::from_millis(500));
+        let elapsed = started.elapsed();
+        // WinHTTP itself may give up before the headers come (if its clock is finer elsewhere);
+        // a timeout after they came would be the body limit counting the wait for them
+        match r {
+            Ok(Outcome::Newer { latest, .. }) => assert_eq!(latest, "v99.0.0"),
+            Err(Failure::Timeout) => assert!(elapsed < delay, "timed out after the headers came ({elapsed:?})"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A body that trickles in, each piece well within the per-read limit, is given up on once
+    /// the whole body has taken longer than `timeout`.
+    #[test]
+    fn a_trickling_body_times_out() {
+        let body = release("v99.0.0");
+        let mut parts = vec![(
+            Duration::ZERO,
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes(),
+        )];
+        parts.extend(body.chunks(4).map(|c| (Duration::from_millis(100), c.to_vec())));
+        let (port, _) = serve_parts(parts);
+        let ep = Endpoint::new("127.0.0.1", port, PATH, false, Duration::from_millis(500)).unwrap();
+        let started = Instant::now();
+        assert_eq!(check_at(&ep), Err(Failure::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(3), "gave up after {:?}", started.elapsed());
     }
 
     #[test]
