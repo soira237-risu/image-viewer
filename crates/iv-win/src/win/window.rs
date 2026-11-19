@@ -54,6 +54,10 @@ pub struct Options {
     pub settings_path: Option<PathBuf>,
     pub trace: Trace,
     pub no_activate: bool,
+    /// Whether startup may move an "Open with" registration left pointing at a deleted copy to
+    /// this one. Off for a run with its own settings file (tests, side-by-side copies): those
+    /// never change the system-wide registration on their own.
+    pub repair_registration: bool,
 }
 
 /// Runs `f` on the app, then lets it drain its queues. `None` when the app is busy further up
@@ -196,11 +200,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 }
 
 /// Hands keyboard navigation (Tab, Esc, arrow keys on controls) to the panel and settings
-/// windows when a message is for them.
+/// windows when a message is for them; Ctrl+Tab switches the settings window's tabs.
 fn dialog_message(msg: &MSG) -> bool {
-    for aux in [panel::hwnd(), settings_window::hwnd(), help::hwnd()].into_iter().flatten() {
+    let settings = settings_window::hwnd();
+    for aux in [panel::hwnd(), settings, help::hwnd()].into_iter().flatten() {
         unsafe {
-            if (msg.hwnd == aux || IsChild(aux, msg.hwnd).as_bool()) && IsDialogMessageW(aux, msg).as_bool() {
+            if msg.hwnd != aux && !IsChild(aux, msg.hwnd).as_bool() {
+                continue;
+            }
+            if Some(aux) == settings && settings_window::pre_translate(msg) {
+                return true;
+            }
+            if IsDialogMessageW(aux, msg).as_bool() {
                 return true;
             }
         }
@@ -304,6 +315,8 @@ pub fn run(opts: Options) -> i32 {
 
     let saved_place = opts.settings_path.as_deref().and_then(|p| WindowPlacement::load(&WindowPlacement::path_for(p)));
     let language = opts.settings.language;
+    let startup_window = opts.settings.startup_window;
+    let repair_registration = opts.repair_registration;
     let mut app = App::new(opts.keymap, opts.trace, opts.settings, opts.settings_path, opts.no_activate);
     // without a console these would go unseen: the title bar says them until the first command
     app.startup_warnings(opts.settings_warning, &opts.keymap_warnings);
@@ -316,6 +329,8 @@ pub fn run(opts: Options) -> i32 {
     // born where it was last time (so it starts at that monitor's DPI), else centred on the
     // primary monitor at 1280×800 logical pixels
     let restore = saved_place.and_then(visible_placement);
+    let was_maximized = saved_place.is_some_and(|p| p.maximized) && restore.is_some();
+    let start = startup_window.start_state(was_maximized, opts.no_activate);
     let hwnd = unsafe {
         let instance = GetModuleHandleW(None).expect("module handle");
         let class = WNDCLASSEXW {
@@ -374,10 +389,10 @@ pub fn run(opts: Options) -> i32 {
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, (&dark as *const i32).cast(), 4);
         DragAcceptFiles(hwnd, true);
         // with --no-activate the window never takes focus from what the user is doing
-        let show = match (opts.no_activate, saved_place) {
+        let show = match (opts.no_activate, start.maximized) {
             (true, _) => SW_SHOWNOACTIVATE,
-            (false, Some(p)) if p.maximized && restore.is_some() => SW_SHOWMAXIMIZED,
-            (false, _) => SW_SHOW,
+            (false, true) => SW_SHOWMAXIMIZED,
+            (false, false) => SW_SHOW,
         };
         match restore {
             // exact restored rectangle (workspace coordinates) and the maximised state
@@ -399,6 +414,12 @@ pub fn run(opts: Options) -> i32 {
             }
         }
     }
+    if start.fullscreen {
+        with_app(App::start_fullscreen);
+    }
+    // a registration left pointing at a deleted older copy is repaired (unless this run has its
+    // own settings file), beside the first frame
+    with_app(|app| app.check_registration(repair_registration));
     // events that arrived before the window existed
     super::wake();
 

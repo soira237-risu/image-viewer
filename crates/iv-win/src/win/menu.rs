@@ -65,7 +65,8 @@ pub struct MenuState {
     pub can_redo: bool,
     pub edited: bool,
     pub has_selection: bool,
-    /// A folder or archive with more than one image is open.
+    /// There is somewhere to step to: a folder or archive with more than one image is open, or
+    /// one with any image when stepping past its end goes on to the next folder.
     pub can_navigate: bool,
     /// An image is current (its path can be copied or shown in Explorer).
     pub has_path: bool,
@@ -155,7 +156,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ids_map_back_to_commands_and_every_command_but_escape_is_listed_once() {
+    fn ids_map_back_to_commands_and_every_command_but_keys_only_ones_is_listed_once() {
         for cmd in Command::ALL {
             assert_eq!(Command::ALL[id_of(cmd) - 1], cmd);
         }
@@ -163,7 +164,8 @@ mod tests {
         let unique: std::collections::HashSet<_> = listed.iter().collect();
         assert_eq!(unique.len(), listed.len(), "a command is listed twice");
         for cmd in Command::ALL {
-            let expected = cmd != Command::Escape;
+            // Esc and the scroll steps are keys for what is on screen, not menu items
+            let expected = !matches!(cmd, Command::Escape | Command::ViewScrollUp | Command::ViewScrollDown);
             assert_eq!(listed.contains(&cmd), expected, "{cmd:?}");
         }
     }

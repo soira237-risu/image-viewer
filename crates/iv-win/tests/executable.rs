@@ -65,17 +65,31 @@ impl<'a> Pe<'a> {
     /// DLL names from the import table (directory 1, 20-byte descriptors, name at +12) and the
     /// delay-load table (directory 13, 32-byte descriptors, name at +4).
     fn imported_dlls(&self) -> Vec<String> {
+        let mut dlls = self.loaded_at_start();
+        dlls.extend(self.delay_loaded());
+        dlls
+    }
+
+    /// DLL names in the import table: loaded with the program.
+    fn loaded_at_start(&self) -> Vec<String> {
+        self.dll_table(1, 20, 12)
+    }
+
+    /// DLL names in the delay-load table: loaded at their first call.
+    fn delay_loaded(&self) -> Vec<String> {
+        self.dll_table(13, 32, 4)
+    }
+
+    fn dll_table(&self, index: usize, step: usize, name_at: usize) -> Vec<String> {
         let mut dlls = Vec::new();
-        for (index, step, name_at) in [(1, 20, 12), (13, 32, 4)] {
-            let (rva, _) = self.directory(index);
-            if rva == 0 {
-                continue;
-            }
-            let mut at = self.offset(rva);
-            while self.bytes[at..at + step].iter().any(|&b| b != 0) {
-                dlls.push(self.c_string(u32_at(self.bytes, at + name_at)));
-                at += step;
-            }
+        let (rva, _) = self.directory(index);
+        if rva == 0 {
+            return dlls;
+        }
+        let mut at = self.offset(rva);
+        while self.bytes[at..at + step].iter().any(|&b| b != 0) {
+            dlls.push(self.c_string(u32_at(self.bytes, at + name_at)));
+            at += step;
         }
         dlls
     }
@@ -112,6 +126,16 @@ fn needs_no_c_runtime_dll() {
     let runtime = ["vcruntime", "msvcp", "msvcr", "ucrtbase", "api-ms-win-crt-", "concrt"];
     let bad: Vec<_> = dlls.iter().filter(|d| runtime.iter().any(|r| d.to_ascii_lowercase().starts_with(r))).collect();
     assert!(bad.is_empty(), "C runtime DLLs imported: {bad:?} (all imports: {dlls:?})");
+}
+
+/// WinHTTP serves only the check for updates the user asks for, so it is not loaded at start.
+#[test]
+fn winhttp_is_loaded_only_when_used() {
+    let bytes = std::fs::read(EXE).unwrap();
+    let pe = Pe::parse(&bytes);
+    let is_winhttp = |d: &String| d.eq_ignore_ascii_case("winhttp.dll");
+    assert!(pe.delay_loaded().iter().any(is_winhttp), "delay-loaded: {:?}", pe.delay_loaded());
+    assert!(!pe.loaded_at_start().iter().any(is_winhttp), "loaded at start: {:?}", pe.loaded_at_start());
 }
 
 #[test]

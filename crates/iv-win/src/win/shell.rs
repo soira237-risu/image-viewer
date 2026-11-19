@@ -2,16 +2,18 @@
 //! and the per-user "Open with" registration. The data each needs is built (and tested) in
 //! [`crate::clipboard`] and [`crate::assoc`]; this module only hands it to Windows.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GlobalFree, HANDLE, HGLOBAL, HWND, WIN32_ERROR};
+use windows::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, GlobalFree, HANDLE, HGLOBAL, HWND, WIN32_ERROR,
+};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_READ, REG_SZ, RegCloseKey, RegDeleteKeyValueW, RegDeleteKeyW, RegDeleteTreeW,
-    RegOpenKeyExW, RegQueryInfoKeyW, RegSetKeyValueW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegDeleteKeyValueW, RegDeleteKeyW,
+    RegDeleteTreeW, RegGetValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegSetKeyValueW,
 };
 use windows::Win32::UI::Shell::{
     FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FOF_WANTNUKEWARNING, ILCreateFromPathW, ILFree,
@@ -22,8 +24,9 @@ use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{PCWSTR, w};
 
 use super::wide;
-use crate::assoc::{self, Removal, Value};
+use crate::assoc::{self, Check, Removal, Value};
 use crate::clipboard;
+use crate::i18n::Strings;
 
 /// One clipboard format and its bytes.
 pub enum Clip {
@@ -237,24 +240,115 @@ pub fn remove(root: &str, r: &Removal) -> Result<(), String> {
     Ok(())
 }
 
+fn texts(t: &Strings) -> assoc::Texts<'static> {
+    assoc::Texts { image_type: t.image_type_name, archive_type: t.archive_type_name, description: t.app_description }
+}
+
 /// Lists the running program in "Open with" and Default apps for the current user, with type
 /// names in the language of `t`.
-pub fn register(t: &crate::i18n::Strings) -> Result<(), String> {
+pub fn register(t: &Strings) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let texts = assoc::Texts {
-        image_type: t.image_type_name,
-        archive_type: t.archive_type_name,
-        description: t.app_description,
+    let result = {
+        let _writing = writing();
+        write_values("", &assoc::registration(&exe, &texts(t)))
     };
-    let result = write_values("", &assoc::registration(&exe, &texts));
     notify_associations_changed();
     result
+}
+
+/// The string value `name` of `HKEY_CURRENT_USER\<root>\<key>`, if there is one.
+pub fn read_value(root: &str, key: &str, name: &str) -> Option<String> {
+    let key = under(root, key);
+    let name = wide(name);
+    let mut buf = vec![0u16; 512];
+    // the value may grow between asking its size and reading it: try again a few times
+    for _ in 0..4 {
+        let mut bytes = (buf.len() * 2) as u32;
+        let e = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR(key.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                Some(buf.as_mut_ptr().cast()),
+                Some(&mut bytes),
+            )
+        };
+        if e == ERROR_MORE_DATA {
+            buf = vec![0u16; (bytes as usize).div_ceil(2) + 1];
+            continue;
+        }
+        let len = (bytes as usize / 2).min(buf.len());
+        return (e == ERROR_SUCCESS).then(|| String::from_utf16_lossy(&buf[..len.saturating_sub(1)]));
+    }
+    None
+}
+
+/// The program the registration under `HKEY_CURRENT_USER\<root>` runs, if there is one.
+pub fn registered_exe(root: &str) -> Option<PathBuf> {
+    read_value(root, assoc::IMAGE_COMMAND_KEY, "").and_then(|c| assoc::command_exe(&c))
+}
+
+/// Where the registration under `root` points, for the running program `current`. Looks at the
+/// file system (the registered program may be on a slow or missing drive), so the window's
+/// thread does not call it at startup.
+pub fn registration_check(root: &str, current: &Path) -> Check {
+    let registered = registered_exe(root);
+    let found = registered.as_deref().map_or(assoc::Found::Unknown, |r| assoc::look_up(r, current));
+    assoc::check(registered.as_deref(), current, found)
+}
+
+/// Held while the registration is written or removed, so a startup repair and the Register or
+/// Unregister button do not interleave their writes.
+fn writing() -> std::sync::MutexGuard<'static, ()> {
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    WRITING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// At startup: when the registration points at a program that is gone, registers the running
+/// program `current` instead (in the language of `t`), dropping the old program's own "Open
+/// with" entry if it had another file name. Anything else is left as it is. Returns what was
+/// found, and how repairing went when it was needed.
+pub fn repair_registration(root: &str, current: &Path, t: &Strings) -> (Check, Option<Result<(), String>>) {
+    apply_repair(root, current, registration_check(root, current), t)
+}
+
+/// The writing half of [`repair_registration`], for what `found` says.
+fn apply_repair(root: &str, current: &Path, found: Check, t: &Strings) -> (Check, Option<Result<(), String>>) {
+    let Check::Repair { old } = &found else { return (found, None) };
+    let writing = writing();
+    // the file system was asked without the lock (it can be slow): if Register or Unregister
+    // changed the registration meanwhile, that choice stands
+    if !registered_exe(root).is_some_and(|r| assoc::same_path(&r, old)) {
+        drop(writing);
+        return (registration_check(root, current), None);
+    }
+    let mut result = write_values(root, &assoc::registration(current, &texts(t)));
+    let old_name = assoc::exe_name(old);
+    if result.is_ok() && !old_name.eq_ignore_ascii_case(&assoc::exe_name(current)) {
+        let key = assoc::application_key(&old_name);
+        let command = read_value(root, &format!(r"{key}\shell\open\command"), "");
+        // only if that entry is the old copy's own, not another program's of the same name
+        if command.and_then(|c| assoc::command_exe(&c)).is_some_and(|c| assoc::same_path(&c, old)) {
+            result = remove(root, &Removal { trees: vec![key], ..Default::default() });
+        }
+    }
+    drop(writing);
+    // the real registration changed: Explorer reads it again
+    if root.is_empty() {
+        notify_associations_changed();
+    }
+    (found, Some(result))
 }
 
 /// Removes what [`register`] wrote.
 pub fn unregister() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let result = remove("", &assoc::removal(&assoc::exe_name(&exe)));
+    let result = {
+        let _writing = writing();
+        remove("", &assoc::removal(&assoc::exe_name(&exe)))
+    };
     notify_associations_changed();
     result
 }
@@ -267,7 +361,6 @@ fn notify_associations_changed() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::System::Registry::{REG_VALUE_TYPE, RRF_RT_REG_SZ, RegGetValueW};
 
     /// A scratch key under `HKEY_CURRENT_USER\Software`, deleted when dropped.
     struct Scratch(String);
@@ -287,23 +380,7 @@ mod tests {
     }
 
     fn read(root: &str, key: &str, name: &str) -> Option<String> {
-        let key = under(root, key);
-        let name = wide(name);
-        let mut buf = vec![0u16; 1024];
-        let mut bytes = (buf.len() * 2) as u32;
-        let mut ty = REG_VALUE_TYPE::default();
-        let e = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                PCWSTR(key.as_ptr()),
-                PCWSTR(name.as_ptr()),
-                RRF_RT_REG_SZ,
-                Some(&mut ty),
-                Some(buf.as_mut_ptr().cast()),
-                Some(&mut bytes),
-            )
-        };
-        (e == ERROR_SUCCESS).then(|| String::from_utf16_lossy(&buf[..(bytes as usize / 2).saturating_sub(1)]))
+        read_value(root, key, name)
     }
 
     fn exists(root: &str, key: &str) -> bool {
@@ -359,5 +436,143 @@ mod tests {
         assert!(exists(root, r"Software\Classes\.jpg\OpenWithProgids"), "still used by the other program");
         // unregistering twice is fine
         remove(root, &assoc::removal(&assoc::exe_name(exe))).unwrap();
+    }
+
+    const TEXTS: assoc::Texts = assoc::Texts { image_type: "Image", archive_type: "Archive", description: "test" };
+
+    /// A registration in a scratch key pointing at `exe`.
+    fn registered_at(name: &str, exe: &Path) -> Scratch {
+        let scratch = Scratch::new(name);
+        write_values(&scratch.0, &assoc::registration(exe, &TEXTS)).unwrap();
+        scratch
+    }
+
+    #[test]
+    fn a_registration_whose_program_is_gone_moves_to_the_running_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("new").join("image-viewer.exe");
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&current, b"MZ").unwrap();
+        let old = dir.path().join("old").join("image-viewer.exe");
+        let scratch = registered_at("repair", &old);
+        let root = scratch.0.as_str();
+        assert_eq!(registered_exe(root).as_deref(), Some(old.as_path()));
+
+        let (found, result) = repair_registration(root, &current, &crate::i18n::EN);
+        assert_eq!(found, Check::Repair { old: old.clone() });
+        assert_eq!(result, Some(Ok(())));
+        // every value now names the running program, in the language given
+        for v in assoc::registration(&current, &texts(&crate::i18n::EN)) {
+            assert_eq!(read(root, &v.key, &v.name).as_deref(), Some(v.data.as_str()), "{v:?}");
+        }
+        assert_eq!(registration_check(root, &current), Check::Here);
+        // a second start finds nothing to do
+        assert_eq!(repair_registration(root, &current, &crate::i18n::EN), (Check::Here, None));
+    }
+
+    #[test]
+    fn a_renamed_program_drops_the_old_names_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("image-viewer.exe");
+        std::fs::write(&current, b"MZ").unwrap();
+        let old = dir.path().join("gone").join("viewer-0.1.exe");
+        let scratch = registered_at("rename", &old);
+        let root = scratch.0.as_str();
+        let (_, result) = repair_registration(root, &current, &crate::i18n::KO);
+        assert_eq!(result, Some(Ok(())));
+        assert!(!exists(root, r"Software\Classes\Applications\viewer-0.1.exe"), "old entry left behind");
+        assert!(exists(root, r"Software\Classes\Applications\image-viewer.exe"));
+        assert_eq!(registered_exe(root).as_deref(), Some(current.as_path()));
+
+        // an entry of that name that runs some other program is not the old copy's to remove
+        let scratch = registered_at("rename-other", &old);
+        let root = scratch.0.as_str();
+        let foreign = Value {
+            key: r"Software\Classes\Applications\viewer-0.1.exe\shell\open\command".into(),
+            name: String::new(),
+            data: r#""D:\Other\viewer-0.1.exe" "%1""#.into(),
+        };
+        write_values(root, std::slice::from_ref(&foreign)).unwrap();
+        assert_eq!(repair_registration(root, &current, &crate::i18n::KO).1, Some(Ok(())));
+        assert_eq!(read(root, &foreign.key, "").as_deref(), Some(foreign.data.as_str()));
+    }
+
+    #[test]
+    fn another_existing_copy_and_no_registration_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("a").join("image-viewer.exe");
+        let other = dir.path().join("b").join("image-viewer.exe");
+        for f in [&current, &other] {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b"MZ").unwrap();
+        }
+        let scratch = registered_at("other", &other);
+        let root = scratch.0.as_str();
+        let before: Vec<_> = assoc::registration(&other, &TEXTS);
+        assert_eq!(repair_registration(root, &current, &crate::i18n::EN), (Check::OtherCopy(other.clone()), None));
+        for v in &before {
+            assert_eq!(read(root, &v.key, &v.name).as_deref(), Some(v.data.as_str()), "changed: {v:?}");
+        }
+
+        let empty = Scratch::new("none");
+        assert_eq!(repair_registration(&empty.0, &current, &crate::i18n::EN), (Check::NotRegistered, None));
+        assert!(!exists(&empty.0, r"Software\Classes"), "nothing written when nothing was registered");
+    }
+
+    #[test]
+    fn a_copy_on_a_drive_that_does_not_answer_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("image-viewer.exe");
+        std::fs::write(&current, b"MZ").unwrap();
+        // a drive letter with nothing behind it, like an unplugged USB stick
+        let Some(drive) = (b'D'..=b'Z').rev().map(|l| format!(r"{}:\", l as char)).find(|d| !Path::new(d).exists())
+        else {
+            return;
+        };
+        let away = Path::new(&drive).join("iv").join("image-viewer.exe");
+        let scratch = registered_at("unplugged", &away);
+        let root = scratch.0.as_str();
+        assert_eq!(repair_registration(root, &current, &crate::i18n::EN), (Check::OtherCopy(away.clone()), None));
+        assert_eq!(registered_exe(root).as_deref(), Some(away.as_path()), "moved off a drive that may come back");
+    }
+
+    #[test]
+    fn a_registration_changed_while_looking_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("new").join("image-viewer.exe");
+        let other = dir.path().join("other").join("image-viewer.exe");
+        for f in [&current, &other] {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b"MZ").unwrap();
+        }
+        let old = dir.path().join("old").join("image-viewer.exe");
+        let stale = Check::Repair { old: old.clone() };
+
+        // another copy registered itself after the look found the old one gone
+        let scratch = registered_at("moved-meanwhile", &old);
+        let root = scratch.0.as_str();
+        write_values(root, &assoc::registration(&other, &TEXTS)).unwrap();
+        assert_eq!(
+            apply_repair(root, &current, stale.clone(), &crate::i18n::EN),
+            (Check::OtherCopy(other.clone()), None)
+        );
+        assert_eq!(registered_exe(root).as_deref(), Some(other.as_path()));
+
+        // or the user unregistered meanwhile: nothing comes back
+        let scratch = registered_at("removed-meanwhile", &old);
+        let root = scratch.0.as_str();
+        remove(root, &assoc::removal(&assoc::exe_name(&old))).unwrap();
+        assert_eq!(apply_repair(root, &current, stale, &crate::i18n::EN), (Check::NotRegistered, None));
+        assert!(!exists(root, r"Software\Classes\ImageViewer.Image"), "written again after unregistering");
+    }
+
+    #[test]
+    fn long_values_are_read_whole() {
+        let scratch = Scratch::new("long");
+        let long = format!(r#""C:\{}\image-viewer.exe" "%1""#, "x".repeat(2000));
+        let v = Value { key: assoc::IMAGE_COMMAND_KEY.into(), name: String::new(), data: long.clone() };
+        write_values(&scratch.0, &[v]).unwrap();
+        assert_eq!(read_value(&scratch.0, assoc::IMAGE_COMMAND_KEY, "").as_deref(), Some(long.as_str()));
+        assert_eq!(read_value(&scratch.0, assoc::IMAGE_COMMAND_KEY, "missing"), None);
     }
 }
