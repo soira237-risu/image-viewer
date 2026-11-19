@@ -27,10 +27,10 @@ M0~M6 완료:
 GitHub 릴리스에서 `image-viewer-<버전>-x86_64-windows.zip`을 받아 원하는 폴더에 풀고 `image-viewer.exe`를 실행. 설치 과정·관리자 권한·Visual C++ 재배포 패키지가 필요 없음 (C 런타임이 실행 파일 안에 들어 있음).
 
 - 요구 사항: Windows 10 1703 이상 또는 Windows 11, 64비트(x64)
-- zip 내용: `image-viewer.exe`(뷰어), `iv.exe`(명령줄 도구: 일괄 변환·확장자 바로잡기·정보·속도 측정), `README.md`, `CHANGELOG.md`, `LICENSE`, `THIRD-PARTY-NOTICES.txt`·`RUST-STD-COPYRIGHT.html`(실행 파일에 들어 있는 오픈 소스 패키지의 라이선스)
+- zip 내용: `image-viewer.exe`(뷰어), `iv.exe`(명령줄 도구: 일괄 변환·확장자 바로잡기·정보·속도 측정), `image_viewer_thumbs.dll`([탐색기 썸네일](#탐색기-썸네일), 등록했을 때만 탐색기가 씀), `README.md`, `CHANGELOG.md`, `LICENSE`, `THIRD-PARTY-NOTICES.txt`·`RUST-STD-COPYRIGHT.html`(실행 파일에 들어 있는 오픈 소스 패키지의 라이선스)
 - 받은 파일 확인: 같은 이름의 `.sha256` 파일에 든 값과 `Get-FileHash <zip 파일>`의 값이 같아야 함
 - `…-symbols.zip`은 비정상 종료 기록(`crash.log`)을 분석할 때 쓰는 디버그 기호(.pdb). 뷰어를 쓰는 데는 필요 없음. 배포한 실행 파일에는 .pdb가 없어 `crash.log`의 뷰어 프레임은 이름 대신 `[image-viewer.exe+0x…]`(실행 파일 시작 주소로부터의 오프셋)로 남고, 보고서 머리의 `image:` 줄에 시작 주소·링크 시각·.pdb의 GUID가 있음. 같은 릴리스의 `image-viewer.exe`와 풀어 둔 기호 폴더로 `pwsh -File scripts/symbolize.ps1 -CrashLog <crash.log> -Exe <image-viewer.exe> -Symbols <기호 폴더>`를 실행하면 Windows의 `dbghelp.dll`로 각 프레임에 함수 이름과 파일:줄을 붙여 보여 줌 (디버거 설치 불필요, 다른 빌드의 crash.log면 경고). `symbolize.ps1`은 배포 zip이 아니라 저장소에 있고, 프레임을 실행 파일 이름으로 찾으므로 `-Exe`에는 crash.log에 적힌 것과 같은 이름의 파일을 줄 것(이름을 바꿔 쓴 경우 그 이름으로 복사)
-- 기본 뷰어로 쓰려면 [기본 뷰어로 쓰기](#기본-뷰어로-쓰기) 참고. 지울 때는 등록을 해제(`image-viewer --unregister`)한 뒤 폴더를 지우고, 설정(`%APPDATA%\image-viewer`)과 기록(`%LOCALAPPDATA%\image-viewer`)도 필요 없으면 지움
+- 기본 뷰어로 쓰려면 [기본 뷰어로 쓰기](#기본-뷰어로-쓰기) 참고. 지울 때는 등록을 해제(`image-viewer --unregister`, 탐색기 썸네일을 등록했으면 `image-viewer --unregister-thumbnails`도)한 뒤 폴더를 지우고, 설정(`%APPDATA%\image-viewer`)과 기록(`%LOCALAPPDATA%\image-viewer`)도 필요 없으면 지움
 
 ### 선택 코덱 (HEIC·RAW)
 
@@ -50,7 +50,7 @@ AVIF·WebP·JPEG XL을 비롯한 나머지 형식은 모두 뷰어 안의 디코
 1. 새 버전 받기: [릴리스 페이지](https://github.com/soira237-risu/image-viewer/releases)에서 새 zip을 받음. 새 버전이 있는지는 설정(F2) > 일반의 **업데이트 확인** 버튼으로 알 수 있고, 새 버전이 있으면 **릴리스 페이지 열기**가 그 버전의 페이지를 엶 (명령줄: `image-viewer --check-update`, 결과를 출력하고 끝남, 확인하지 못하면 종료 코드 1)
 2. 뷰어를 모두 닫음 (실행 중인 exe는 덮어쓸 수 없음)
 3. 둘 중 하나:
-   - 쓰던 폴더에 `image-viewer.exe`와 `iv.exe`를 **둘 다** 덮어씀 (나머지 파일도 새 zip의 것으로 바꾸면 됨)
+   - 쓰던 폴더에 `image-viewer.exe`, `iv.exe`, `image_viewer_thumbs.dll`을 **모두** 덮어씀 (나머지 파일도 새 zip의 것으로 바꾸면 됨). 탐색기 썸네일을 등록해 두었으면 탐색기가 DLL을 쥐고 있어 덮어쓰지 못할 수 있음: 썸네일을 띄우는 `dllhost.exe`(COM Surrogate)가 끝나기를 잠시 기다리거나 로그아웃 후 다시 시도
    - 또는 다른 폴더에 새로 풂
 
 설정·단축키(`%APPDATA%\image-viewer`의 `settings.toml`·`keymap.toml`·`window.toml`)는 실행 파일 밖에 있으므로 어느 쪽이든 그대로 남음.
@@ -61,6 +61,7 @@ AVIF·WebP·JPEG XL을 비롯한 나머지 형식은 모두 뷰어 안의 디코
 - 예전 폴더가 아직 있으면 아무것도 바꾸지 않음 (일부러 두 벌을 쓰는 경우를 위해). 설정 > 일반에 "다른 사본에 등록됨: <경로>"로 나오므로, 새 뷰어로 옮기려면 거기서 **등록**을 누름
 - 예전 exe가 있는지 알 수 없을 때도 바꾸지 않음: 빼 둔 USB·외장 드라이브, 연결되지 않은 네트워크 공유, 읽을 권한이 없는 폴더. 저절로 고치는 것은 그 드라이브(공유)는 읽히는데 파일이 없을 때뿐
 - `--settings <파일>`로 따로 설정 파일을 준 실행(시험용, 두 번째 사본)은 시작할 때 등록을 고치지 않음. 필요하면 그 창의 **등록**을 누름
+- [탐색기 썸네일](#탐색기-썸네일) 등록도 같은 규칙: 등록이 가리키는 DLL이 없어졌고 새 exe 옆에 DLL이 있으면 시작할 때 새 DLL로 고침 (썸네일을 그리는 확장자 목록은 그대로)
 
 업데이트 확인은 버튼을 누르거나 `--check-update`를 줄 때만 GitHub(`api.github.com`)에 한 번 물어봄: 자동·주기 확인은 없고, 보내는 것은 User-Agent의 버전(`image-viewer/<버전>`)뿐 (쿠키·Windows 자격 증명·사용 기록 없음). Windows의 WinHTTP를 쓰므로 시스템 프록시 설정을 따르고, 답이 없으면 10초쯤(WinHTTP의 시간 단위 때문에 실제로는 12초 안팎) 뒤 포기함. 결과는 설정 창의 상태 줄에: 최신 버전 / 새 버전(번호) / 확인하지 못함(인터넷 연결 없음, 응답 시간 초과, 보안 연결 실패, 요청 한도 초과 — GitHub은 로그인하지 않은 요청을 주소당 시간당 60번으로 제한, 그 밖의 HTTP 상태, 알아볼 수 없는 응답). 확인하는 동안에도 뷰어는 그대로 쓸 수 있고, 설정 창이나 뷰어를 닫아도 됨
 
@@ -91,6 +92,7 @@ cargo build --release
 ./target/release/image-viewer --version     # 버전 (`iv --version`도 같음)
 ./target/release/image-viewer --check-update   # GitHub에 최신 릴리스를 물어 결과를 출력 (창 없음, 확인하지 못하면 종료 코드 1)
 ./target/release/image-viewer --register    # "연결 프로그램"·기본 앱 목록에 등록 (이 사용자만, --unregister로 해제)
+./target/release/image-viewer --register-thumbnails   # 탐색기 썸네일 등록 (같은 폴더의 image_viewer_thumbs.dll, --unregister-thumbnails로 해제)
 ```
 
 ### 릴리스 만들기
@@ -199,6 +201,18 @@ JPEG XL 인코더는 참조 구현 libjxl 0.12를 실행 파일에 정적으로 
 ### 기본 뷰어로 쓰기
 
 설정(F2)의 "Windows '연결 프로그램' 목록"에서 **등록**을 누르면(또는 `image-viewer --register`) 지금 실행 중인 image-viewer.exe가 지원하는 모든 이미지·압축파일 확장자의 "연결 프로그램" 목록과 Windows 설정 > 기본 앱에 나타남. 현재 사용자(`HKEY_CURRENT_USER`)에만 쓰므로 관리자 권한이 필요 없음. Windows 10/11은 프로그램이 스스로 기본 앱이 되는 것을 막으므로, 기본 뷰어로 쓰려면 **기본 앱 설정…** 버튼으로 연 화면에서 image-viewer를 고름. **등록 해제**(`--unregister`)는 등록이 쓴 값만 지우고(다른 프로그램의 항목과 사용자가 고른 기본 앱 설정은 그대로) 원래대로 돌림. 버튼 아래 줄은 등록이 지금 어디를 가리키는지 보여 줌: "등록됨: 이 실행 파일" / "다른 사본에 등록됨: <경로>" / "없는 파일에 등록됨: <경로>" / "등록되지 않음". 실행 파일을 옮긴 경우는 [업그레이드](#업그레이드) 참고 (예전 exe가 없어졌으면 시작할 때 저절로 고쳐짐).
+
+### 탐색기 썸네일
+
+Windows 탐색기는 JPEG·PNG처럼 Windows가 아는 형식(과 Store 코덱 확장을 설치한 HEIC·RAW 등)만 썸네일을 그리고, 나머지는 아이콘으로 보여 줌. 설정(F2) > 일반의 "탐색기 썸네일"에서 **등록**을 누르면(또는 `image-viewer --register-thumbnails`) 뷰어 옆의 `image_viewer_thumbs.dll`이 그 나머지 형식의 썸네일을 그림: 예를 들어 TGA·PNM·EXR·HDR, 만화 압축파일(CBZ·CB7, 자연 순서로 첫 이미지가 표지), 그리고 이 PC에서 썸네일을 그리는 것이 없는 AVIF·JPEG XL·QOI·SVG 등.
+
+- 이미 썸네일을 그리는 것이 있는 확장자는 건드리지 않음: Windows 자신(확장자, `SystemFileAssociations`, 인식 형식 `image`)과 다른 프로그램(PowerToys 등), 사용자가 고른 기본 프로그램의 것까지 확인함. 그래서 Windows가 그리는 JPEG·PNG는 그대로 Windows가 그림. 등록할 때마다 다시 고르므로, 나중에 코덱 확장을 설치한 형식은 다시 **등록**하면 Windows에 돌려줌
+- 일반 `.zip`·`.7z`는 무엇이든 담는 파일이라 표지를 그리지 않음. HEIC·RAW는 뷰어도 Windows 코덱으로 읽으므로 대상이 아님 (코덱 확장을 설치하면 Windows가 썸네일을 그림)
+- 현재 사용자(`HKEY_CURRENT_USER`)에만 쓰고 관리자 권한이 필요 없음. **등록 해제**(`--unregister-thumbnails`)는 뷰어가 쓴 값만 지움 (그 사이 다른 프로그램이 같은 확장자에 쓴 썸네일 처리기는 그대로)
+- DLL은 탐색기 안이 아니라 Windows가 띄우는 별도 프로세스(`dllhost.exe`, COM Surrogate)에서 돌아감: 손상된 파일로 디코더가 실패해도 탐색기는 영향을 받지 않고 그 파일만 아이콘으로 남음
+- EXIF 방향을 따르고, 투명한 부분은 투명하게 그림. 내장 미리보기가 썸네일 크기보다 크면(카메라 JPEG의 EXIF 썸네일·RAW 내장 JPEG 등) 그것을 써서 빠름
+- 등록하기 전부터 아이콘으로 보이던 파일은 탐색기를 새로 고쳐야(F5) 바뀔 수 있음. 반대로 해제한 뒤에도 이미 그려진 썸네일은 Windows 썸네일 캐시에 남음: 지우려면 디스크 정리에서 "미리 보기 사진(Thumbnails)"을 정리
+- 버튼 아래 줄은 등록이 가리키는 DLL을 보여 줌 ("연결 프로그램"과 같은 문구)
 
 화면 언어는 한국어가 기본이고 설정(F2)의 "언어"에서 English로 바꿀 수 있음 (바로 적용, `settings.toml`의 `language = "ko"` / `"en"`).
 

@@ -55,25 +55,35 @@ const ID_STARTUP: i32 = 118;
 const ID_TABS: i32 = 119;
 const ID_CHECK_UPDATE: i32 = 120;
 const ID_OPEN_RELEASE: i32 = 121;
+const ID_THUMBNAILS_ON: i32 = 122;
+const ID_THUMBNAILS_OFF: i32 = 123;
 const ID_CANCEL: i32 = 2;
 
 /// Client size in 96-DPI units.
 const WIDTH: i32 = 440;
-const HEIGHT: i32 = 384;
+const HEIGHT: i32 = 460;
 /// Where the pages start, below the strip of tab titles.
 const TOP: i32 = 50;
 /// On the General page, under the "Open with" buttons: where the registration points.
 const REGISTRATION_Y: i32 = TOP + 182;
+/// The Explorer thumbnail row: its note, buttons (26 high) and the line saying where it points.
+const THUMBNAILS_TOP: i32 = TOP + 210;
+const THUMBNAILS_Y: i32 = THUMBNAILS_TOP + 54;
 /// The version, then the band for checking for updates: a row of buttons (26) and a status
 /// line (18) with the usual gaps.
-const VERSION_Y: i32 = TOP + 208;
-const UPDATE_Y: i32 = TOP + 234;
+const VERSION_Y: i32 = TOP + 290;
+const UPDATE_Y: i32 = TOP + 316;
 const UPDATE_H: i32 = 52;
 /// The Save and Defaults buttons at the bottom of every page.
 const BUTTONS_Y: i32 = HEIGHT - 38;
 // each line (18 high) clears the next, and the update band ends above the buttons
-const _: () =
-    assert!(REGISTRATION_Y + 18 + 8 <= VERSION_Y && VERSION_Y + 18 + 8 <= UPDATE_Y && UPDATE_Y + UPDATE_H <= BUTTONS_Y);
+const _: () = assert!(
+    REGISTRATION_Y + 18 + 8 <= THUMBNAILS_TOP
+        && THUMBNAILS_TOP + 22 + 26 + 6 <= THUMBNAILS_Y
+        && THUMBNAILS_Y + 18 + 8 <= VERSION_Y
+        && VERSION_Y + 18 + 8 <= UPDATE_Y
+        && UPDATE_Y + UPDATE_H <= BUTTONS_Y
+);
 /// Where the label and value columns start, and how wide they are.
 const LABEL_X: i32 = 16;
 const LABEL_W: i32 = 200;
@@ -173,6 +183,7 @@ struct Window {
     wheel: HWND,
     confirm_delete: HWND,
     registration: HWND,
+    thumbnails: HWND,
     version: HWND,
     check_update: HWND,
     open_release: HWND,
@@ -207,7 +218,8 @@ thread_local! {
     /// The last check for updates, and where the registration points (`None`: not known yet),
     /// kept for relabelling in another language.
     static UPDATE: RefCell<State> = const { RefCell::new(State::Idle) };
-    static REGISTRATION: RefCell<Option<Check>> = const { RefCell::new(None) };
+    /// The "Open with" registration, then the thumbnail one.
+    static REGISTRATION: RefCell<Option<(Check, Check)>> = const { RefCell::new(None) };
 }
 
 pub fn hwnd() -> Option<HWND> {
@@ -369,6 +381,11 @@ fn create(owner: HWND, dpi: u32, s: &Strings) -> windows::core::Result<Window> {
         // a long path keeps its start and its file name
         let path_style = SS_NOPREFIX.0 | SS_PATHELLIPSIS.0;
         let registration = on_page(b.add(w!("STATIC"), "", path_style, LABEL_X, REGISTRATION_Y, ROW_W, 18, 0)?);
+        // Explorer thumbnails, registered at once like "Open with"
+        note(|s| s.thumbnails, THUMBNAILS_TOP)?;
+        on_page(button(|s| s.register, LABEL_X, THUMBNAILS_TOP + 22, 110, ID_THUMBNAILS_ON)?);
+        on_page(button(|s| s.unregister, LABEL_X + 116, THUMBNAILS_TOP + 22, 110, ID_THUMBNAILS_OFF)?);
+        let thumbnails = on_page(b.add(w!("STATIC"), "", path_style, LABEL_X, THUMBNAILS_Y, ROW_W, 18, 0)?);
         let version = on_page(b.add(w!("STATIC"), &version_text(s), 0, LABEL_X, VERSION_Y, LABEL_W, 18, 0)?);
         // checking for updates happens only when this button is pressed
         let check_update = on_page(button(|s| s.check_updates, LABEL_X, UPDATE_Y, 150, ID_CHECK_UPDATE)?);
@@ -417,6 +434,7 @@ fn create(owner: HWND, dpi: u32, s: &Strings) -> windows::core::Result<Window> {
             wheel,
             confirm_delete,
             registration,
+            thumbnails,
             version,
             check_update,
             open_release,
@@ -538,8 +556,11 @@ fn show_status(s: &Strings) {
     WINDOW.with(|w| {
         let w = w.borrow();
         let Some(w) = w.as_ref() else { return };
-        let registration = REGISTRATION.with(|r| r.borrow().as_ref().map(|c| registration_text(c, s)));
-        controls::set_text(w.registration, &registration.unwrap_or_default());
+        let texts =
+            REGISTRATION.with(|r| r.borrow().as_ref().map(|(c, t)| (registration_text(c, s), registration_text(t, s))));
+        let (registration, thumbnails) = texts.unwrap_or_default();
+        controls::set_text(w.registration, &registration);
+        controls::set_text(w.thumbnails, &thumbnails);
         let state = UPDATE.with(|u| u.borrow().clone());
         controls::set_text(w.update_status, &update::status_text(&state, s));
         let checking = state == State::Checking;
@@ -563,9 +584,9 @@ pub fn set_update(state: &State, s: &Strings) {
     show_status(s);
 }
 
-/// Where the "Open with" registration points now.
-pub fn set_registration(check: Check, s: &Strings) {
-    REGISTRATION.with(|r| *r.borrow_mut() = Some(check));
+/// Where the "Open with" and thumbnail registrations point now.
+pub fn set_registration(check: Check, thumbnails: Check, s: &Strings) {
+    REGISTRATION.with(|r| *r.borrow_mut() = Some((check, thumbnails)));
     show_status(s);
 }
 
@@ -745,6 +766,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 }
                 (ID_REGISTER, BN_CLICKED) => post_ui(UiEvent::Register(true)),
                 (ID_UNREGISTER, BN_CLICKED) => post_ui(UiEvent::Register(false)),
+                (ID_THUMBNAILS_ON, BN_CLICKED) => post_ui(UiEvent::Thumbnails(true)),
+                (ID_THUMBNAILS_OFF, BN_CLICKED) => post_ui(UiEvent::Thumbnails(false)),
                 (ID_DEFAULT_APPS, BN_CLICKED) => post_ui(UiEvent::OpenDefaultApps),
                 (ID_CHECK_UPDATE, BN_CLICKED) => post_ui(UiEvent::CheckUpdate),
                 (ID_OPEN_RELEASE, BN_CLICKED) => post_ui(UiEvent::OpenReleasePage),
@@ -931,9 +954,11 @@ mod tests {
         // relabelled with the language
         set_language(&crate::i18n::KO);
         assert_eq!(controls::text(status), "확인하지 못함: 응답 시간 초과");
-        set_registration(Check::OtherCopy(r"D:\old\image-viewer.exe".into()), &crate::i18n::KO);
-        let reg = WINDOW.with(|c| c.borrow().as_ref().unwrap().registration);
+        let old_dll = Check::Repair { old: r"D:\old\image_viewer_thumbs.dll".into() };
+        set_registration(Check::OtherCopy(r"D:\old\image-viewer.exe".into()), old_dll, &crate::i18n::KO);
+        let (reg, thumbs) = WINDOW.with(|c| c.borrow().as_ref().map(|w| (w.registration, w.thumbnails)).unwrap());
         assert_eq!(controls::text(reg), r"다른 사본에 등록됨: D:\old\image-viewer.exe");
+        assert_eq!(controls::text(thumbs), r"없는 파일에 등록됨: D:\old\image_viewer_thumbs.dll");
         let hwnd = WINDOW.with(|c| c.borrow_mut().take().unwrap().hwnd);
         unsafe { DestroyWindow(hwnd).unwrap() };
     }
@@ -1040,6 +1065,11 @@ mod tests {
                     [Check::NotRegistered, Check::Here, Check::OtherCopy(short.clone()), Check::Repair { old: short }]
                 {
                     fits(w.registration, &registration_text(&c, s));
+                }
+                let dll = std::path::PathBuf::from(r"D:\iv\image_viewer_thumbs.dll");
+                for c in [Check::NotRegistered, Check::Here, Check::OtherCopy(dll.clone()), Check::Repair { old: dll }]
+                {
+                    fits(w.thumbnails, &registration_text(&c, s));
                 }
                 unsafe { DestroyWindow(w.hwnd).unwrap() };
             }

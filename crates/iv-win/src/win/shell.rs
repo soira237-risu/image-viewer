@@ -1,6 +1,7 @@
 //! The Windows shell around the current file: the clipboard, the Recycle Bin, Explorer, Settings
-//! and the per-user "Open with" registration. The data each needs is built (and tested) in
-//! [`crate::clipboard`] and [`crate::assoc`]; this module only hands it to Windows.
+//! and the per-user "Open with" and Explorer thumbnail registrations. The data each needs is
+//! built (and tested) in [`crate::clipboard`], [`crate::assoc`] and [`crate::thumbs`]; this
+//! module only hands it to Windows.
 
 use std::path::{Path, PathBuf};
 
@@ -12,8 +13,8 @@ use windows::Win32::System::DataExchange::{
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_READ, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegDeleteKeyValueW, RegDeleteKeyW,
-    RegDeleteTreeW, RegGetValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegSetKeyValueW,
+    HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, KEY_READ, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegDeleteKeyValueW,
+    RegDeleteKeyW, RegDeleteTreeW, RegGetValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegSetKeyValueW,
 };
 use windows::Win32::UI::Shell::{
     FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FOF_WANTNUKEWARNING, ILCreateFromPathW, ILFree,
@@ -27,6 +28,7 @@ use super::wide;
 use crate::assoc::{self, Check, Removal, Value};
 use crate::clipboard;
 use crate::i18n::Strings;
+use crate::thumbs;
 
 /// One clipboard format and its bytes.
 pub enum Clip {
@@ -258,7 +260,11 @@ pub fn register(t: &Strings) -> Result<(), String> {
 
 /// The string value `name` of `HKEY_CURRENT_USER\<root>\<key>`, if there is one.
 pub fn read_value(root: &str, key: &str, name: &str) -> Option<String> {
-    let key = under(root, key);
+    read_from(HKEY_CURRENT_USER, &under(root, key), name)
+}
+
+/// The string value `name` of `<hive>\<key>` (`key` NUL-terminated), if there is one.
+fn read_from(hive: HKEY, key: &[u16], name: &str) -> Option<String> {
     let name = wide(name);
     let mut buf = vec![0u16; 512];
     // the value may grow between asking its size and reading it: try again a few times
@@ -266,7 +272,7 @@ pub fn read_value(root: &str, key: &str, name: &str) -> Option<String> {
         let mut bytes = (buf.len() * 2) as u32;
         let e = unsafe {
             RegGetValueW(
-                HKEY_CURRENT_USER,
+                hive,
                 PCWSTR(key.as_ptr()),
                 PCWSTR(name.as_ptr()),
                 RRF_RT_REG_SZ,
@@ -351,6 +357,139 @@ pub fn unregister() -> Result<(), String> {
     };
     notify_associations_changed();
     result
+}
+
+/// Whether a thumbnail handler other than the viewer's claims `ext`, where Explorer looks for
+/// one: the user's chosen program and the extension's own file type, the extension, Windows'
+/// entries for it, and those for its perceived type (`image`: every format a WIC codec draws).
+/// Read from the merged classes view, so machine-wide entries count too.
+fn thumbnail_handler_taken(ext: &str) -> bool {
+    let classes = |key: &str| read_from(HKEY_CLASSES_ROOT, &wide(key), "");
+    let handler = |prefix: &str| classes(&format!(r"{prefix}\ShellEx\{}", thumbs::THUMBNAIL_HANDLER));
+    let user_choice = read_value(
+        "",
+        &format!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.{ext}\UserChoice"),
+        "ProgId",
+    );
+    let prog_id = classes(&format!(".{ext}"));
+    let perceived = read_from(HKEY_CLASSES_ROOT, &wide(&format!(".{ext}")), "PerceivedType");
+    let mut places = vec![format!(".{ext}"), format!(r"SystemFileAssociations\.{ext}")];
+    places.extend([user_choice, prog_id].into_iter().flatten().filter(|p| !p.trim().is_empty()));
+    places.extend(perceived.filter(|p| !p.trim().is_empty()).map(|p| format!(r"SystemFileAssociations\{p}")));
+    places.iter().filter_map(|p| handler(p)).any(|h| !h.trim().is_empty() && !thumbs::is_ours(&h))
+}
+
+/// The extensions whose thumbnail entry under `HKEY_CURRENT_USER\<root>` names the provider, among
+/// every extension the viewer opens (see [`thumbs::cleanup_scope`]).
+fn our_thumbnail_exts(root: &str) -> Vec<String> {
+    thumbs::cleanup_scope()
+        .into_iter()
+        .filter(|e| {
+            let key = format!(r"Software\Classes\{}", thumbs::handler_key(e));
+            read_value(root, &key, "").is_some_and(|v| thumbs::is_ours(&v))
+        })
+        .collect()
+}
+
+/// Registers the provider at `dll` under `HKEY_CURRENT_USER\<root>` for every candidate that
+/// `taken` says no other handler claims, after removing its old entries (so a format that has
+/// gained a handler of its own since is given back). Returns how many extensions it took.
+fn register_thumbnails_at(root: &str, dll: &Path, taken: impl Fn(&str) -> bool) -> Result<usize, String> {
+    let _writing = writing();
+    remove(root, &thumbs::removal(&our_thumbnail_exts(root)))?;
+    let exts = thumbs::chosen(taken);
+    if exts.is_empty() {
+        return Ok(0);
+    }
+    write_values(root, &thumbs::registration(dll, &exts))?;
+    Ok(exts.len())
+}
+
+fn unregister_thumbnails_at(root: &str) -> Result<(), String> {
+    let _writing = writing();
+    remove(root, &thumbs::removal(&our_thumbnail_exts(root)))
+}
+
+/// Draws Explorer thumbnails of the formats that have none with the DLL next to the running
+/// program, for the current user. Returns how many extensions that covers (none: nothing was
+/// written). A missing DLL is reported with its path.
+pub fn register_thumbnails() -> Result<usize, ThumbnailError> {
+    let exe = std::env::current_exe().map_err(|e| ThumbnailError::Failed(e.to_string()))?;
+    let dll = thumbs::dll_for(&exe);
+    if !dll.is_file() {
+        return Err(ThumbnailError::DllMissing(dll));
+    }
+    let result = register_thumbnails_at("", &dll, thumbnail_handler_taken).map_err(ThumbnailError::Failed);
+    notify_associations_changed();
+    result
+}
+
+/// Removes what [`register_thumbnails`] wrote.
+pub fn unregister_thumbnails() -> Result<(), String> {
+    let result = unregister_thumbnails_at("");
+    notify_associations_changed();
+    result
+}
+
+/// Why registering the thumbnail provider failed.
+#[derive(Debug)]
+pub enum ThumbnailError {
+    DllMissing(PathBuf),
+    Failed(String),
+}
+
+/// Registers (`on`) or unregisters the thumbnail provider, for the settings window's buttons and
+/// the command line: what happened, in the language of `t`, or why it failed.
+pub fn change_thumbnails(on: bool, t: &Strings) -> Result<String, String> {
+    use crate::i18n::fill;
+    let result = if on {
+        register_thumbnails().map(|n| match n {
+            0 => t.thumbnails_none_needed.to_string(),
+            n => fill(t.thumbnails_registered, &[("count", &n.to_string())]),
+        })
+    } else {
+        unregister_thumbnails().map(|()| t.thumbnails_unregistered.to_string()).map_err(ThumbnailError::Failed)
+    };
+    result.map_err(|e| match e {
+        ThumbnailError::DllMissing(dll) => fill(t.thumbnails_dll_missing, &[("path", &dll.display().to_string())]),
+        ThumbnailError::Failed(e) => fill(t.thumbnails_failed, &[("error", &e)]),
+    })
+}
+
+/// The provider's DLL that the registration under `HKEY_CURRENT_USER\<root>` names.
+pub fn registered_thumbnail_dll(root: &str) -> Option<PathBuf> {
+    read_value(root, &thumbs::server_key(), "").filter(|p| !p.trim().is_empty()).map(PathBuf::from)
+}
+
+/// Where the thumbnail registration under `root` points, for the DLL `current` of the running
+/// program. Looks at the file system, like [`registration_check`].
+pub fn thumbnails_check(root: &str, current: &Path) -> Check {
+    let registered = registered_thumbnail_dll(root);
+    let found = registered.as_deref().map_or(assoc::Found::Unknown, |r| assoc::look_up(r, current));
+    assoc::check(registered.as_deref(), current, found)
+}
+
+/// At startup: when the thumbnail registration names a DLL that is gone and the running
+/// program has its own, points it there (the extensions stay as they are). Anything else is
+/// left alone, like [`repair_registration`].
+pub fn repair_thumbnails(root: &str, current: &Path) -> (Check, Option<Result<(), String>>) {
+    let found = thumbnails_check(root, current);
+    let Check::Repair { old } = &found else { return (found, None) };
+    if !current.is_file() {
+        return (found, None);
+    }
+    let writing = writing();
+    if !registered_thumbnail_dll(root).is_some_and(|r| assoc::same_path(&r, old)) {
+        drop(writing);
+        return (thumbnails_check(root, current), None);
+    }
+    let server = Value { key: thumbs::server_key(), name: String::new(), data: current.display().to_string() };
+    let result = write_values(root, &[server]);
+    drop(writing);
+    if root.is_empty() {
+        notify_associations_changed();
+    }
+    (found, Some(result))
 }
 
 /// Tells Explorer to read file associations again.
@@ -574,5 +713,119 @@ mod tests {
         write_values(&scratch.0, &[v]).unwrap();
         assert_eq!(read_value(&scratch.0, assoc::IMAGE_COMMAND_KEY, "").as_deref(), Some(long.as_str()));
         assert_eq!(read_value(&scratch.0, assoc::IMAGE_COMMAND_KEY, "missing"), None);
+    }
+
+    fn handler(root: &str, ext: &str) -> Option<String> {
+        read(root, &format!(r"Software\Classes\{}", thumbs::handler_key(ext)), "")
+    }
+
+    /// Thumbnails in a scratch key: only the formats no other handler claims are taken, another
+    /// program's handler is never overwritten or removed, and unregistering leaves nothing of
+    /// the viewer's behind.
+    #[test]
+    fn thumbnails_take_only_free_formats_and_leave_others_alone() {
+        let scratch = Scratch::new("thumbs");
+        let root = scratch.0.as_str();
+        let other = "{11111111-2222-3333-4444-555555555555}";
+        let foreign = Value {
+            key: format!(r"Software\Classes\{}", thumbs::handler_key("exr")),
+            name: String::new(),
+            data: other.into(),
+        };
+        write_values(root, std::slice::from_ref(&foreign)).unwrap();
+        let dll = Path::new(r"C:\Tools\iv\image_viewer_thumbs.dll");
+        let taken = |e: &str| ["jpg", "jpeg", "png", "exr"].contains(&e);
+        let n = register_thumbnails_at(root, dll, taken).unwrap();
+        assert_eq!(n, thumbs::chosen(taken).len());
+        assert_eq!(registered_thumbnail_dll(root).as_deref(), Some(dll));
+        assert_eq!(read(root, &thumbs::server_key(), "ThreadingModel").as_deref(), Some("Apartment"));
+        assert_eq!(handler(root, "tga").as_deref(), Some(thumbs::clsid().as_str()));
+        assert_eq!(handler(root, "cbz").as_deref(), Some(thumbs::clsid().as_str()));
+        assert_eq!(handler(root, "jpg"), None, "Windows draws it");
+        assert_eq!(handler(root, "exr").as_deref(), Some(other), "another program's handler kept");
+
+        // registering again after TGA gained a handler of its own gives it back
+        let taken_now = |e: &str| taken(e) || e == "tga";
+        assert_eq!(register_thumbnails_at(root, dll, taken_now).unwrap(), n - 1);
+        assert_eq!(handler(root, "tga"), None);
+        assert!(!exists(root, r"Software\Classes\.tga"), "its emptied keys are pruned");
+
+        unregister_thumbnails_at(root).unwrap();
+        assert_eq!(registered_thumbnail_dll(root), None);
+        assert!(!exists(root, &thumbs::class_key()));
+        for e in thumbs::candidates().iter().filter(|e| *e != "exr") {
+            assert!(!exists(root, &format!(r"Software\Classes\.{e}")), ".{e} left behind");
+        }
+        assert_eq!(handler(root, "exr").as_deref(), Some(other), "another program's handler kept");
+        unregister_thumbnails_at(root).unwrap();
+
+        // nothing free: nothing written, not even the class
+        assert_eq!(register_thumbnails_at(root, dll, |_| true).unwrap(), 0);
+        assert!(!exists(root, &thumbs::class_key()));
+    }
+
+    /// Entries a build that drew more formats wrote (RAW and HEIF were candidates at first) are
+    /// still the viewer's to remove, by registering again or unregistering.
+    #[test]
+    fn entries_outside_todays_candidates_are_removed_too() {
+        let scratch = Scratch::new("thumbs-older");
+        let root = scratch.0.as_str();
+        let dll = Path::new(r"C:\Tools\iv\image_viewer_thumbs.dll");
+        let older = ["dng", "r3d", "heic"].map(String::from);
+        assert!(older.iter().all(|e| !thumbs::candidates().contains(e)));
+        write_values(root, &thumbs::registration(dll, &older)).unwrap();
+        register_thumbnails_at(root, dll, |_| false).unwrap();
+        for e in &older {
+            assert_eq!(handler(root, e), None, ".{e} left by registering again");
+        }
+        write_values(root, &thumbs::registration(dll, &older)).unwrap();
+        unregister_thumbnails_at(root).unwrap();
+        for e in &older {
+            assert!(!exists(root, &format!(r"Software\Classes\.{e}")), ".{e} left by unregistering");
+        }
+    }
+
+    #[test]
+    fn a_thumbnail_dll_that_is_gone_moves_to_the_running_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("new").join(thumbs::DLL_NAME);
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&current, b"MZ").unwrap();
+        let old = dir.path().join("old").join(thumbs::DLL_NAME);
+        let scratch = Scratch::new("thumbs-repair");
+        let root = scratch.0.as_str();
+        assert_eq!(thumbnails_check(root, &current), Check::NotRegistered);
+        assert_eq!(repair_thumbnails(root, &current), (Check::NotRegistered, None));
+        write_values(root, &thumbs::registration(&old, &["tga".to_string()])).unwrap();
+
+        // the running copy has no DLL of its own: nothing to point at
+        let missing = dir.path().join("bare").join(thumbs::DLL_NAME);
+        assert_eq!(repair_thumbnails(root, &missing), (Check::Repair { old: old.clone() }, None));
+        assert_eq!(registered_thumbnail_dll(root).as_deref(), Some(old.as_path()));
+
+        assert_eq!(repair_thumbnails(root, &current), (Check::Repair { old: old.clone() }, Some(Ok(()))));
+        assert_eq!(registered_thumbnail_dll(root).as_deref(), Some(current.as_path()));
+        assert_eq!(handler(root, "tga").as_deref(), Some(thumbs::clsid().as_str()), "extensions kept");
+        assert_eq!(repair_thumbnails(root, &current), (Check::Here, None));
+
+        // another copy's DLL that still exists is left alone
+        let other = dir.path().join("other").join(thumbs::DLL_NAME);
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, b"MZ").unwrap();
+        write_values(root, &thumbs::registration(&other, &[])).unwrap();
+        assert_eq!(repair_thumbnails(root, &current), (Check::OtherCopy(other.clone()), None));
+    }
+
+    /// Windows draws JPEG and PNG thumbnails itself (through the `image` perceived type) on
+    /// every install; an extension nobody registered has no handler.
+    #[test]
+    fn windows_own_thumbnail_handlers_are_found() {
+        assert!(thumbnail_handler_taken("jpg"));
+        assert!(thumbnail_handler_taken("png"));
+        assert!(!thumbnail_handler_taken("iv-no-such-extension"));
+        // what registering would take on this machine (read only)
+        let chosen = thumbs::chosen(thumbnail_handler_taken);
+        println!("would draw thumbnails of: {chosen:?}");
+        assert!(!chosen.iter().any(|e| e == "jpg" || e == "png"));
     }
 }

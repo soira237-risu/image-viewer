@@ -4,10 +4,10 @@ Writes THIRD-PARTY-NOTICES.txt: the license of every package built into the rele
 with the license texts, read from Cargo.lock and the local Cargo registry. No extra tools.
 
 .DESCRIPTION
-The packages are those `cargo metadata` resolves for x86_64-pc-windows-msvc, reached from the two
-executables' crates (iv-win, iv-cli) through normal dependencies only: build scripts, proc macros
-and dev-dependencies run on the build machine and are not part of the executables. Our own
-workspace crates are left out.
+The packages are those `cargo metadata` resolves for x86_64-pc-windows-msvc, reached from the
+crates of the two executables and the thumbnail DLL (iv-win, iv-cli, iv-thumb) through normal
+dependencies only: build scripts, proc macros and dev-dependencies run on the build machine and are
+not part of the binaries. Our own workspace crates are left out.
 
 For each package the texts are the license files in its registry folder (LICENSE*, COPYING*,
 NOTICE*, PATENTS*, COPYRIGHT*, UNLICENSE*), also in a `vendor` or `third_party` subfolder for
@@ -39,7 +39,7 @@ $allowed = @(
     'MIT', 'MIT-0', 'Apache-2.0', 'BSD-2-Clause', 'BSD-3-Clause', '0BSD', 'Zlib', 'ISC',
     'Unicode-3.0', 'Unicode-DFS-2016', 'Unlicense', 'CC0-1.0', 'BSL-1.0', 'MPL-2.0', 'LLVM-exception'
 )
-$executableCrates = @('iv-win', 'iv-cli')
+$executableCrates = @('iv-win', 'iv-cli', 'iv-thumb')
 $licenseFile = '^(LICEN[CS]E|COPYING|NOTICE|PATENTS|COPYRIGHT|UNLICENSE)([-._].*)?$'
 
 $cargo = (Get-Command cargo -ErrorAction SilentlyContinue).Source
@@ -219,15 +219,15 @@ $nl = "`n"
 $sb = [System.Text.StringBuilder]::new()
 $rule = '=' * 78
 [void]$sb.Append("image-viewer $version - third-party notices$nl$nl")
-[void]$sb.Append("image-viewer.exe and iv.exe contain the open-source packages listed below (Rust crates from$nl")
-[void]$sb.Append("crates.io, built from the versions in Cargo.lock, and the C/C++ libraries libjxl, highway,$nl")
-[void]$sb.Append("brotli and skcms, built from the libjxl source in the jpegxl-src crate), and the Rust standard$nl")
-[void]$sb.Append("library, whose notices are in RUST-STD-COPYRIGHT.html. Each package keeps its own license; the$nl")
-[void]$sb.Append("license texts follow the list. Source code of every package is available at the address given$nl")
-[void]$sb.Append("for it, and of every crate at https://crates.io/crates/<name>/<version>.$nl$nl")
+[void]$sb.Append("image-viewer.exe, iv.exe and image_viewer_thumbs.dll contain the open-source packages listed$nl")
+[void]$sb.Append("below (Rust crates from crates.io, built from the versions in Cargo.lock, and the C/C++ libraries$nl")
+[void]$sb.Append("libjxl, highway, brotli and skcms, built from the libjxl source in the jpegxl-src crate), and the$nl")
+[void]$sb.Append("Rust standard library, whose notices are in RUST-STD-COPYRIGHT.html. Each package keeps its own$nl")
+[void]$sb.Append("license; the license texts follow the list. Source code of every package is available at the$nl")
+[void]$sb.Append("address given for it, and of every crate at https://crates.io/crates/<name>/<version>.$nl$nl")
 [void]$sb.Append("Compiler: $rustVersion$nl$nl")
-[void]$sb.Append("이 프로그램(image-viewer.exe, iv.exe)에는 아래의 오픈 소스 패키지와 Rust 표준 라이브러리가$nl")
-[void]$sb.Append("들어 있습니다. 각 패키지의 라이선스 전문은 목록 뒤에 있습니다.$nl$nl")
+[void]$sb.Append("이 프로그램(image-viewer.exe, iv.exe, image_viewer_thumbs.dll)에는 아래의 오픈 소스 패키지와$nl")
+[void]$sb.Append("Rust 표준 라이브러리가 들어 있습니다. 각 패키지의 라이선스 전문은 목록 뒤에 있습니다.$nl$nl")
 [void]$sb.Append("$rule$nl" + "Packages ($($rows.Count))$nl$rule$nl$nl")
 $w = ($rows | ForEach-Object { "$($_.Name) $($_.Version)".Length } | Measure-Object -Maximum).Maximum
 foreach ($r in $rows) {

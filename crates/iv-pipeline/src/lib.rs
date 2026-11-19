@@ -9,6 +9,7 @@ pub mod natord;
 mod order;
 mod pipeline;
 pub mod siblings;
+pub mod thumbnail;
 
 pub use folder::{AtEnd, FolderList, Move, SortBy, SortKey, SortOrder, entry_index, step, step_or_cross};
 pub use order::prefetch_order;

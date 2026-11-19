@@ -3,8 +3,10 @@
 //! Also `image-viewer --version` (prints the version), `image-viewer --check-update` (asks
 //! GitHub for the latest release and prints whether it is newer; exit code 1 when the check
 //! failed) and `image-viewer --register` / `--unregister` (lists the viewer in Windows' "Open
-//! with" and Default apps for the current user, or removes it; the settings window has the same
-//! buttons). None of these opens a window.
+//! with" and Default apps for the current user, or removes it), `--register-thumbnails` /
+//! `--unregister-thumbnails` (Explorer thumbnails of the formats Windows does not draw, from the
+//! DLL next to the program); the settings window has the same buttons. None of these opens a
+//! window.
 
 // no console window for release builds launched from Explorer
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -27,6 +29,8 @@ enum Action {
     CheckUpdate,
     /// `true`: register for "Open with"; `false`: remove that registration.
     Register(bool),
+    /// `true`: draw Explorer thumbnails with the DLL next to the program; `false`: stop.
+    Thumbnails(bool),
 }
 
 /// `--check-update`: what the check found, in `t`'s language, and whether it worked.
@@ -90,6 +94,10 @@ fn main() {
             action = Some(Action::Register(true));
         } else if arg == "--unregister" {
             action = Some(Action::Register(false));
+        } else if arg == "--register-thumbnails" {
+            action = Some(Action::Thumbnails(true));
+        } else if arg == "--unregister-thumbnails" {
+            action = Some(Action::Thumbnails(false));
         } else {
             file = Some(PathBuf::from(arg));
         }
@@ -126,6 +134,12 @@ fn main() {
         if let Err(e) = &result {
             console_line(&format!("image-viewer: {e}"));
         }
+        std::process::exit(i32::from(result.is_err()));
+    }
+    if let Some(Action::Thumbnails(on)) = action {
+        let result = shell::change_thumbnails(on, settings.language.strings());
+        let (Ok(text) | Err(text)) = &result;
+        console_line(&format!("image-viewer: {text}"));
         std::process::exit(i32::from(result.is_err()));
     }
     if let Some(w) = &warning {

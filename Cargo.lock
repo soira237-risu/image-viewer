@@ -841,6 +841,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "iv-thumb"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "iv-codec",
+ "iv-core",
+ "iv-pipeline",
+ "tempfile",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "iv-win"
 version = "0.1.0"
 dependencies = [

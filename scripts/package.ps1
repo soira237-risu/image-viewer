@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
 Builds the release package: image-viewer-<version>-x86_64-windows.zip with both executables, the
-README, CHANGELOG, LICENSE and third-party notices, its SHA-256, and a separate symbols zip.
+Explorer thumbnail DLL, the README, CHANGELOG, LICENSE and third-party notices, its SHA-256, and a
+separate symbols zip.
 
 .DESCRIPTION
 The release workflow (.github/workflows/release.yml) runs this on a tag; it also runs locally.
@@ -11,22 +12,22 @@ In order, and it stops at the first failure:
 2. The version (Cargo.toml) must match -Tag when given, and CHANGELOG.md must have a section
    for it (it becomes the release notes).
 3. The workspace rust-version must be at least every locked dependency's rust-version.
-4. A clean release build of both executables in target/package-build, with build paths removed
-   from the binaries (--remap-path-prefix for this checkout, the Cargo home and the user
-   profile; rustc already embeds only the .pdb's file name). The flags are added with
+4. A clean release build of both executables and the DLL in target/package-build, with build
+   paths removed from the binaries (--remap-path-prefix for this checkout, the Cargo home and
+   the user profile; rustc already embeds only the .pdb's file name). The flags are added with
    --config, so .cargo/config.toml (static C runtime) still applies. The separate target dir
    keeps these differently-flagged units away from target/release. It is deleted when the run
    ends, whether it succeeds, fails at any later step or is interrupted with Ctrl+C, so nothing
    is left to pile up; with -KeepBuild it is kept and marked (.package-kept). While the run is
    going, .package-run in it holds the process id, and scripts/cache.ps1 leaves the folder
    alone; a folder left by a killed run (no live owner, no mark) is deleted by scripts/cache.ps1.
-5. Checks of each executable: it imports no C runtime DLL (VCRUNTIME140.dll and the like are not
+5. Checks of each binary: it imports no C runtime DLL (VCRUNTIME140.dll and the like are not
    part of Windows), contains none of the build machine's paths, and carries the version.
 6. scripts/notices.ps1 writes THIRD-PARTY-NOTICES.txt; then the zips and the .sha256.
 
 Output in -OutDir (default target/dist): the zip, <zip>.sha256, the symbols zip (image_viewer.pdb
-and iv.pdb, for reading crash backtraces with scripts/symbolize.ps1; not for users) and
-release-notes.md.
+iv.pdb and image_viewer_thumbs.pdb, for reading crash backtraces with scripts/symbolize.ps1; not
+for users) and release-notes.md.
 
 .EXAMPLE
 pwsh -File scripts/package.ps1 -Jobs 3
@@ -160,7 +161,7 @@ if (Test-Path -LiteralPath $keptFile) { Remove-Item -LiteralPath $keptFile -Forc
 $stage = $null
 $symStage = $null
 try {
-    $cargoArgs = @('build', '--release', '--locked', '--workspace', '--bins', '--target-dir', $buildDir,
+    $cargoArgs = @('build', '--release', '--locked', '--workspace', '--bins', '--lib', '--target-dir', $buildDir,
         '--config', "target.$triple.rustflags=[$($flags -join ', ')]")
     if ($Jobs -gt 0) { $cargoArgs += @('-j', "$Jobs") }
     Push-Location $root
@@ -169,7 +170,8 @@ try {
         if ($LASTEXITCODE -ne 0) { Fail "release build failed (exit $LASTEXITCODE)" }
     } finally { Pop-Location }
     $bin = Join-Path $buildDir 'release'
-    $exes = @('image-viewer.exe', 'iv.exe') | ForEach-Object { Join-Path $bin $_ }
+    # the viewer and the command-line tool, then the Explorer thumbnail provider (crates/iv-thumb)
+    $exes = @('image-viewer.exe', 'iv.exe', 'image_viewer_thumbs.dll') | ForEach-Object { Join-Path $bin $_ }
 
     # 5. checks
     $latin1 = [Text.Encoding]::GetEncoding(28591)
@@ -220,7 +222,7 @@ try {
     if (Test-Path $symbols) { Remove-Item -Force $symbols }
     if (Test-Path $symStage) { Remove-Item -Recurse -Force $symStage }
     New-Item -ItemType Directory -Force $symStage | Out-Null
-    foreach ($pdb in 'image_viewer.pdb', 'iv.pdb') {
+    foreach ($pdb in 'image_viewer.pdb', 'iv.pdb', 'image_viewer_thumbs.pdb') {
         $p = Join-Path $bin $pdb
         if (-not (Test-Path $p)) { Fail "$pdb was not produced" }
         Copy-Item $p $symStage

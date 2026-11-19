@@ -8,6 +8,7 @@ members = [
     "crates/iv-ops",
     "crates/iv-win",
     "crates/iv-libjxl",
+    "crates/iv-thumb",
 ]
 
 [workspace.package]
@@ -85,8 +86,11 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# the `#[implement]` macro of COM objects (crates/iv-thumb) names this crate; the same one `windows` uses
+windows-core = "0.62.2"
 tempfile = "3"
 
 [profile.release]

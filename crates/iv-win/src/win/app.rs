@@ -76,11 +76,13 @@ pub enum AppEvent {
     },
     /// The answer to the check for updates the user asked for.
     UpdateChecked(Result<Outcome, Failure>),
-    /// Where the "Open with" registration points, and how repairing it went when it pointed at
-    /// a program that is gone ([`App::check_registration`]).
+    /// Where the "Open with" and thumbnail registrations point, and how repairing each went
+    /// when it pointed at a file that is gone ([`App::check_registration`]).
     Registration {
         check: Check,
         repaired: Option<Result<(), String>>,
+        thumbnails: Check,
+        thumbnails_repaired: Option<Result<(), String>>,
         elapsed: Duration,
     },
 }
@@ -412,8 +414,8 @@ impl App {
                         self.handle_neighbour(seq, forward, result, elapsed)
                     }
                     AppEvent::UpdateChecked(result) => self.handle_update(result),
-                    AppEvent::Registration { check, repaired, elapsed } => {
-                        self.handle_registration(check, repaired, elapsed)
+                    AppEvent::Registration { check, repaired, thumbnails, thumbnails_repaired, elapsed } => {
+                        self.handle_registration(check, repaired, (thumbnails, thumbnails_repaired), elapsed)
                     }
                 }
             } else if let Some(e) = super::take_ui() {
@@ -1310,12 +1312,15 @@ impl App {
         let t = self.t();
         let spawned = std::thread::Builder::new().name("open-with-check".into()).spawn(move || {
             let start = Instant::now();
-            let (check, repaired) = if repair {
-                shell::repair_registration("", &exe, t)
+            // the thumbnail provider goes with this copy: the DLL next to it
+            let dll = crate::thumbs::dll_for(&exe);
+            let ((check, repaired), (thumbnails, thumbnails_repaired)) = if repair {
+                (shell::repair_registration("", &exe, t), shell::repair_thumbnails("", &dll))
             } else {
-                (shell::registration_check("", &exe), None)
+                ((shell::registration_check("", &exe), None), (shell::thumbnails_check("", &dll), None))
             };
-            send(&tx, AppEvent::Registration { check, repaired, elapsed: start.elapsed() });
+            let elapsed = start.elapsed();
+            send(&tx, AppEvent::Registration { check, repaired, thumbnails, thumbnails_repaired, elapsed });
         });
         match spawned {
             Ok(_) => self.registration_running = true,
@@ -1323,10 +1328,17 @@ impl App {
         }
     }
 
-    fn handle_registration(&mut self, check: Check, repaired: Option<Result<(), String>>, elapsed: Duration) {
+    fn handle_registration(
+        &mut self,
+        check: Check,
+        repaired: Option<Result<(), String>>,
+        (thumbnails, thumbnails_repaired): (Check, Option<Result<(), String>>),
+        elapsed: Duration,
+    ) {
         self.trace.mark(&format!(
-            "open-with registration: {check:?}{} ({:.1} ms)",
+            "open-with registration: {check:?}{}, thumbnails: {thumbnails:?}{} ({:.1} ms)",
             repaired.as_ref().map_or(String::new(), |r| format!(", repaired: {r:?}")),
+            thumbnails_repaired.as_ref().map_or(String::new(), |r| format!(", repaired: {r:?}")),
             elapsed.as_secs_f64() * 1000.0
         ));
         self.registration_running = false;
@@ -1348,9 +1360,22 @@ impl App {
             }
             (check, _) => check,
         };
-        // a newer look is on its way: it says where the registration points now
+        let thumbnails = match (thumbnails, thumbnails_repaired) {
+            (Check::Repair { old }, Some(Ok(()))) => {
+                diag::log(&format!("thumbnail registration moved from {} to this copy", old.display()));
+                self.set_notice(fill(t.thumbnails_repaired, &[("path", &old.display().to_string())]));
+                Check::Here
+            }
+            (check, Some(Err(e))) => {
+                diag::log(&format!("thumbnail registration repair: {e}"));
+                self.set_notice(fill(t.thumbnails_failed, &[("error", &e)]));
+                check
+            }
+            (check, _) => check,
+        };
+        // a newer look is on its way: it says where the registrations point now
         if !stale {
-            settings_window::set_registration(check, t);
+            settings_window::set_registration(check, thumbnails, t);
         }
     }
 
@@ -1464,6 +1489,20 @@ impl App {
                         self.set_notice(fill(t.register_failed, &[("error", &e)]));
                     }
                 }
+                self.check_registration(false);
+            }
+            UiEvent::Thumbnails(on) => {
+                let result = shell::change_thumbnails(on, self.t());
+                self.trace
+                    .mark(&format!("thumbnail registration {}: {result:?}", if on { "added" } else { "removed" }));
+                let notice = match result {
+                    Ok(notice) => notice,
+                    Err(e) => {
+                        diag::log(&format!("thumbnail registration: {e}"));
+                        e
+                    }
+                };
+                self.set_notice(notice);
                 self.check_registration(false);
             }
             UiEvent::CheckUpdate => self.check_update(),

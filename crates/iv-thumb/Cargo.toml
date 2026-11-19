@@ -1,0 +1,27 @@
+[package]
+name = "iv-thumb"
+description = "Explorer thumbnail provider (an in-process COM server) for the formats Windows cannot show."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# image_viewer_thumbs.dll, shipped next to image-viewer.exe; the settings window registers it
+name = "image_viewer_thumbs"
+crate-type = ["cdylib"]
+
+[dependencies]
+iv-core.workspace = true
+iv-codec.workspace = true
+iv-pipeline.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+windows-core.workspace = true
+
+[dev-dependencies]
+image.workspace = true
+tempfile.workspace = true

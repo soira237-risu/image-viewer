@@ -135,6 +135,9 @@ strings! {
     update_too_large, update_unreadable, update_not_started, update_open_failed,
     // where the "Open with" registration points
     registration_here, registration_other, registration_missing, registration_none, registration_repaired,
+    // the Explorer thumbnail provider (settings window)
+    thumbnails, thumbnails_registered, thumbnails_none_needed, thumbnails_unregistered, thumbnails_failed,
+    thumbnails_dll_missing, thumbnails_repaired,
 }
 
 impl Strings {
@@ -398,6 +401,13 @@ pub static KO: Strings = Strings {
     registration_missing: "없는 파일에 등록됨: {path}",
     registration_none: "등록되지 않음",
     registration_repaired: "연결 프로그램 등록을 이 실행 파일로 옮겼습니다 (전에 등록한 파일이 없음: {path})",
+    thumbnails: "탐색기 썸네일 (Windows가 그리지 못하는 형식만)",
+    thumbnails_registered: "탐색기 썸네일을 확장자 {count}개에 등록했습니다",
+    thumbnails_none_needed: "모든 형식에 이미 썸네일이 있어 등록할 것이 없습니다",
+    thumbnails_unregistered: "탐색기 썸네일 등록을 지웠습니다",
+    thumbnails_failed: "탐색기 썸네일 등록을 바꾸지 못했습니다: {error}",
+    thumbnails_dll_missing: "썸네일 DLL이 실행 파일 옆에 없습니다: {path}",
+    thumbnails_repaired: "탐색기 썸네일 등록을 이 실행 파일 옆의 DLL로 옮겼습니다 (전에 등록한 파일이 없음: {path})",
 };
 
 pub static EN: Strings = Strings {
@@ -600,6 +610,13 @@ pub static EN: Strings = Strings {
     registration_missing: "Registered to a missing file: {path}",
     registration_none: "Not registered",
     registration_repaired: "Open with now runs this copy (the one registered before is gone: {path})",
+    thumbnails: "Explorer thumbnails (only formats Windows cannot draw)",
+    thumbnails_registered: "Explorer thumbnails registered for {count} extensions",
+    thumbnails_none_needed: "every format already has thumbnails: nothing to register",
+    thumbnails_unregistered: "Explorer thumbnails removed",
+    thumbnails_failed: "cannot change the Explorer thumbnail registration: {error}",
+    thumbnails_dll_missing: "the thumbnail DLL is not next to the program: {path}",
+    thumbnails_repaired: "Explorer thumbnails now use the DLL next to this copy (the one registered before is gone: {path})",
 };
 
 #[cfg(test)]
