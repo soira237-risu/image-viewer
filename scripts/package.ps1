@@ -31,7 +31,7 @@ for users) and release-notes.md.
 
 .EXAMPLE
 pwsh -File scripts/package.ps1 -Jobs 3
-pwsh -File scripts/package.ps1 -Tag v0.1.0 -OutDir dist      # as the release workflow runs it
+pwsh -File scripts/package.ps1 -Tag v0.2.0 -OutDir dist      # as the release workflow runs it
 #>
 param(
     [string]$OutDir = 'target/dist',

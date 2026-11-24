@@ -767,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "iv-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "iv-codec",
  "iv-core",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "iv-codec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "avif-decode",
  "avif-parse",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "iv-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "thiserror",
@@ -810,14 +810,14 @@ dependencies = [
 
 [[package]]
 name = "iv-libjxl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cmake",
 ]
 
 [[package]]
 name = "iv-ops"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "fast_image_resize",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "iv-pipeline"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "image",
  "iv-codec",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "iv-thumb"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "image",
  "iv-codec",
@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "iv-win"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "fast_image_resize",
