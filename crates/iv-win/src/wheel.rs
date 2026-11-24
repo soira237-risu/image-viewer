@@ -1,5 +1,7 @@
-//! What the mouse wheel does: a command bound to it in the keymap, previous / next image when
-//! the "wheel navigates" setting is on, else zoom at the cursor. Commands fire once per notch.
+//! What the mouse wheel does: a command bound to it in the keymap; scrolling when a picture
+//! fitted to the window's width is taller than the window; previous / next image when the "wheel
+//! navigates" setting is on (after the end of such a picture); else zoom at the cursor. Commands
+//! fire once per notch.
 
 use std::time::{Duration, Instant};
 
@@ -18,15 +20,35 @@ pub enum WheelUse {
     Command(Command),
     /// Zoom at the cursor by the wheel's exact amount.
     Zoom,
+    /// Scroll the picture by the wheel's exact amount.
+    Scroll,
 }
 
-/// What a wheel turn (`up`: away from the user) with these modifiers does.
-pub fn wheel_use(keymap: &Keymap, up: bool, ctrl: bool, alt: bool, shift: bool, navigates: bool) -> WheelUse {
+/// What a wheel turn (`up`: away from the user) with these modifiers does. `scroll` is `None`
+/// unless the view is fitted to the width and taller than the window; then it says whether
+/// there is more of the picture in the wheel's direction. At its end the plain wheel goes on to
+/// the next image when `navigates`, else it stays (it does not start zooming).
+pub fn wheel_use(
+    keymap: &Keymap,
+    up: bool,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    navigates: bool,
+    scroll: Option<bool>,
+) -> WheelUse {
     let chord = Chord::new(if up { "WheelUp" } else { "WheelDown" }, ctrl, alt, shift);
     if let Some(cmd) = keymap.lookup(&chord) {
         return WheelUse::Command(cmd);
     }
-    if navigates && !ctrl && !alt && !shift {
+    let plain = !ctrl && !alt && !shift;
+    if plain
+        && let Some(room) = scroll
+        && (room || !navigates)
+    {
+        return WheelUse::Scroll;
+    }
+    if navigates && plain {
         return WheelUse::Command(if up { Command::NavPrev } else { Command::NavNext });
     }
     WheelUse::Zoom
@@ -95,14 +117,32 @@ mod tests {
     #[test]
     fn keymap_then_setting_then_zoom() {
         let map = Keymap::defaults();
-        assert_eq!(wheel_use(&map, true, false, false, false, false), WheelUse::Zoom);
-        assert_eq!(wheel_use(&map, true, false, false, false, true), WheelUse::Command(Command::NavPrev));
-        assert_eq!(wheel_use(&map, false, false, false, false, true), WheelUse::Command(Command::NavNext));
+        assert_eq!(wheel_use(&map, true, false, false, false, false, None), WheelUse::Zoom);
+        assert_eq!(wheel_use(&map, true, false, false, false, true, None), WheelUse::Command(Command::NavPrev));
+        assert_eq!(wheel_use(&map, false, false, false, false, true, None), WheelUse::Command(Command::NavNext));
         // with the setting on, Ctrl+wheel still zooms
-        assert_eq!(wheel_use(&map, false, true, false, false, true), WheelUse::Zoom);
+        assert_eq!(wheel_use(&map, false, true, false, false, true, None), WheelUse::Zoom);
         let mut map = Keymap::defaults();
         map.apply_toml("[bindings]\n\"Shift+WheelUp\" = \"view.zoom_in\"\n\"WheelDown\" = \"nav.last\"\n").unwrap();
-        assert_eq!(wheel_use(&map, true, false, false, true, false), WheelUse::Command(Command::ViewZoomIn));
-        assert_eq!(wheel_use(&map, false, false, false, false, true), WheelUse::Command(Command::NavLast));
+        assert_eq!(wheel_use(&map, true, false, false, true, false, None), WheelUse::Command(Command::ViewZoomIn));
+        assert_eq!(wheel_use(&map, false, false, false, false, true, None), WheelUse::Command(Command::NavLast));
+    }
+
+    #[test]
+    fn a_tall_fit_width_picture_scrolls_then_goes_on() {
+        let map = Keymap::defaults();
+        let wheel = |up, ctrl, navigates, room| wheel_use(&map, up, ctrl, false, false, navigates, Some(room));
+        // more picture that way: the plain wheel scrolls, whatever the setting
+        assert_eq!(wheel(false, false, false, true), WheelUse::Scroll);
+        assert_eq!(wheel(true, false, true, true), WheelUse::Scroll);
+        // at its end: on to the next image when the wheel browses, else stay put (no zoom)
+        assert_eq!(wheel(false, false, true, false), WheelUse::Command(Command::NavNext));
+        assert_eq!(wheel(true, false, true, false), WheelUse::Command(Command::NavPrev));
+        assert_eq!(wheel(false, false, false, false), WheelUse::Scroll);
+        // Ctrl+wheel still zooms; a keymap binding still wins
+        assert_eq!(wheel(false, true, false, true), WheelUse::Zoom);
+        let mut map = Keymap::defaults();
+        map.apply_toml("[bindings]\n\"WheelDown\" = \"nav.next\"\n").unwrap();
+        assert_eq!(wheel_use(&map, false, false, false, false, false, Some(true)), WheelUse::Command(Command::NavNext));
     }
 }

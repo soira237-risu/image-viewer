@@ -35,6 +35,9 @@ pub enum Command {
     ViewActualSize,
     ViewZoomIn,
     ViewZoomOut,
+    /// Scroll a picture taller than the window (fit width, or zoomed in) up or down a step.
+    ViewScrollUp,
+    ViewScrollDown,
     ViewToggleFullscreen,
     /// The edit panel: sliders, resize, buttons.
     ViewToggleEditPanel,
@@ -54,7 +57,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 33] = [
+    pub const ALL: [Command; 35] = [
         Command::FileOpen,
         Command::FileSave,
         Command::FileSaveAs,
@@ -79,6 +82,8 @@ impl Command {
         Command::ViewActualSize,
         Command::ViewZoomIn,
         Command::ViewZoomOut,
+        Command::ViewScrollUp,
+        Command::ViewScrollDown,
         Command::ViewToggleFullscreen,
         Command::ViewToggleEditPanel,
         Command::ViewToggleSpread,
@@ -116,6 +121,8 @@ impl Command {
             Command::ViewActualSize => "view.actual_size",
             Command::ViewZoomIn => "view.zoom_in",
             Command::ViewZoomOut => "view.zoom_out",
+            Command::ViewScrollUp => "view.scroll_up",
+            Command::ViewScrollDown => "view.scroll_down",
             Command::ViewToggleFullscreen => "view.toggle_fullscreen",
             Command::ViewToggleEditPanel => "view.toggle_edit_panel",
             Command::ViewToggleSpread => "view.toggle_spread",
@@ -138,11 +145,19 @@ impl Command {
     }
 
     /// Whether a held key repeats the command. Only stepping commands do: navigation, zoom,
-    /// undo and redo. Everything else runs once per press, so holding Delete cannot recycle file
-    /// after file, Esc cannot go on to quit, and a toggle does not flicker.
+    /// scrolling, undo and redo. Everything else runs once per press, so holding Delete cannot
+    /// recycle file after file, Esc cannot go on to quit, and a toggle does not flicker.
     pub fn repeats(self) -> bool {
         self.is_navigation()
-            || matches!(self, Command::ViewZoomIn | Command::ViewZoomOut | Command::EditUndo | Command::EditRedo)
+            || matches!(
+                self,
+                Command::ViewZoomIn
+                    | Command::ViewZoomOut
+                    | Command::ViewScrollUp
+                    | Command::ViewScrollDown
+                    | Command::EditUndo
+                    | Command::EditRedo
+            )
     }
 }
 

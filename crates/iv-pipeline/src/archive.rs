@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -237,7 +237,7 @@ fn seven_z_error(e: sevenz_rust2::Error) -> String {
 }
 
 /// The index (header) of a 7z archive, read within [`SEVEN_Z_HEADER_KIB`].
-fn seven_z_index(file: &mut BufReader<File>) -> std::result::Result<sevenz_rust2::Archive, sevenz_rust2::Error> {
+fn seven_z_index<R: Read + Seek>(file: &mut R) -> std::result::Result<sevenz_rust2::Archive, sevenz_rust2::Error> {
     sevenz_rust2::Archive::read_with_memory_limit(file, &sevenz_rust2::Password::empty(), SEVEN_Z_HEADER_KIB)
 }
 
@@ -389,13 +389,107 @@ pub fn source_for_cancellable(path: &Path, cancel: &CancelToken) -> Result<Sourc
     Ok(Source::from_bytes(name, bytes))
 }
 
+/// The archive format `head` (the first bytes of a file) starts like.
+fn sniff_kind(head: &[u8]) -> Option<Kind> {
+    // a local file header, or the end record of an archive with no entries
+    if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") {
+        Some(Kind::Zip)
+    } else if head.starts_with(&[b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C]) {
+        Some(Kind::SevenZ)
+    } else {
+        None
+    }
+}
+
+/// Whether `head` (the first bytes of a file) is the start of an archive [`cover`] reads.
+pub fn is_archive_content(head: &[u8]) -> bool {
+    sniff_kind(head).is_some()
+}
+
+/// The first page of an archive (ZIP or 7z, told apart by content), read from `reader`: the
+/// image entry that comes first in natural order, as [`list_images`] lists them, held to
+/// [`MAX_ENTRY_BYTES`]. `None` when the archive holds no image. For a file that only gives a
+/// stream, not a path (Explorer's thumbnails); nothing is cached.
+pub fn cover<R: Read + Seek>(mut reader: R) -> Result<Option<Source>> {
+    let mut head = Vec::with_capacity(6);
+    (&mut reader).take(6).read_to_end(&mut head)?;
+    reader.seek(SeekFrom::Start(0))?;
+    let first = |names: &mut Vec<(String, usize)>| {
+        names.retain(|(n, _)| is_image_entry(n));
+        names.sort_by(|a, b| natural_cmp(&a.0, &b.0));
+        names.first().cloned()
+    };
+    let (entry, bytes) = match sniff_kind(&head) {
+        Some(Kind::Zip) => {
+            let archive_len = reader.seek(SeekFrom::End(0))?;
+            reader.seek(SeekFrom::Start(0))?;
+            let mut zip = zip::ZipArchive::new(reader).map_err(|e| Error::decode("zip", e))?;
+            // `file_names` lists entries in index order
+            let mut names: Vec<(String, usize)> = zip
+                .file_names()
+                .enumerate()
+                .filter_map(|(i, n)| n.ok().and_then(|n| clean_name(&n)).map(|n| (n, i)))
+                .collect();
+            let Some((entry, index)) = first(&mut names) else { return Ok(None) };
+            let mut file = zip.by_index(index).map_err(|e| Error::decode("zip", format!("{entry}: {e}")))?;
+            if file.compressed_size() > archive_len {
+                return Err(Error::decode("zip", format!("{entry}: compressed size is larger than the archive")));
+            }
+            let declared = file.size();
+            let bytes = read_entry(&mut file, declared, MAX_ENTRY_BYTES)
+                .map_err(|e| Error::decode("zip", format!("{entry}: {e}")))?;
+            (entry, bytes)
+        }
+        Some(Kind::SevenZ) => {
+            let fail = |e: sevenz_rust2::Error| Error::decode("7z", seven_z_error(e));
+            let index = seven_z_index(&mut reader).map_err(fail)?;
+            let mut names: Vec<(String, usize)> = index
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.has_stream && !f.is_directory())
+                .filter_map(|(i, f)| clean_name(f.name()).map(|n| (n, i)))
+                .collect();
+            let Some((entry, target)) = first(&mut names) else { return Ok(None) };
+            let missing = || Error::decode("7z", format!("{entry}: not in the archive"));
+            let block = index.stream_map.file_block_index[target].ok_or_else(missing)?;
+            let target = &index.files[target];
+            let password = sevenz_rust2::Password::empty();
+            let mut found = None;
+            // one thread, for the reason given in `seven_z_read`; the walk stops at the page
+            sevenz_rust2::BlockDecoder::new_with_memory_limit(
+                1,
+                SEVEN_Z_DICTIONARY_KIB,
+                block,
+                &index,
+                &password,
+                &mut reader,
+            )
+            .for_each_entries(&mut |e, data| {
+                if !std::ptr::eq(e, target) {
+                    return Ok(true);
+                }
+                let bytes = read_entry(data, e.size(), MAX_ENTRY_BYTES)
+                    .map_err(|err| std::io::Error::other(format!("{entry}: {err}")))?;
+                found = Some(bytes);
+                Ok(false)
+            })
+            .map_err(|e| Error::decode("7z", format!("{entry}: {}", seven_z_error(e))))?;
+            (entry.clone(), found.ok_or_else(missing)?)
+        }
+        None => return Err(Error::UnsupportedFormat),
+    };
+    let name = entry.rsplit('/').next().unwrap_or(&entry).to_string();
+    Ok(Some(Source::from_bytes(name, bytes)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
 
     use super::*;
 
-    fn make_zip(path: &Path, entries: &[(&str, &[u8])]) {
+    pub(super) fn make_zip(path: &Path, entries: &[(&str, &[u8])]) {
         let mut w = zip::ZipWriter::new(File::create(path).unwrap());
         for (name, data) in entries {
             if name.ends_with('/') {
@@ -537,6 +631,7 @@ mod tests {
 
 #[cfg(test)]
 mod seven_z_tests {
+    use super::tests::make_zip;
     use super::*;
 
     fn fixture(name: &str) -> PathBuf {
@@ -686,5 +781,47 @@ mod seven_z_tests {
         assert_eq!(names, ["a", "c", "d"]);
         cache.insert("d".into(), big(10));
         assert_eq!(cache.bytes, 2 * third + 10, "a replaced entry is not counted twice");
+    }
+
+    #[test]
+    fn the_cover_is_the_first_page_in_natural_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let cbz = dir.path().join("book.cbz");
+        make_zip(
+            &cbz,
+            &[
+                ("notes.txt", b"no"),
+                ("ch10/01.png", b"ten"),
+                ("ch2/10.png", b"two-ten"),
+                ("ch2/9.png", b"two-nine"),
+                ("__MACOSX/ch1/._01.png", b"fork"),
+            ],
+        );
+        let cover_of = |path: &Path| cover(BufReader::new(File::open(path).unwrap()));
+        let src = cover_of(&cbz).unwrap().unwrap();
+        assert_eq!(src.display_name(), "9.png");
+        assert_eq!(&*src.read_all().unwrap(), b"two-nine");
+        // the same page the viewer opens first
+        assert_eq!(list_images(&cbz).unwrap()[0], entry_path(&cbz, "ch2/9.png"));
+
+        // 7z, solid and not: whatever block the first page is in
+        let _turn = exclusive();
+        for (name, first) in [("book.cb7", &b"two"[..]), ("pages.cb7", b"page 01"), ("solid.cb7", b"page 01")] {
+            let src = cover_of(&fixture(name)).unwrap().unwrap();
+            assert_eq!(&*src.read_all().unwrap(), first, "{name}");
+        }
+        assert!(cached_names().is_empty(), "the viewer's page cache is not filled");
+
+        // no image at all, and something that is not an archive
+        let empty = dir.path().join("text.cbz");
+        make_zip(&empty, &[("readme.txt", b"no"), ("dir/", b"")]);
+        assert!(cover_of(&empty).unwrap().is_none());
+        let not = dir.path().join("not.cbz");
+        std::fs::write(&not, b"plain text").unwrap();
+        assert!(matches!(cover_of(&not), Err(Error::UnsupportedFormat)));
+        // a hostile header is refused within its limits, as when browsing
+        assert!(cover_of(&fixture("header-bomb.cb7")).is_err());
+        assert!(is_archive_content(b"PK\x03\x04rest") && is_archive_content(&[b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C]));
+        assert!(!is_archive_content(b"\x89PNG") && !is_archive_content(b""));
     }
 }

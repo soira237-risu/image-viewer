@@ -167,6 +167,8 @@ const DEFAULTS: &[(&str, Command)] = &[
     ("Ctrl+=", Command::ViewZoomIn),
     ("-", Command::ViewZoomOut),
     ("Ctrl+-", Command::ViewZoomOut),
+    ("Up", Command::ViewScrollUp),
+    ("Down", Command::ViewScrollDown),
     ("F11", Command::ViewToggleFullscreen),
     ("E", Command::ViewToggleEditPanel),
     ("D", Command::ViewToggleSpread),

@@ -8,15 +8,17 @@ members = [
     "crates/iv-ops",
     "crates/iv-win",
     "crates/iv-libjxl",
+    "crates/iv-thumb",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # the highest rust-version among the locked dependencies (avif-decode 3.0); scripts/package.ps1 checks it
 rust-version = "1.98"
 publish = false
 license = "MIT"
+repository = "https://github.com/soira237-risu/image-viewer"
 
 [workspace.dependencies]
 iv-core = { path = "crates/iv-core" }
@@ -64,6 +66,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",
+    "Win32_Networking_WinHttp",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Console",
@@ -83,8 +86,11 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# the `#[implement]` macro of COM objects (crates/iv-thumb) names this crate; the same one `windows` uses
+windows-core = "0.62.2"
 tempfile = "3"
 
 [profile.release]

@@ -7,7 +7,7 @@ use crate::keymap::{Chord, Keymap};
 use crate::wheel::{WheelUse, wheel_use};
 
 /// Commands in the order the help lists them: files, browsing, view, editing, windows.
-const ORDER: [Command; 33] = [
+const ORDER: [Command; 35] = [
     Command::FileOpen,
     Command::FileSave,
     Command::FileSaveAs,
@@ -25,6 +25,8 @@ const ORDER: [Command; 33] = [
     Command::ViewActualSize,
     Command::ViewZoomIn,
     Command::ViewZoomOut,
+    Command::ViewScrollUp,
+    Command::ViewScrollDown,
     Command::ViewToggleFullscreen,
     Command::ViewToggleSpread,
     Command::ViewToggleDirection,
@@ -54,9 +56,9 @@ pub struct Row {
 /// same name: it decides whether the plain wheel browses or zooms.
 pub fn rows(keymap: &Keymap, t: &Strings, wheel_navigates: bool) -> Vec<Row> {
     // the plain wheel's command when the setting (not the keymap) gives it one
-    let plain_wheel = |up: bool| match wheel_use(keymap, up, false, false, false, wheel_navigates) {
+    let plain_wheel = |up: bool| match wheel_use(keymap, up, false, false, false, wheel_navigates, None) {
         WheelUse::Command(c) => Some(c),
-        WheelUse::Zoom => None,
+        WheelUse::Zoom | WheelUse::Scroll => None,
     };
     let mut out: Vec<Row> = ORDER
         .iter()
@@ -70,14 +72,20 @@ pub fn rows(keymap: &Keymap, t: &Strings, wheel_navigates: bool) -> Vec<Row> {
             Row { action: t.command(cmd).to_string(), keys: keys.join(", ") }
         })
         .collect();
-    let zoom_keys = match (plain_wheel(true).or(plain_wheel(false)), wheel_use(keymap, true, true, false, false, true))
-    {
-        (None, _) => t.mouse_wheel,
-        (Some(_), WheelUse::Zoom) => t.mouse_ctrl_wheel,
-        (Some(_), WheelUse::Command(_)) => "",
+    let zoom_keys =
+        match (plain_wheel(true).or(plain_wheel(false)), wheel_use(keymap, true, true, false, false, true, None)) {
+            (None, _) => t.mouse_wheel,
+            (Some(_), WheelUse::Zoom) => t.mouse_ctrl_wheel,
+            (Some(_), WheelUse::Command(_) | WheelUse::Scroll) => "",
+        };
+    // a picture fitted to the width and taller than the window: the plain wheel scrolls it
+    let scroll_keys = match wheel_use(keymap, false, false, false, false, wheel_navigates, Some(true)) {
+        WheelUse::Scroll => t.mouse_wheel,
+        _ => "",
     };
     let mouse = [
         (t.pan, t.mouse_drag),
+        (t.scroll_tall, scroll_keys),
         (t.select_area, t.mouse_shift_drag),
         (t.fit_or_actual, t.mouse_double_click),
         (t.zoom_at_cursor, zoom_keys),

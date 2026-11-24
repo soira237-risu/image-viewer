@@ -1,15 +1,94 @@
-//! The images of one folder, in natural order, and stepping through them.
+//! The images of one folder in the chosen order (natural file-name order by default), and
+//! stepping through them.
 
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use iv_core::FormatId;
 
 use crate::natord::natural_cmp;
 
+/// What a folder's images are sorted by. Ties (and [`SortBy::Name`]) use natural file-name
+/// order, so the order is always total.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortBy {
+    /// Natural order of the file names: `img2` before `img10`, like Explorer.
+    #[default]
+    Name,
+    /// The file's last-modified time, oldest first.
+    Modified,
+    /// The file's size in bytes, smallest first.
+    Size,
+}
+
+/// How a folder's images are ordered. Archive pages ignore it: they always go in natural name
+/// order (entries carry no reliable dates, and a comic's pages are named in reading order).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SortOrder {
+    pub by: SortBy,
+    /// Reverses the key: Z to A, newest first, largest first. Files with an equal date or size
+    /// still go in natural name order (A to Z) among themselves.
+    pub descending: bool,
+}
+
+/// What stepping past the last image (or before the first) does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AtEnd {
+    /// Continue at the other end of the same folder.
+    #[default]
+    Wrap,
+    /// Stay at the end.
+    Stop,
+    /// Go on to the next (or previous) sibling folder, or archive, that has images.
+    NextFolder,
+}
+
+/// What a file sorts by: its name, and the date and size read when the folder was listed
+/// (`None` / 0 when they could not be read).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SortKey {
+    pub name: String,
+    pub modified: Option<SystemTime>,
+    pub size: u64,
+}
+
+impl SortKey {
+    /// The key of `path` as it is on disk now (name only when it cannot be read).
+    pub fn read(path: &Path) -> Self {
+        let meta = std::fs::metadata(path).ok();
+        Self::new(path, meta.as_ref())
+    }
+
+    fn new(path: &Path, meta: Option<&std::fs::Metadata>) -> Self {
+        Self {
+            name: name_of(path),
+            modified: meta.and_then(|m| m.modified().ok()),
+            size: meta.map_or(0, std::fs::Metadata::len),
+        }
+    }
+
+    /// Where `self` sorts relative to `other` in `order`.
+    pub fn cmp_in(&self, other: &Self, order: SortOrder) -> Ordering {
+        let name = natural_cmp(&self.name, &other.name);
+        let key = match order.by {
+            SortBy::Name => return if order.descending { name.reverse() } else { name },
+            SortBy::Modified => self.modified.cmp(&other.modified),
+            SortBy::Size => self.size.cmp(&other.size),
+        };
+        (if order.descending { key.reverse() } else { key }).then(name)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FolderList {
     dir: PathBuf,
     files: Vec<PathBuf>,
+    /// The sort key of each entry of `files`, at the same index.
+    keys: Vec<SortKey>,
+    order: SortOrder,
+    /// `dir` is an archive file and the entries are its pages.
+    archive: bool,
 }
 
 fn is_image(path: &Path) -> bool {
@@ -24,20 +103,44 @@ impl FolderList {
     /// Lists the files in `dir` whose extension names a known image format (not recursive,
     /// hidden files included), naturally sorted by file name.
     pub fn scan(dir: &Path) -> std::io::Result<Self> {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
+        Self::scan_sorted(dir, SortOrder::default())
+    }
+
+    /// [`Self::scan`] in `order`. Dates and sizes come with the directory listing (no extra
+    /// call per file on Windows), so every order costs the same.
+    pub fn scan_sorted(dir: &Path, order: SortOrder) -> std::io::Result<Self> {
+        let (files, keys) = std::fs::read_dir(dir)?
             .flatten()
             .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-            .map(|e| e.path())
-            .filter(|p| is_image(p))
-            .collect();
-        files.sort_by(|a, b| natural_cmp(&name_of(a), &name_of(b)));
-        Ok(Self { dir: dir.to_path_buf(), files })
+            .map(|e| (e.path(), e.metadata().ok()))
+            .filter(|(p, _)| is_image(p))
+            .map(|(p, meta)| {
+                let key = SortKey::new(&p, meta.as_ref());
+                (p, key)
+            })
+            .unzip();
+        let mut list = Self { dir: dir.to_path_buf(), files, keys, order, archive: false };
+        list.sort();
+        Ok(list)
+    }
+
+    /// The images of the archive file `archive`, in natural order.
+    pub fn for_archive(archive: &Path) -> std::io::Result<Self> {
+        let files = crate::archive::list_images(archive).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let keys = files.iter().map(|f| SortKey { name: name_of(f), ..SortKey::default() }).collect();
+        // already in natural order: archive pages are never re-sorted
+        Ok(Self { dir: archive.to_path_buf(), files, keys, order: SortOrder::default(), archive: true })
     }
 
     /// The folder holding `file`, scanned. `file` itself is included even when its extension is
     /// unknown (it was opened explicitly, so the user wants to see it), unless it is a folder:
     /// a folder is never an entry of an image list.
     pub fn for_file(file: &Path) -> std::io::Result<Self> {
+        Self::for_file_sorted(file, SortOrder::default())
+    }
+
+    /// [`Self::for_file`] in `order` (an archive's pages keep their natural order).
+    pub fn for_file_sorted(file: &Path, order: SortOrder) -> std::io::Result<Self> {
         // an archive (or a page inside one) browses the archive's images
         let archive = if crate::archive::is_archive(file) && file.is_file() {
             Some(file.to_path_buf())
@@ -45,20 +148,47 @@ impl FolderList {
             crate::archive::split(file).map(|(a, _)| a)
         };
         if let Some(archive) = archive {
-            let files = crate::archive::list_images(&archive).map_err(|e| std::io::Error::other(e.to_string()))?;
-            return Ok(Self { dir: archive, files });
+            return Self::for_archive(&archive);
         }
         let dir = file.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        let mut list = Self::scan(dir)?;
+        let mut list = Self::scan_sorted(dir, order)?;
         if !file.is_dir() && list.position(file).is_none() {
             list.files.push(file.to_path_buf());
-            list.files.sort_by(|a, b| natural_cmp(&name_of(a), &name_of(b)));
+            list.keys.push(SortKey::read(file));
+            list.sort();
         }
         Ok(list)
     }
 
+    /// Puts the entries in `self.order`, keeping each key with its file.
+    fn sort(&mut self) {
+        let order = self.order;
+        let mut entries: Vec<(PathBuf, SortKey)> = self.files.drain(..).zip(self.keys.drain(..)).collect();
+        entries.sort_by(|a, b| a.1.cmp_in(&b.1, order));
+        (self.files, self.keys) = entries.into_iter().unzip();
+    }
+
+    /// The folder (or, for an archive's pages, the archive file).
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Whether the entries are the pages of the archive [`Self::dir`].
+    pub fn is_archive(&self) -> bool {
+        self.archive
+    }
+
+    pub fn order(&self) -> SortOrder {
+        self.order
+    }
+
+    /// Sorts the list again in `order`. An archive's pages keep their natural order.
+    pub fn set_order(&mut self, order: SortOrder) {
+        if self.archive || order == self.order {
+            return;
+        }
+        self.order = order;
+        self.sort();
     }
 
     pub fn len(&self) -> usize {
@@ -77,14 +207,22 @@ impl FolderList {
         &self.files
     }
 
-    /// `old` was renamed to `new` on disk: the list follows, keeping its natural order. `old` is
-    /// found the way [`Self::position`] finds it (so `x.jpg` matches the scanned `.\x.jpg`, and
-    /// letter case need not match on Windows). Returns the new entry's index, or `None` when
-    /// `old` is not in the list.
+    /// `old` was renamed to `new` on disk: the list follows, keeping its order. `old` is found
+    /// the way [`Self::position`] finds it (so `x.jpg` matches the scanned `.\x.jpg`, and letter
+    /// case need not match on Windows). Returns the new entry's index, or `None` when `old` is
+    /// not in the list.
     pub fn rename(&mut self, old: &Path, new: &Path) -> Option<usize> {
         let i = self.position(old)?;
         self.files[i] = new.to_path_buf();
-        self.files.sort_by(|a, b| natural_cmp(&name_of(a), &name_of(b)));
+        let key = &mut self.keys[i];
+        key.name = name_of(new);
+        // a rename keeps the date and size; read them again in case the file changed meanwhile
+        if !self.archive
+            && let Ok(meta) = std::fs::metadata(new)
+        {
+            *key = SortKey::new(new, Some(&meta));
+        }
+        self.sort();
         self.files.iter().position(|f| f == new)
     }
 
@@ -94,16 +232,22 @@ impl FolderList {
     pub fn remove(&mut self, path: &Path) -> Option<usize> {
         let i = self.position(path)?;
         self.files.remove(i);
+        self.keys.remove(i);
         Some(i)
     }
 
-    /// Where `path` sorts in this list: the index of the first entry whose name comes after it
-    /// in natural order, else the last entry (`path` sorts after everything). `None` for an
-    /// empty list. For a file that is no longer in the list, this is the image that followed it.
+    /// Where `path` sorts in this list by its name alone: see [`Self::index_after_key`].
     pub fn index_after(&self, path: &Path) -> Option<usize> {
+        self.index_after_key(&SortKey { name: name_of(path), ..SortKey::default() })
+    }
+
+    /// Where a file with sort key `key` sorts in this list: the index of the first entry that
+    /// comes after it in the list's order, else the last entry (it sorts after everything).
+    /// `None` for an empty list. For a file that is no longer in the list (with the key it had),
+    /// this is the image that followed it.
+    pub fn index_after_key(&self, key: &SortKey) -> Option<usize> {
         let last = self.files.len().checked_sub(1)?;
-        let name = name_of(path);
-        Some(self.files.iter().position(|f| natural_cmp(&name_of(f), &name).is_gt()).unwrap_or(last))
+        Some(self.keys.iter().position(|k| k.cmp_in(key, self.order).is_gt()).unwrap_or(last))
     }
 
     /// Index of `path` in the list: the exact path, else the same file name (case-insensitively
@@ -134,6 +278,54 @@ pub fn step(index: usize, len: usize, delta: isize, wrap: bool) -> Option<usize>
     } else {
         let clamped = target.clamp(0, len as isize - 1) as usize;
         (clamped != index).then_some(clamped)
+    }
+}
+
+/// Where a navigation step leads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Move {
+    /// To this index of the same list.
+    To(usize),
+    /// Past the last image (`forward`) or before the first: on to the neighbouring folder or
+    /// archive.
+    Cross { forward: bool },
+    /// Nowhere.
+    Stay,
+}
+
+/// A step of `delta` from `index` in a list of `len`, with `at_end` deciding what happens at
+/// the ends. `|delta|` images are on screen from `index` (two in two-page view). With
+/// [`AtEnd::NextFolder`] the step crosses into the next folder when nothing is left after what
+/// is on screen (into the previous one from the first image), except while the key is held
+/// (`repeat`): auto-repeat stops at the end, and crossing takes a fresh press.
+pub fn step_or_cross(index: usize, len: usize, delta: isize, at_end: AtEnd, repeat: bool) -> Move {
+    if len == 0 || delta == 0 {
+        return Move::Stay;
+    }
+    if at_end != AtEnd::NextFolder {
+        return step(index, len, delta, at_end == AtEnd::Wrap).map_or(Move::Stay, Move::To);
+    }
+    let forward = delta > 0;
+    let stride = delta.unsigned_abs();
+    let at_edge = if forward { index + stride >= len } else { index == 0 };
+    match (at_edge, repeat) {
+        (true, true) => Move::Stay,
+        (true, false) => Move::Cross { forward },
+        (false, _) if forward => Move::To(index + stride),
+        (false, _) => Move::To(index.saturating_sub(stride)),
+    }
+}
+
+/// The image to show on entering a list of `len` images: the first going forward, the last
+/// going back. With `stride` images on screen at a time (two-page view), going back lands on
+/// the spread that stepping forward from the first image reaches, so the pages pair up the same
+/// whichever way the list was entered.
+pub fn entry_index(len: usize, forward: bool, stride: usize) -> usize {
+    if forward || len == 0 {
+        0
+    } else {
+        let stride = stride.max(1);
+        (len - 1) / stride * stride
     }
 }
 
@@ -267,5 +459,139 @@ mod tests {
         assert_eq!(step(2, 5, -10, false), Some(0));
         assert_eq!(step(0, 5, -10, false), None);
         assert_eq!(step(0, 0, 1, true), None);
+    }
+
+    fn names(list: &FolderList) -> Vec<String> {
+        list.files().iter().map(|p| name_of(p)).collect()
+    }
+
+    /// Files with the given names, sizes and modification times (seconds after an epoch).
+    fn files_with(dir: &Path, files: &[(&str, usize, u64)]) {
+        let epoch = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for (name, size, secs) in files {
+            let path = dir.join(name);
+            std::fs::write(&path, vec![0u8; *size]).unwrap();
+            let f = std::fs::File::options().write(true).open(&path).unwrap();
+            f.set_modified(epoch + std::time::Duration::from_secs(*secs)).unwrap();
+        }
+    }
+
+    #[test]
+    fn sorting_by_date_and_size_breaks_ties_by_natural_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // name, size, modified
+        files_with(
+            dir.path(),
+            &[("img10.jpg", 30, 100), ("img2.png", 10, 300), ("img1.webp", 20, 100), ("b.gif", 10, 200)],
+        );
+        let sorted =
+            |by, descending| names(&FolderList::scan_sorted(dir.path(), SortOrder { by, descending }).unwrap());
+        assert_eq!(sorted(SortBy::Name, false), ["b.gif", "img1.webp", "img2.png", "img10.jpg"]);
+        assert_eq!(sorted(SortBy::Name, true), ["img10.jpg", "img2.png", "img1.webp", "b.gif"]);
+        // img1 and img10 share a date: natural order between them, whichever way the dates go
+        assert_eq!(sorted(SortBy::Modified, false), ["img1.webp", "img10.jpg", "b.gif", "img2.png"]);
+        assert_eq!(sorted(SortBy::Modified, true), ["img2.png", "b.gif", "img1.webp", "img10.jpg"]);
+        // b and img2 share a size
+        assert_eq!(sorted(SortBy::Size, false), ["b.gif", "img2.png", "img1.webp", "img10.jpg"]);
+        assert_eq!(sorted(SortBy::Size, true), ["img10.jpg", "img1.webp", "b.gif", "img2.png"]);
+        // the default is today's natural order
+        assert_eq!(names(&FolderList::scan(dir.path()).unwrap()), sorted(SortBy::Name, false));
+    }
+
+    #[test]
+    fn re_sorting_keeps_every_file_and_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        files_with(dir.path(), &[("a.jpg", 3, 30), ("b.jpg", 1, 10), ("c.jpg", 2, 20)]);
+        let mut list = FolderList::scan(dir.path()).unwrap();
+        assert_eq!(names(&list), ["a.jpg", "b.jpg", "c.jpg"]);
+        list.set_order(SortOrder { by: SortBy::Size, descending: false });
+        assert_eq!(names(&list), ["b.jpg", "c.jpg", "a.jpg"]);
+        assert_eq!(list.position(&dir.path().join("a.jpg")), Some(2));
+        list.set_order(SortOrder { by: SortBy::Modified, descending: true });
+        assert_eq!(names(&list), ["a.jpg", "c.jpg", "b.jpg"]);
+        // a renamed file keeps its date: still first, newest
+        std::fs::rename(dir.path().join("a.jpg"), dir.path().join("z.jpg")).unwrap();
+        assert_eq!(list.rename(&dir.path().join("a.jpg"), &dir.path().join("z.jpg")), Some(0));
+        // the image after a deleted one, by the key it had before it went
+        let key = SortKey::read(&dir.path().join("c.jpg"));
+        assert_eq!(list.remove(&dir.path().join("c.jpg")), Some(1));
+        assert_eq!(list.index_after_key(&key), Some(1), "b.jpg followed c.jpg");
+        assert_eq!(names(&list), ["z.jpg", "b.jpg"]);
+    }
+
+    #[test]
+    fn an_opened_file_with_an_odd_extension_sorts_by_its_own_key() {
+        let dir = tempfile::tempdir().unwrap();
+        files_with(dir.path(), &[("a.jpg", 5, 10), ("b.dat", 1, 20), ("c.jpg", 9, 0)]);
+        let order = SortOrder { by: SortBy::Size, descending: false };
+        let list = FolderList::for_file_sorted(&dir.path().join("b.dat"), order).unwrap();
+        assert_eq!(names(&list), ["b.dat", "a.jpg", "c.jpg"]);
+        assert_eq!(list.order(), order);
+        assert!(!list.is_archive());
+    }
+
+    #[test]
+    fn archive_pages_keep_their_natural_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let cbz = dir.path().join("book.cbz");
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&cbz).unwrap());
+        for (name, size) in [("p10.png", 1), ("p2.png", 50), ("p1.png", 9)] {
+            w.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut w, &vec![0u8; size]).unwrap();
+        }
+        w.finish().unwrap();
+        let order = SortOrder { by: SortBy::Size, descending: true };
+        let mut list = FolderList::for_file_sorted(&cbz, order).unwrap();
+        assert!(list.is_archive());
+        assert_eq!(names(&list), ["p1.png", "p2.png", "p10.png"]);
+        list.set_order(SortOrder { by: SortBy::Name, descending: true });
+        assert_eq!(names(&list), ["p1.png", "p2.png", "p10.png"], "the setting does not apply to archives");
+    }
+
+    #[test]
+    fn wrap_and_stop_keep_their_old_meaning() {
+        for (index, len, delta) in [(0, 5, 1), (4, 5, 1), (0, 5, -1), (3, 4, 2), (2, 5, -10)] {
+            for (at_end, wrap) in [(AtEnd::Wrap, true), (AtEnd::Stop, false)] {
+                let old = step(index, len, delta, wrap).map_or(Move::Stay, Move::To);
+                assert_eq!(step_or_cross(index, len, delta, at_end, false), old);
+                assert_eq!(step_or_cross(index, len, delta, at_end, true), old);
+            }
+        }
+    }
+
+    #[test]
+    fn next_folder_crosses_only_past_the_ends_and_never_on_auto_repeat() {
+        let nf = AtEnd::NextFolder;
+        assert_eq!(step_or_cross(0, 3, 1, nf, false), Move::To(1));
+        assert_eq!(step_or_cross(2, 3, 1, nf, false), Move::Cross { forward: true });
+        assert_eq!(step_or_cross(0, 3, -1, nf, false), Move::Cross { forward: false });
+        assert_eq!(step_or_cross(2, 3, -1, nf, false), Move::To(1));
+        // a held key stops at the end
+        assert_eq!(step_or_cross(2, 3, 1, nf, true), Move::Stay);
+        assert_eq!(step_or_cross(0, 3, -1, nf, true), Move::Stay);
+        assert_eq!(step_or_cross(1, 3, 1, nf, true), Move::To(2), "but moves within the folder");
+        // a folder of one image: both ways cross
+        assert_eq!(step_or_cross(0, 1, 1, nf, false), Move::Cross { forward: true });
+        assert_eq!(step_or_cross(0, 1, -1, nf, false), Move::Cross { forward: false });
+        assert_eq!(step_or_cross(0, 0, 1, nf, false), Move::Stay);
+
+        // two pages: the spread 3-4 of five is not the end, 5 alone (or 3-4 of four) is
+        assert_eq!(step_or_cross(2, 5, 2, nf, false), Move::To(4));
+        assert_eq!(step_or_cross(4, 5, 2, nf, false), Move::Cross { forward: true });
+        assert_eq!(step_or_cross(2, 4, 2, nf, false), Move::Cross { forward: true });
+        assert_eq!(step_or_cross(1, 4, -2, nf, false), Move::To(0));
+        assert_eq!(step_or_cross(0, 4, -2, nf, false), Move::Cross { forward: false });
+        assert_eq!(step_or_cross(2, 4, 2, nf, true), Move::Stay);
+    }
+
+    #[test]
+    fn entering_a_folder_backwards_lands_on_its_last_spread() {
+        assert_eq!(entry_index(7, true, 1), 0);
+        assert_eq!(entry_index(7, false, 1), 6);
+        // two pages: 1-2, 3-4, 5-6, 7 / 1-2, 3-4
+        assert_eq!(entry_index(7, false, 2), 6);
+        assert_eq!(entry_index(4, false, 2), 2);
+        assert_eq!(entry_index(1, false, 2), 0);
+        assert_eq!(entry_index(0, false, 2), 0);
     }
 }

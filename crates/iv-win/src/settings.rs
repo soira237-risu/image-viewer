@@ -7,7 +7,128 @@
 
 use std::path::{Path, PathBuf};
 
+use iv_pipeline::{AtEnd, SortBy, SortOrder};
+
 use crate::i18n::Language;
+use crate::view::ZoomOnOpen;
+
+/// How the main window opens when the viewer starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StartupWindow {
+    /// Where and as it was when it last closed (`window.toml`), maximised if it was.
+    #[default]
+    Remember,
+    /// Maximised (restoring brings back the remembered size and place).
+    Maximized,
+    /// Full screen (leaving it brings back the remembered window).
+    Fullscreen,
+}
+
+/// How the main window is first shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartState {
+    pub maximized: bool,
+    /// Full screen on top of that (leaving it returns to the maximised or restored window).
+    pub fullscreen: bool,
+}
+
+impl StartupWindow {
+    /// The first show: `was_maximized` says the remembered window (`window.toml`, on a monitor
+    /// still connected) was maximised. With `no_activate` (the window must not take the focus
+    /// from what the user is doing) it never takes over the screen either: Windows has no way
+    /// to maximise without activating, and a full-screen window would cover the user's.
+    pub fn start_state(self, was_maximized: bool, no_activate: bool) -> StartState {
+        if no_activate {
+            return StartState { maximized: false, fullscreen: false };
+        }
+        match self {
+            StartupWindow::Remember => StartState { maximized: was_maximized, fullscreen: false },
+            StartupWindow::Maximized => StartState { maximized: true, fullscreen: false },
+            StartupWindow::Fullscreen => StartState { maximized: was_maximized, fullscreen: true },
+        }
+    }
+}
+
+/// A setting that is one of a few named values, stored in `settings.toml` by its code. An
+/// unknown code falls back to the default value instead of discarding the whole file (like
+/// [`Language`]).
+pub trait Choice: Copy + Default + PartialEq + 'static {
+    /// Every value, in the order the settings window lists them.
+    const ALL: &'static [Self];
+    /// The code stored in `settings.toml`.
+    fn code(self) -> &'static str;
+
+    fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.code().eq_ignore_ascii_case(code.trim()))
+    }
+
+    /// Where the value is in [`Choice::ALL`].
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|c| *c == self).unwrap_or(0)
+    }
+}
+
+impl Choice for ZoomOnOpen {
+    const ALL: &'static [Self] =
+        &[ZoomOnOpen::Fit, ZoomOnOpen::FitEnlarge, ZoomOnOpen::FitWidth, ZoomOnOpen::ActualSize];
+    fn code(self) -> &'static str {
+        match self {
+            ZoomOnOpen::Fit => "fit",
+            ZoomOnOpen::FitEnlarge => "fit_enlarge",
+            ZoomOnOpen::FitWidth => "fit_width",
+            ZoomOnOpen::ActualSize => "actual_size",
+        }
+    }
+}
+
+impl Choice for SortBy {
+    const ALL: &'static [Self] = &[SortBy::Name, SortBy::Modified, SortBy::Size];
+    fn code(self) -> &'static str {
+        match self {
+            SortBy::Name => "name",
+            SortBy::Modified => "modified",
+            SortBy::Size => "size",
+        }
+    }
+}
+
+impl Choice for AtEnd {
+    const ALL: &'static [Self] = &[AtEnd::Wrap, AtEnd::Stop, AtEnd::NextFolder];
+    fn code(self) -> &'static str {
+        match self {
+            AtEnd::Wrap => "wrap",
+            AtEnd::Stop => "stop",
+            AtEnd::NextFolder => "next_folder",
+        }
+    }
+}
+
+impl Choice for StartupWindow {
+    const ALL: &'static [Self] = &[StartupWindow::Remember, StartupWindow::Maximized, StartupWindow::Fullscreen];
+    fn code(self) -> &'static str {
+        match self {
+            StartupWindow::Remember => "remember",
+            StartupWindow::Maximized => "maximized",
+            StartupWindow::Fullscreen => "fullscreen",
+        }
+    }
+}
+
+/// `#[serde(with = "choice")]` for a [`Choice`] field.
+mod choice {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::Choice;
+
+    pub fn serialize<T: Choice, S: Serializer>(value: &T, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(value.code())
+    }
+
+    pub fn deserialize<'de, T: Choice, D: Deserializer<'de>>(d: D) -> Result<T, D::Error> {
+        let code = String::deserialize(d)?;
+        Ok(T::from_code(&code).unwrap_or_default())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -16,8 +137,28 @@ pub struct Settings {
     pub prefetch_count: usize,
     /// Memory for decoded images, in MiB.
     pub cache_mib: u32,
-    /// Stepping past the last image continues at the first.
-    pub wrap: bool,
+    /// What stepping past the last image (or before the first) does: `"wrap"` to the other
+    /// end, `"stop"`, or `"next_folder"` (the next sibling folder or archive with images).
+    #[serde(with = "choice")]
+    pub at_end: AtEnd,
+    /// The `wrap = true / false` of files written before `at_end` existed: read (as `at_end =
+    /// "wrap"` / `"stop"`) only when the file has no `at_end`, never written.
+    #[serde(rename = "wrap", skip_serializing)]
+    legacy_wrap: Option<bool>,
+    /// What a folder's images are sorted by: `"name"` (natural order), `"modified"` or
+    /// `"size"`. Ties go in natural name order; an archive's pages are always in name order.
+    #[serde(with = "choice")]
+    pub sort: SortBy,
+    /// Sort the other way round (Z to A, newest or largest first).
+    pub sort_descending: bool,
+    /// The zoom each newly shown image starts at: `"fit"` (shrink to fit, never enlarge),
+    /// `"fit_enlarge"`, `"fit_width"` (from the top, for webtoons) or `"actual_size"` (100 %).
+    #[serde(with = "choice")]
+    pub zoom_on_open: ZoomOnOpen,
+    /// How the main window opens: `"remember"` (as it last closed), `"maximized"` or
+    /// `"fullscreen"`.
+    #[serde(with = "choice")]
+    pub startup_window: StartupWindow,
     /// Background around the image, sRGB.
     pub background: [u8; 3],
     /// Two-page view reads right to left (manga) when turned on.
@@ -91,7 +232,12 @@ impl Default for Settings {
         Self {
             prefetch_count: 6,
             cache_mib: 1024,
-            wrap: true,
+            at_end: AtEnd::Wrap,
+            legacy_wrap: None,
+            sort: SortBy::Name,
+            sort_descending: false,
+            zoom_on_open: ZoomOnOpen::Fit,
+            startup_window: StartupWindow::Remember,
             background: [26, 26, 28],
             spread_right_to_left: true,
             nearest_above_zoom: 3.0,
@@ -114,11 +260,29 @@ impl Settings {
         self
     }
 
+    /// How a folder's images are ordered.
+    pub fn sort_order(&self) -> SortOrder {
+        SortOrder { by: self.sort, descending: self.sort_descending }
+    }
+
+    /// Settings read from `text`: a file from before `at_end` existed keeps what its `wrap`
+    /// meant. `at_end` wins when a file has both.
+    pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
+        let mut s = toml::from_str::<Settings>(text)?;
+        if let Some(wrap) = s.legacy_wrap.take() {
+            let has_at_end = text.parse::<toml::Table>().is_ok_and(|t| t.contains_key("at_end"));
+            if !has_at_end {
+                s.at_end = if wrap { AtEnd::Wrap } else { AtEnd::Stop };
+            }
+        }
+        Ok(s.clamped())
+    }
+
     /// Reads `path`; a missing file gives defaults, a broken one gives defaults and a warning.
     pub fn load(path: &Path) -> (Self, Option<String>) {
         match std::fs::read_to_string(path) {
-            Ok(text) => match toml::from_str::<Settings>(&text) {
-                Ok(s) => (s.clamped(), None),
+            Ok(text) => match Settings::parse(&text) {
+                Ok(s) => (s, None),
                 Err(e) => (Settings::default(), Some(format!("{}: {}", path.display(), toml_error(&text, &e)))),
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Settings::default(), None),
@@ -199,7 +363,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("settings.toml");
         let mut s = Settings {
-            wrap: false,
+            at_end: AtEnd::Stop,
             save_quality: 70,
             background: [255, 0, 10],
             language: Language::English,
@@ -211,7 +375,7 @@ mod tests {
         std::fs::write(&path, "wrap = false\n").unwrap();
         let (partial, warning) = Settings::load(&path);
         assert!(warning.is_none());
-        assert!(!partial.wrap);
+        assert_eq!(partial.at_end, AtEnd::Stop, "an old wrap = false still means stop");
         assert_eq!(partial.cache_mib, Settings::default().cache_mib, "missing keys take defaults");
         assert!(partial.confirm_delete, "deleting asks first unless turned off");
         std::fs::write(&path, "confirm_delete = false\n").unwrap();
@@ -305,6 +469,100 @@ mod tests {
         .unwrap();
         let (s, warning) = Settings::load(&settings);
         assert!(warning.is_none());
-        assert!(!s.wrap);
+        assert_eq!(s.at_end, AtEnd::Stop);
+    }
+
+    #[test]
+    fn defaults_are_the_old_behaviour() {
+        let d = Settings::default();
+        assert_eq!(d.at_end, AtEnd::Wrap, "wrap = true was the default");
+        assert_eq!(d.sort_order(), SortOrder { by: SortBy::Name, descending: false });
+        assert_eq!(d.zoom_on_open, ZoomOnOpen::Fit);
+        assert_eq!(d.startup_window, StartupWindow::Remember);
+        // an empty file is the defaults
+        assert_eq!(Settings::parse("").unwrap(), d);
+    }
+
+    #[test]
+    fn an_old_wrap_setting_becomes_at_end_and_is_never_written_again() {
+        assert_eq!(Settings::parse("wrap = true\n").unwrap().at_end, AtEnd::Wrap);
+        assert_eq!(Settings::parse("wrap = false\n").unwrap().at_end, AtEnd::Stop);
+        // at_end wins over a wrap left beside it, whichever comes first
+        assert_eq!(Settings::parse("wrap = false\nat_end = \"next_folder\"\n").unwrap().at_end, AtEnd::NextFolder);
+        assert_eq!(Settings::parse("at_end = \"wrap\"\nwrap = false\n").unwrap().at_end, AtEnd::Wrap);
+        // a migrated file equals the settings it means, so saving it writes at_end only
+        let migrated = Settings::parse("wrap = false\nprefetch_count = 3\n").unwrap();
+        assert_eq!(migrated, Settings { at_end: AtEnd::Stop, prefetch_count: 3, ..Default::default() });
+        let text = toml::to_string_pretty(&migrated).unwrap();
+        assert!(text.contains("at_end = \"stop\""), "{text}");
+        assert!(!text.lines().any(|l| l.starts_with("wrap")), "{text}");
+        assert_eq!(Settings::parse(&text).unwrap(), migrated);
+        // still a boolean: anything else is a broken file, as before
+        assert!(Settings::parse("wrap = \"maybe\"").is_err());
+    }
+
+    #[test]
+    fn new_choices_round_trip_and_unknown_codes_fall_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        for (zoom, sort, at_end, startup) in [
+            (ZoomOnOpen::FitEnlarge, SortBy::Modified, AtEnd::NextFolder, StartupWindow::Maximized),
+            (ZoomOnOpen::FitWidth, SortBy::Size, AtEnd::Stop, StartupWindow::Fullscreen),
+            (ZoomOnOpen::ActualSize, SortBy::Name, AtEnd::Wrap, StartupWindow::Remember),
+        ] {
+            let s = Settings {
+                zoom_on_open: zoom,
+                sort,
+                sort_descending: true,
+                at_end,
+                startup_window: startup,
+                ..Default::default()
+            };
+            s.save(&path).unwrap();
+            assert_eq!(Settings::load(&path), (s, None));
+        }
+        let text = "zoom_on_open = \"FIT_WIDTH\"\nsort = \"size\"\nat_end = \"next_folder\"\nstartup_window = \"fullscreen\"\n";
+        let s = Settings::parse(text).unwrap();
+        assert_eq!(
+            (s.zoom_on_open, s.sort, s.at_end, s.startup_window),
+            (ZoomOnOpen::FitWidth, SortBy::Size, AtEnd::NextFolder, StartupWindow::Fullscreen),
+            "codes ignore letter case"
+        );
+        // a value from a newer version (or a typo) is the default, not a broken file
+        let text = "zoom_on_open = \"fill\"\nsort = \"random\"\nat_end = \"bounce\"\nstartup_window = \"tiny\"\ncache_mib = 512\n";
+        let s = Settings::parse(text).unwrap();
+        assert_eq!(s, Settings { cache_mib: 512, ..Default::default() });
+        // a value of the wrong type is a broken file, like any other
+        assert!(Settings::parse("sort = 3").is_err());
+        assert!(Settings::parse("sort_descending = \"yes\"").is_err());
+        // every value has its own code
+        let codes: Vec<&str> = ZoomOnOpen::ALL
+            .iter()
+            .map(|c| c.code())
+            .chain(SortBy::ALL.iter().map(|c| c.code()))
+            .chain(AtEnd::ALL.iter().map(|c| c.code()))
+            .chain(StartupWindow::ALL.iter().map(|c| c.code()))
+            .collect();
+        for c in &codes {
+            assert_eq!(codes.iter().filter(|o| *o == c).count(), 1, "{c}");
+        }
+        assert_eq!(AtEnd::from_code(" Next_Folder "), Some(AtEnd::NextFolder));
+        assert_eq!(StartupWindow::Fullscreen.index(), 2);
+    }
+
+    #[test]
+    fn the_startup_window_setting_decides_the_first_show() {
+        let show = |w: StartupWindow, was_maximized, no_activate| w.start_state(was_maximized, no_activate);
+        let state = |maximized, fullscreen| StartState { maximized, fullscreen };
+        assert_eq!(show(StartupWindow::Remember, false, false), state(false, false));
+        assert_eq!(show(StartupWindow::Remember, true, false), state(true, false));
+        assert_eq!(show(StartupWindow::Maximized, false, false), state(true, false));
+        // full screen over the remembered window, which comes back when it is left
+        assert_eq!(show(StartupWindow::Fullscreen, false, false), state(false, true));
+        assert_eq!(show(StartupWindow::Fullscreen, true, false), state(true, true));
+        // a window that must not take the focus does not take the screen either
+        for w in StartupWindow::ALL {
+            assert_eq!(show(*w, true, true), state(false, false), "{w:?}");
+        }
     }
 }
