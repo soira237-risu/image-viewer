@@ -14,8 +14,8 @@ use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, CreateSolidBrush, DeleteObjec
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemServices::{SS_ENDELLIPSIS, SS_NOPREFIX, SS_PATHELLIPSIS, SS_SUNKEN};
 use windows::Win32::UI::Controls::{
-    NMHDR, TCIF_TEXT, TCITEMW, TCM_GETCURSEL, TCM_GETITEMRECT, TCM_INSERTITEMW, TCM_SETCURSEL, TCM_SETITEMW,
-    TCN_SELCHANGE, WC_TABCONTROLW,
+    NM_CUSTOMDRAW, NMHDR, TCIF_TEXT, TCITEMW, TCM_GETCURSEL, TCM_GETITEMRECT, TCM_INSERTITEMW, TCM_SETCURSEL,
+    TCM_SETITEMW, TCN_SELCHANGE, WC_TABCONTROLW,
 };
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -25,6 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
 
 use super::controls::{self, Builder};
+use super::theme;
 use super::{UiEvent, dialogs, post_ui, wide};
 use crate::assoc::Check;
 use crate::i18n::{Language, Strings};
@@ -57,6 +58,8 @@ const ID_CHECK_UPDATE: i32 = 120;
 const ID_OPEN_RELEASE: i32 = 121;
 const ID_THUMBNAILS_ON: i32 = 122;
 const ID_THUMBNAILS_OFF: i32 = 123;
+/// The dialog manager's OK (Enter) and Cancel (Esc); Cancel is also the Cancel button's id.
+const ID_OK: i32 = 1;
 const ID_CANCEL: i32 = 2;
 
 /// Client size in 96-DPI units.
@@ -210,7 +213,12 @@ struct Window {
 
 thread_local! {
     static WINDOW: RefCell<Option<Window>> = const { RefCell::new(None) };
+    /// The settings as the window shows them (applied live, saved by Save).
     static VALUE: RefCell<Settings> = RefCell::new(Settings::default());
+    /// The settings when the window opened (or last saved): what Cancel goes back to.
+    static ORIGINAL: RefCell<Option<Settings>> = const { RefCell::new(None) };
+    /// Whether the window has the dark look (see [`theme::enabled`]).
+    static THEMED: Cell<bool> = const { Cell::new(false) };
     static SYNCING: Cell<bool> = const { Cell::new(false) };
     static SWATCH_BRUSH: Cell<isize> = const { Cell::new(0) };
     /// The page shown.
@@ -281,6 +289,9 @@ fn fit_tabs(tabs: HWND) {
 
 /// The window (hidden) over `owner`, laid out for `dpi` and labelled in `s`'s language.
 fn create(owner: HWND, dpi: u32, s: &Strings) -> windows::core::Result<Window> {
+    // the viewer's dark look, unless high contrast asks for the user's own colours
+    let themed = theme::enabled();
+    THEMED.with(|t| t.set(themed));
     unsafe {
         let instance = GetModuleHandleW(None).expect("module handle");
         let class = WNDCLASSW {
@@ -288,7 +299,11 @@ fn create(owner: HWND, dpi: u32, s: &Strings) -> windows::core::Result<Window> {
             hInstance: instance.into(),
             lpszClassName: w!("iv-settings"),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as usize as *mut _),
+            hbrBackground: if themed {
+                theme::window_brush()
+            } else {
+                HBRUSH((COLOR_BTNFACE.0 + 1) as usize as *mut _)
+            },
             ..Default::default()
         };
         RegisterClassW(&class);
@@ -314,6 +329,9 @@ fn create(owner: HWND, dpi: u32, s: &Strings) -> windows::core::Result<Window> {
             Some(instance.into()),
             None,
         )?;
+        if themed {
+            theme::dark_title_bar(hwnd);
+        }
         let b = Builder::new(hwnd, dpi);
         let texts = RefCell::new(Vec::<(HWND, Text)>::new());
         let combos = RefCell::new(Vec::<(HWND, Items)>::new());
@@ -339,7 +357,11 @@ fn create(owner: HWND, dpi: u32, s: &Strings) -> windows::core::Result<Window> {
             if number {
                 style |= ES_NUMBER;
             }
-            Ok(on_page(b.add(w!("EDIT"), "", style as u32, VALUE_X, y, 100, 24, id)?))
+            let h = on_page(b.add(w!("EDIT"), "", style as u32, VALUE_X, y, 100, 24, id)?);
+            if themed {
+                theme::dark_control(h);
+            }
+            Ok(h)
         };
         let check = |text: Text, y, id| -> windows::core::Result<HWND> {
             let style = (BS_AUTOCHECKBOX | WS_TABSTOP.0 as i32) as u32;
@@ -353,6 +375,9 @@ fn create(owner: HWND, dpi: u32, s: &Strings) -> windows::core::Result<Window> {
             let style = (CBS_DROPDOWNLIST | WS_TABSTOP.0 as i32 | WS_VSCROLL.0 as i32) as u32;
             // the height is the open list's: room for every item
             let h = on_page(b.add(w!("COMBOBOX"), "", style, VALUE_X, y, VALUE_W, 160, id)?);
+            if themed {
+                theme::dark_control(h);
+            }
             set_items(h, &items(s), 0);
             combos.borrow_mut().push((h, items));
             Ok(h)
@@ -361,6 +386,9 @@ fn create(owner: HWND, dpi: u32, s: &Strings) -> windows::core::Result<Window> {
         // the strip of tab titles; the pages lie below it
         let tab_style = WS_TABSTOP.0 | WS_CLIPSIBLINGS.0;
         let tabs = b.add(WC_TABCONTROLW, "", tab_style, 8, 8, WIDTH - 16, 30, ID_TABS)?;
+        if themed {
+            theme::dark_tabs(tabs);
+        }
         for (i, title) in TABS.iter().enumerate() {
             set_tab_title(tabs, i, title(s), true);
         }
@@ -422,8 +450,9 @@ fn create(owner: HWND, dpi: u32, s: &Strings) -> windows::core::Result<Window> {
         let quality = field(top, ID_QUALITY, true)?;
 
         // on every page
+        button(|s| s.defaults, LABEL_X, BUTTONS_Y, 92, ID_DEFAULTS)?;
         button(|s| s.save, VALUE_X + VALUE_W - 188, BUTTONS_Y, 92, ID_SAVE)?;
-        button(|s| s.defaults, VALUE_X + VALUE_W - 92, BUTTONS_Y, 92, ID_DEFAULTS)?;
+        button(|s| s.cancel, VALUE_X + VALUE_W - 92, BUTTONS_Y, 92, ID_CANCEL)?;
 
         fit_tabs(tabs);
         let window = Window {
@@ -601,8 +630,7 @@ pub fn show(owner: HWND, s: &Settings, activate: bool) -> Result<(), String> {
         show_page(GENERAL);
         show_status(t);
     }
-    VALUE.with(|v| *v.borrow_mut() = s.clone());
-    fill(s);
+    opened(s);
     if let Some(h) = hwnd() {
         unsafe {
             let _ = ShowWindow(h, if activate { SW_SHOW } else { SW_SHOWNOACTIVATE });
@@ -611,11 +639,24 @@ pub fn show(owner: HWND, s: &Settings, activate: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The window starts on `s`: it shows it, and Cancel goes back to it.
+fn opened(s: &Settings) {
+    VALUE.with(|v| *v.borrow_mut() = s.clone());
+    ORIGINAL.with(|o| *o.borrow_mut() = Some(s.clone()));
+    fill(s);
+}
+
 /// The save quality was changed elsewhere (the edit panel's slider): the window's copy and its
 /// field follow, without reporting it back, so its next change or Save does not bring back the
 /// old quality.
 pub fn set_quality(quality: u8) {
     VALUE.with(|v| v.borrow_mut().save_quality = quality);
+    // a change made outside the window is not the window's to undo
+    ORIGINAL.with(|o| {
+        if let Some(o) = o.borrow_mut().as_mut() {
+            o.save_quality = quality;
+        }
+    });
     WINDOW.with(|w| {
         let w = w.borrow();
         let Some(w) = w.as_ref() else { return };
@@ -657,6 +698,38 @@ pub fn hide() {
             let _ = ShowWindow(h, SW_HIDE);
         }
     }
+}
+
+/// What closing without saving (Cancel, Esc, the window's X, F2 again) reports: the settings
+/// the window opened with, when they differ from what is live now, then the close.
+fn dismissal(live: &Settings, original: Option<&Settings>) -> Vec<UiEvent> {
+    let mut out = Vec::new();
+    if let Some(o) = original
+        && o != live
+    {
+        out.push(UiEvent::SettingsChanged(o.clone()));
+    }
+    out.push(UiEvent::SettingsClosed);
+    out
+}
+
+/// Closes the window without saving: changes made since it opened are undone.
+pub fn dismiss() {
+    let live = VALUE.with(|v| v.borrow().clone());
+    let original = ORIGINAL.with(|o| o.borrow_mut().take());
+    if let Some(o) = &original {
+        VALUE.with(|v| *v.borrow_mut() = o.clone());
+    }
+    for e in dismissal(&live, original.as_ref()) {
+        post_ui(e);
+    }
+}
+
+/// The settings were saved: they are what a later Cancel goes back to, and the window closes.
+pub fn saved() {
+    let now = VALUE.with(|v| v.borrow().clone());
+    ORIGINAL.with(|o| *o.borrow_mut() = Some(now));
+    hide();
 }
 
 /// The value chosen in a drop-down list of `T`s, or `prev` when nothing is.
@@ -734,6 +807,13 @@ fn refill_field(id: i32) {
     });
 }
 
+/// Whether `hwnd` is a button control (push button or check box).
+fn is_button(hwnd: HWND) -> bool {
+    let mut class = [0u16; 16];
+    let n = unsafe { GetClassNameW(hwnd, &mut class) }.max(0) as usize;
+    String::from_utf16_lossy(&class[..n]).eq_ignore_ascii_case("button")
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_COMMAND if !SYNCING.with(Cell::get) => {
@@ -759,7 +839,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     changed(d);
                 }
                 (ID_PREFETCH | ID_CACHE | ID_NEAREST | ID_QUALITY, EN_KILLFOCUS) => refill_field(id),
-                (ID_SAVE, BN_CLICKED) => {
+                // the Save button, or Enter anywhere in the window (the dialog manager's OK)
+                (ID_SAVE, BN_CLICKED) | (ID_OK, _) => {
+                    // a number field still being typed in counts as it reads now
+                    let current = read(&current).clamped();
+                    if current != VALUE.with(|v| v.borrow().clone()) {
+                        changed(current.clone());
+                    }
                     // what is written is what the window shows
                     fill(&current);
                     post_ui(UiEvent::SettingsSave);
@@ -771,7 +857,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 (ID_DEFAULT_APPS, BN_CLICKED) => post_ui(UiEvent::OpenDefaultApps),
                 (ID_CHECK_UPDATE, BN_CLICKED) => post_ui(UiEvent::CheckUpdate),
                 (ID_OPEN_RELEASE, BN_CLICKED) => post_ui(UiEvent::OpenReleasePage),
-                (ID_CANCEL, _) => post_ui(UiEvent::SettingsClosed),
+                // the Cancel button, or Esc (the dialog manager's Cancel)
+                (ID_CANCEL, _) => dismiss(),
                 _ => {}
             }
             LRESULT(0)
@@ -784,6 +871,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     show_page(index);
                 }
             }
+            // buttons and check boxes in the dark look (the only children that custom-draw)
+            if header.code == NM_CUSTOMDRAW && THEMED.with(Cell::get) && is_button(header.hwndFrom) {
+                // SAFETY: an NM_CUSTOMDRAW notification carries an NMCUSTOMDRAW
+                if let Some(r) = unsafe { theme::custom_draw_button(lp) } {
+                    return r;
+                }
+            }
             LRESULT(0)
         }
         WM_CTLCOLORSTATIC => {
@@ -792,10 +886,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             if is_swatch && brush != 0 {
                 return LRESULT(brush);
             }
+            if THEMED.with(Cell::get)
+                && let Some(r) = theme::ctl_color(msg, wp, lp)
+            {
+                return r;
+            }
             unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN if THEMED.with(Cell::get) => {
+            theme::ctl_color(msg, wp, lp).unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, msg, wp, lp) })
+        }
         WM_CLOSE => {
-            post_ui(UiEvent::SettingsClosed);
+            dismiss();
             LRESULT(0)
         }
         WM_DPICHANGED => {
@@ -819,6 +921,72 @@ mod tests {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::Graphics::Gdi::ScreenToClient;
     use windows::Win32::UI::Controls::TCM_GETROWCOUNT;
+
+    /// Closing without saving puts back the settings the window opened with, and only when
+    /// something changed; it always closes.
+    #[test]
+    fn closing_without_saving_undoes_the_changes() {
+        let original = Settings::default();
+        let mut live = original.clone();
+        live.zoom_on_open = crate::view::ZoomOnOpen::FitEnlarge;
+        live.language = Language::English;
+        let events = dismissal(&live, Some(&original));
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], UiEvent::SettingsChanged(s) if *s == original), "{events:?}");
+        assert!(matches!(events[1], UiEvent::SettingsClosed));
+        // nothing changed, or nothing to go back to: just the close
+        for events in [dismissal(&original, Some(&original)), dismissal(&live, None)] {
+            assert!(matches!(events.as_slice(), [UiEvent::SettingsClosed]), "{events:?}");
+        }
+    }
+
+    /// The window remembers what it opened with: Cancel goes back to it, a save makes the saved
+    /// settings the new starting point, and the edit panel's quality is never undone. Built
+    /// hidden, never shown.
+    #[test]
+    fn cancel_goes_back_to_the_last_opened_or_saved_settings() {
+        controls::init_common_controls();
+        let w = create(HWND::default(), 96, &crate::i18n::EN).expect("settings window");
+        WINDOW.with(|c| *c.borrow_mut() = Some(w));
+        let start = Settings::default();
+        opened(&start);
+        let opened_with = start;
+        while super::super::take_ui().is_some() {}
+        let mut edited = opened_with.clone();
+        edited.sort_descending = true;
+        changed(edited.clone());
+        set_quality(42);
+        dismiss();
+        let mut events = Vec::new();
+        while let Some(e) = super::super::take_ui() {
+            events.push(e);
+        }
+        let mut expected = opened_with.clone();
+        expected.save_quality = 42;
+        assert!(
+            events.iter().any(|e| matches!(e, UiEvent::SettingsChanged(s) if *s == expected)),
+            "back to what it opened with, keeping the panel's quality: {events:?}"
+        );
+        assert!(matches!(events.last(), Some(UiEvent::SettingsClosed)));
+
+        // saved, then changed again: Cancel goes back to the saved settings
+        opened(&opened_with);
+        changed(edited.clone());
+        saved();
+        let mut again = edited.clone();
+        again.wheel_navigates = !again.wheel_navigates;
+        changed(again);
+        while super::super::take_ui().is_some() {}
+        dismiss();
+        let first = super::super::take_ui();
+        assert!(
+            matches!(&first, Some(UiEvent::SettingsChanged(s)) if s.sort_descending && *s == edited.clamped()),
+            "{first:?}"
+        );
+        while super::super::take_ui().is_some() {}
+        let hwnd = WINDOW.with(|c| c.borrow_mut().take().unwrap().hwnd);
+        unsafe { DestroyWindow(hwnd).unwrap() };
+    }
 
     #[test]
     fn ctrl_tab_goes_round_the_tabs() {

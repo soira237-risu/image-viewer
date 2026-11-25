@@ -1292,7 +1292,8 @@ impl App {
                     self.check_registration(false);
                 }
             }
-            _ => settings_window::hide(),
+            // F2 again closes it like Cancel: unsaved changes are undone
+            _ => settings_window::dismiss(),
         }
     }
 
@@ -1468,7 +1469,13 @@ impl App {
                 self.panel.quality = self.settings.save_quality;
                 self.settings_changed();
             }
-            UiEvent::SettingsSave => self.save_settings(),
+            // Save closes the window once the file is written; a failed write keeps it open
+            UiEvent::SettingsSave => {
+                if self.save_settings() {
+                    self.settings_open = false;
+                    settings_window::saved();
+                }
+            }
             UiEvent::SettingsClosed => {
                 self.settings_open = false;
                 settings_window::hide();
@@ -1523,8 +1530,10 @@ impl App {
         self.invalidate();
     }
 
-    fn save_settings(&mut self) {
-        let Some(path) = self.settings_path.clone() else { return };
+    /// Writes the settings file; `false` when it could not be written (the notice says why).
+    /// Without a settings folder there is nothing to write, which is not a failure.
+    fn save_settings(&mut self) -> bool {
+        let Some(path) = self.settings_path.clone() else { return true };
         match self.settings.save(&path) {
             Ok(None) => self.trace.mark(&format!("settings saved to {}", path.display())),
             // the file it replaced could not be read (the warning at startup): say where it went
@@ -1532,8 +1541,12 @@ impl App {
                 self.trace.mark(&format!("settings saved to {}; old file kept as {}", path.display(), kept.display()));
                 self.set_notice(fill(self.t().settings_backed_up, &[("name", &file_name(&kept))]));
             }
-            Err(e) => self.set_notice(fill(self.t().settings_error, &[("error", &e)])),
+            Err(e) => {
+                self.set_notice(fill(self.t().settings_error, &[("error", &e)]));
+                return false;
+            }
         }
+        true
     }
 
     fn panel_context(&self) -> PanelContext {
