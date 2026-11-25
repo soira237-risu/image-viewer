@@ -10,6 +10,7 @@ pub mod panel;
 pub mod session;
 pub mod settings_window;
 pub mod shell;
+pub mod theme;
 pub mod update_check;
 pub mod window;
 
