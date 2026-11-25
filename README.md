@@ -26,6 +26,21 @@ M0~M6 완료:
 
 GitHub 릴리스에서 `image-viewer-<버전>-x86_64-windows.zip`을 받아 원하는 폴더에 풀고 `image-viewer.exe`를 실행. 설치 과정·관리자 권한·Visual C++ 재배포 패키지가 필요 없음 (C 런타임이 실행 파일 안에 들어 있음).
 
+### 설치 스크립트 (시작 메뉴·설치된 앱·기본 앱까지)
+
+[`scripts/install.ps1`](scripts/install.ps1)(0.2.0 다음 릴리스부터는 zip 안에도 있음)은 현재 사용자에게, 관리자 권한 없이 설치함. Windows PowerShell 5.1에서도 돌아감.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1                  # 푼 zip 폴더 안에서: 그 파일들을, 그 밖에서: GitHub의 최신 릴리스를
+powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.2.0  # 특정 릴리스
+powershell -ExecutionPolicy Bypass -File install.ps1 -Zip <받은 zip>  # 받아 둔 zip (옆에 .sha256이 있으면 확인)
+```
+
+- 하는 일: 릴리스 zip을 받아 `.sha256`으로 확인 → `%LOCALAPPDATA%\Programs\image-viewer`에 복사(`-Dir`로 바꿀 수 있음) → "연결 프로그램"·기본 앱 등록(`--register`)과 [탐색기 썸네일](#탐색기-썸네일) 등록(`-NoThumbnails`면 안 함) → 시작 메뉴 바로 가기, 설정 > 앱 > 설치된 앱 항목 → 기본 앱 화면 열기
+- 기본 이미지 프로그램은 Windows가 사용자만 고르게 하므로, 열린 기본 앱 화면(image-viewer)의 **기본값 설정**을 누름
+- 업그레이드: 같은 명령을 다시 실행 (설정은 그대로). 뷰어가 실행 중이면 멈추고 닫으라고 알림. 탐색기가 썸네일 DLL을 쥐고 있으면 옛 파일을 옆으로 옮기고 바꿈(다음 설치·제거 때 지움)
+- 제거: 설정 > 앱 > 설치된 앱의 image-viewer **제거**, 또는 `install.ps1 -Uninstall` — 등록 해제, 바로 가기·설치된 앱 항목·설치 폴더 삭제. 설정·기록은 남김(`-RemoveSettings`면 함께 지움)
+
 - 요구 사항: Windows 10 1703 이상 또는 Windows 11, 64비트(x64)
 - zip 내용: `image-viewer.exe`(뷰어), `iv.exe`(명령줄 도구: 일괄 변환·확장자 바로잡기·정보·속도 측정), `image_viewer_thumbs.dll`([탐색기 썸네일](#탐색기-썸네일), 등록했을 때만 탐색기가 씀), `README.md`, `CHANGELOG.md`, `LICENSE`, `THIRD-PARTY-NOTICES.txt`·`RUST-STD-COPYRIGHT.html`(실행 파일에 들어 있는 오픈 소스 패키지의 라이선스)
 - 받은 파일 확인: 같은 이름의 `.sha256` 파일에 든 값과 `Get-FileHash <zip 파일>`의 값이 같아야 함

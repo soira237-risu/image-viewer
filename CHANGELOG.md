@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### 추가
+
+- 설치 스크립트 `install.ps1`(zip에도 들어 있음): 현재 사용자에게 관리자 권한 없이 설치 — 릴리스 zip을 받아 SHA-256 확인, `%LOCALAPPDATA%\Programs\image-viewer`에 복사, "연결 프로그램"·탐색기 썸네일 등록, 시작 메뉴 바로 가기와 설정 > 앱 > 설치된 앱 항목(제거 가능), 기본 앱 화면 열기. 같은 명령으로 업그레이드, `-Uninstall`로 제거
+
 ## [0.2.0]
 
 탭으로 나눈 설정 창과 보기·탐색 설정, 누를 때만 하는 업데이트 확인, 실행 파일을 옮긴 뒤의 "연결 프로그램" 고침, 그리고 Windows가 그리지 못하는 형식의 탐색기 썸네일. zip에 `image_viewer_thumbs.dll`이 새로 들어 있으므로, 쓰던 폴더에 덮어쓸 때는 세 파일(`image-viewer.exe`·`iv.exe`·`image_viewer_thumbs.dll`)을 모두 바꿀 것 ([업그레이드](README.md#업그레이드)).
