@@ -208,6 +208,8 @@ try {
     if ($LASTEXITCODE -ne 0) { Fail 'third-party notices could not be written (see above)' }
     Copy-Item $exes $stage
     Copy-Item (Join-Path $root 'README.md'), (Join-Path $root 'CHANGELOG.md') $stage
+    # the installer: run from the unzipped folder it installs those files for the current user
+    Copy-Item (Join-Path $PSScriptRoot 'install.ps1') $stage
     Copy-Item $licenses.FullName $stage
 
     $zip = Join-Path $out "$name.zip"
